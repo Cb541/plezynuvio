@@ -43,6 +43,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var heldDirection = 0
     private var holdTickCount = 0
     private var isTouchScrubbing = false
+    // Locked transport is engaged by holding the left/right edge once.
+    // Release keeps it running; further clicks cycle speed and direction.
+    private var lockedSeekDirection = 0
+    private var lockedSpeedIndex = 0
+    private var holdActivationTimer: Timer?
+    private var explicitChromeHidden = false
 
     private var targetSeconds: Double?
     private var currentSeconds: Double = 0
@@ -78,7 +84,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var previewHideTimer: Timer?
     private var previewIsVisible = false
     private let toolbar = UIStackView()
-    private var toolbarButtons: [UIButton] = []
+    private var toolbarButtons: [UILabel] = []
     private let trackPanel = UIView()
     private let trackTitle = UILabel()
     private var trackLabels: [UILabel] = []
@@ -457,6 +463,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         panel.isUserInteractionEnabled = false
         view.addSubview(panel)
         progress.translatesAutoresizingMaskIntoConstraints = false
+        currentLabel.translatesAutoresizingMaskIntoConstraints = false
+        endLabel.translatesAutoresizingMaskIntoConstraints = false
+        currentLabel.textColor = .white
+        endLabel.textColor = .white
+        currentLabel.text = "0:00"
+        endLabel.text = "--:--"
+        currentLabel.font = .monospacedDigitSystemFont(ofSize: 21, weight: .medium)
+        endLabel.font = .monospacedDigitSystemFont(ofSize: 21, weight: .medium)
+        currentLabel.textAlignment = .left
+        endLabel.textAlignment = .right
+        panel.addSubview(currentLabel)
+        panel.addSubview(endLabel)
         progress.progressTintColor = .white
         progress.trackTintColor = UIColor.white.withAlphaComponent(0.35)
         progress.layer.cornerRadius = 2
@@ -471,20 +489,39 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         // Text-based controls are intentionally used rather than SF Symbols:
         // the assetless sideloaded tvOS app returned nil for some of the
         // requested system icons, leaving three invisible buttons.
-        for (name, label) in [("Audio", "AUDIO"), ("Subtitles", "CC"), ("Info", "INFO")] {
-            let button = UIButton(type: .system)
-            button.setTitle(label, for: .normal)
-            button.titleLabel?.font = .systemFont(ofSize: 17, weight: .bold)
-            button.setTitleColor(.white, for: .normal)
-            button.backgroundColor = UIColor.white.withAlphaComponent(0.14)
-            button.layer.cornerRadius = 13
-            button.isUserInteractionEnabled = false
-            button.accessibilityLabel = name
-            toolbarButtons.append(button)
-            toolbar.addArrangedSubview(button)
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: name == "Audio" ? 90 : (name == "Info" ? 75 : 58)).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        // The older disabled UIButton instances were rendered blank on
+        // sideloaded tvOS. Real UILabel glyphs are always visible and do not
+        // depend on symbol-font availability or focus behavior.
+        for (name, caption, width) in [
+            ("Audio", "♫  AUDIO", 121.0),
+            ("Subtitles", "▣  CC", 88.0),
+            ("Info", "ⓘ  INFO", 106.0)
+        ] {
+            let capsule = UIView()
+            capsule.translatesAutoresizingMaskIntoConstraints = false
+            capsule.layer.cornerRadius = 21
+            capsule.clipsToBounds = true
+            addGlassBackdrop(to: capsule, radius: 21)
+            let label = UILabel()
+            label.translatesAutoresizingMaskIntoConstraints = false
+            label.text = caption
+            label.textAlignment = .center
+            label.font = .systemFont(ofSize: 20, weight: .semibold)
+            label.textColor = .white
+            label.adjustsFontSizeToFitWidth = true
+            label.minimumScaleFactor = 0.78
+            label.accessibilityLabel = name
+            capsule.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: capsule.leadingAnchor, constant: 9),
+                label.trailingAnchor.constraint(equalTo: capsule.trailingAnchor, constant: -9),
+                label.topAnchor.constraint(equalTo: capsule.topAnchor),
+                label.bottomAnchor.constraint(equalTo: capsule.bottomAnchor),
+                capsule.widthAnchor.constraint(equalToConstant: width),
+                capsule.heightAnchor.constraint(equalToConstant: 51)
+            ])
+            toolbarButtons.append(label)
+            toolbar.addArrangedSubview(capsule)
         }
         panel.addSubview(toolbar)
 
@@ -496,13 +533,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         filmStrip.distribution = .fill
         filmStrip.alignment = .fill
         filmStrip.isUserInteractionEnabled = false
+        filmStrip.clipsToBounds = true
         view.addSubview(filmStrip)
         let preview = UIImageView()
         preview.contentMode = .scaleAspectFill
-        preview.backgroundColor = UIColor(white: 0.12, alpha: 0.86)
-        preview.layer.cornerRadius = 13
-        preview.layer.borderColor = UIColor.white.withAlphaComponent(0.38).cgColor
-        preview.layer.borderWidth = 1
+        // Entire separate decoded preview fills the display during LOCKED
+        // transport or PAUSED touch scrubbing. scaleAspectFill crops any
+        // letterboxing; this is NOT the currently playing video surface.
+        preview.backgroundColor = .black
+        preview.layer.cornerRadius = 0
+        preview.layer.borderWidth = 0
         preview.clipsToBounds = true
         preview.translatesAutoresizingMaskIntoConstraints = false
         frameViews.append(preview)
@@ -529,11 +569,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
         // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
-        picturePanel.backgroundColor = UIColor(white: 0.075, alpha: 0.94)
+        picturePanel.backgroundColor = .clear
         picturePanel.layer.cornerRadius = 18
         picturePanel.isHidden = true
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
+        addGlassBackdrop(to: picturePanel, radius: 18)
         for label in [zoomLabel, stretchLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
@@ -544,11 +585,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
         // Audio/subtitle/info menu shares the zoom panel's simple vertical layout.
         trackPanel.translatesAutoresizingMaskIntoConstraints = false
-        trackPanel.backgroundColor = UIColor(white: 0.075, alpha: 0.94)
+        trackPanel.backgroundColor = .clear
         trackPanel.layer.cornerRadius = 18
         trackPanel.isUserInteractionEnabled = false
         trackPanel.isHidden = true
         view.addSubview(trackPanel)
+        addGlassBackdrop(to: trackPanel, radius: 18)
         let rows = UIStackView()
         rows.translatesAutoresizingMaskIntoConstraints = false
         rows.axis = .vertical
@@ -581,18 +623,24 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             statusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.85),
             panel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
             panel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
-            panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -19),
-            panel.heightAnchor.constraint(equalToConstant: 56),
-            progress.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 14),
-            progress.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -26),
+            panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -2),
+            panel.heightAnchor.constraint(equalToConstant: 54),
+            currentLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 4),
+            currentLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
+            currentLabel.widthAnchor.constraint(equalToConstant: 105),
+            progress.leadingAnchor.constraint(equalTo: currentLabel.trailingAnchor, constant: 12),
+            progress.trailingAnchor.constraint(equalTo: endLabel.leadingAnchor, constant: -12),
             progress.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             progress.heightAnchor.constraint(equalToConstant: 5),
+            endLabel.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -17),
+            endLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
+            endLabel.widthAnchor.constraint(equalToConstant: 105),
             toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            filmStrip.widthAnchor.constraint(equalToConstant: 360),
-            filmStrip.heightAnchor.constraint(equalToConstant: 204),
-            filmStrip.centerXAnchor.constraint(equalTo: progress.centerXAnchor),
-            filmStrip.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -18),
+            filmStrip.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            filmStrip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            filmStrip.topAnchor.constraint(equalTo: view.topAnchor),
+            filmStrip.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
@@ -613,18 +661,48 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             rows.topAnchor.constraint(equalTo: trackPanel.topAnchor, constant: 20),
             rows.bottomAnchor.constraint(equalTo: trackPanel.bottomAnchor, constant: -20)
         ])
+        // The full-screen preview must be beneath the progress/time labels,
+        // tools and picture menus. It's non-interactive, so the Siri Remote
+        // surface beneath it continues to receive presses and gestures.
+        view.bringSubviewToFront(panel)
+        view.bringSubviewToFront(seekTimeLabel)
+        view.bringSubviewToFront(picturePanel)
+        view.bringSubviewToFront(trackPanel)
+        view.bringSubviewToFront(statusLabel)
         panel.isHidden = true
         updateToolbarFocus()
     }
 
+    private func addGlassBackdrop(to target: UIView, radius: CGFloat) {
+        let effect: UIVisualEffect
+        if #available(tvOS 26.0, *) {
+            effect = UIGlassEffect(style: .regular)
+        } else {
+            effect = UIBlurEffect(style: .dark)
+        }
+        let background = UIVisualEffectView(effect: effect)
+        background.translatesAutoresizingMaskIntoConstraints = false
+        background.isUserInteractionEnabled = false
+        background.layer.cornerRadius = radius
+        background.clipsToBounds = true
+        target.insertSubview(background, at: 0)
+        NSLayoutConstraint.activate([
+            background.leadingAnchor.constraint(equalTo: target.leadingAnchor),
+            background.trailingAnchor.constraint(equalTo: target.trailingAnchor),
+            background.topAnchor.constraint(equalTo: target.topAnchor),
+            background.bottomAnchor.constraint(equalTo: target.bottomAnchor)
+        ])
+    }
+
     private func updateToolbarFocus() {
-        for (index, button) in toolbarButtons.enumerated() {
+        for (index, label) in toolbarButtons.enumerated() {
             let selected = toolbarFocused && toolPanel == .none && index == toolbarIndex
-            button.layer.borderWidth = selected ? 2.2 : 0
-            button.layer.borderColor = UIColor.white.cgColor
-            button.backgroundColor = selected
-                ? UIColor.white.withAlphaComponent(0.30)
-                : UIColor.white.withAlphaComponent(0.12)
+            label.superview?.layer.borderWidth = selected ? 2.4 : 0
+            label.superview?.layer.borderColor = UIColor.white.withAlphaComponent(0.95).cgColor
+            label.superview?.backgroundColor = selected
+                ? UIColor.white.withAlphaComponent(0.17)
+                : .clear
+            label.textColor = .white
         }
     }
 
@@ -1198,8 +1276,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private func refreshLabels() {
         let seconds = targetSeconds ?? currentSeconds
         progress.progress = Float(max(0, min(1, totalSeconds > 0 ? seconds / totalSeconds : 0)))
-        seekTimeLabel.text = clockString(seconds) + "  /  " +
-            (totalSeconds > 0 ? clockString(totalSeconds) : "--:--")
+        currentLabel.text = clockString(seconds)
+        endLabel.text = totalSeconds > 0 ? clockString(totalSeconds) : "--:--"
+        seekTimeLabel.text = lockedSeekDirection != 0
+            ? (lockedSeekDirection > 0 ? "FAST FORWARD" : "REWIND") +
+              "  ·  " + ["2×", "4×", "8×", "16×", "32×"][lockedSpeedIndex] +
+              "  ·  " + clockString(seconds)
+            : clockString(seconds)
     }
 
     private func clockString(_ seconds: Double) -> String {

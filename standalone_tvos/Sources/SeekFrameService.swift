@@ -21,6 +21,8 @@ final class SeekFrameService {
         let diskFrames: Int
         let ramOnlyFrames: Int
         let storageError: String
+        let autoCapturedSlots: Int
+        let seekCapturedSlots: Int
     }
 
     private struct Request {
@@ -71,6 +73,8 @@ final class SeekFrameService {
     private var compressedBytes = 0
     private let compressedLimit = 24 * 1_024 * 1_024
     private var lastStorageError = ""
+    private var autoCapturedSlots = Set<Int>()
+    private var seekCapturedSlots = Set<Int>()
 
     init() {
         // RAM is bounded to protect playback; the persistent disk cache
@@ -121,6 +125,8 @@ final class SeekFrameService {
         compressedOrder.removeAll()
         compressedBytes = 0
         lastStorageError = ""
+        autoCapturedSlots.removeAll()
+        seekCapturedSlots.removeAll()
         hotImages.removeAllObjects()
         let version = generation
         let oldDirectory = legacyScopedDirectory
@@ -174,7 +180,9 @@ final class SeekFrameService {
             diskBytes: diskBytes,
             diskFrames: cachedSlots.count,
             ramOnlyFrames: coverage.count - cachedSlots.count,
-            storageError: lastStorageError)
+            storageError: lastStorageError,
+            autoCapturedSlots: autoCapturedSlots.count,
+            seekCapturedSlots: seekCapturedSlots.count)
         lock.unlock()
         return result
     }
@@ -241,13 +249,19 @@ final class SeekFrameService {
     /// NEVER enqueue playback captures onto that same queue.
     /// Normal playback needs only a small retained UIImage; JPEG encoding
     /// and all filesystem operations run on the serial disk writer.
-    func cachePlaybackFrame(_ image: UIImage, second: Int) {
+    func cachePlaybackFrame(_ image: UIImage, second: Int,
+                            automatic: Bool = true) {
         let slot = bucket(second)
         lock.lock()
         let primary = scopedDirectory
         let fallback = legacyScopedDirectory
         let epoch = cacheEpoch
         deliveredFrames += 1
+        if automatic {
+            autoCapturedSlots.insert(slot)
+        } else {
+            seekCapturedSlots.insert(slot)
+        }
         lock.unlock()
 
         // Make the decoded image usable immediately, even if disk is full.
@@ -386,6 +400,8 @@ final class SeekFrameService {
         compressedOrder.removeAll()
         compressedBytes = 0
         lastStorageError = ""
+        autoCapturedSlots.removeAll()
+        seekCapturedSlots.removeAll()
         hotImages.removeAllObjects()
         lock.unlock()
         // Intentionally DO NOT delete stored previews.
@@ -450,7 +466,7 @@ final class SeekFrameService {
         // persistence path as native decoded-frame captures. The old direct
         // disk writer would silently lose them when tvOS refused its folder.
         if writeToDisk {
-            cachePlaybackFrame(image, second: slot)
+            cachePlaybackFrame(image, second: slot, automatic: false)
         } else {
             hotImages.setObject(image, forKey: key(slot),
                 cost: max(1, Int(image.size.width * image.size.height * 4)))

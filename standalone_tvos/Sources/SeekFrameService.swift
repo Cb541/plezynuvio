@@ -44,6 +44,21 @@ final class SeekFrameService {
         lock.unlock()
     }
 
+    /// Cancel preview I/O and wait for the serial FFmpeg worker to finish
+    /// cleaning up its decoder before allowing the main mpv seek to begin.
+    /// A fixed 180ms delay did NOT guarantee that a 4K HEVC decode stopped.
+    func cancelAndDrain(_ completion: @escaping () -> Void) {
+        lock.lock()
+        generation &+= 1
+        activeToken?.cancelled = true
+        pending = nil
+        lock.unlock()
+        worker.async { [weak self] in
+            self?.decoder.reset()
+            DispatchQueue.main.async(execute: completion)
+        }
+    }
+
     func clear() {
         lock.lock()
         generation &+= 1
@@ -93,7 +108,7 @@ final class SeekFrameService {
             lock.unlock()
 
             let decoded = decoder.thumbnail(for: request.url,
-                second: Int64(request.second), timeoutSeconds: 4.0, token: token)
+                second: Int64(request.second), timeoutSeconds: 5.0, token: token)
             let image = decoded ?? (token.cancelled ? nil
                 : appleFallback(url: request.url, second: request.second))
 
@@ -137,7 +152,11 @@ final class SeekFrameService {
 
     private func appleFallback(url: URL, second: Int) -> UIImage? {
         let extensionName = url.pathExtension.lowercased()
-        guard ["m3u8", "mp4", "mov", "m4v"].contains(extensionName) else { return nil }
+        // HLS/MP4 sources often arrive as signed extensionless HTTP URLs.
+        // AVFoundation can sometimes handle those even if FFmpeg's seek
+        // failed; leave known non-AVFoundation containers to FFmpeg.
+        guard !["mkv", "webm", "avi", "ts", "m2ts", "vob"].contains(extensionName)
+            else { return nil }
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true

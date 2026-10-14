@@ -99,6 +99,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var heldDirection = 0
     private var holdTickCount = 0
     private var isTouchScrubbing = false
+    // Reuse cached images during touchpad motion, avoiding continuous
+    // competing remote HEVC decodes while tvOS displays DV video.
+    private var touchpadPreviewMode = false
     // Locked transport is engaged by holding the left/right edge once.
     // Release keeps it running; further clicks cycle speed and direction.
     private var lockedSeekDirection = 0
@@ -255,6 +258,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         holdActivationTimer = nil
         holdTickCount = 0
         isTouchScrubbing = false
+        touchpadPreviewMode = false
         circularSeekActive = false
         panStartedWhilePlaying = false
         hasSelectedPreferredAudio = false
@@ -1132,6 +1136,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             guard heldDirection == 0 else { return }
             seekCommitOperationID += 1
             isTouchScrubbing = true
+            // A new pan cancels any outstanding remote preview decode.
+            thumbTimer?.invalidate()
+            thumbTimer = nil
+            thumbs.cancel()
+            currentPreviewSerial += 1
+            lastPreviewRequestedBucket = nil
             panLastTranslation = .zero
             panLastHeading = nil
             panTravelPoints = 0
@@ -1150,6 +1160,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
             panStartedWhilePlaying = playing && targetSeconds == nil
             if !panStartedWhilePlaying {
+                touchpadPreviewMode = true
                 panOriginSeconds = targetSeconds ?? currentSeconds
                 targetSeconds = panOriginSeconds
                 PlayerStartupDiagnostics.mark("touchpad-preview-active")
@@ -1185,6 +1196,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     // A straight swipe skips silently. Only after genuine
                     // curvature do we freeze video and enter thumbnail mode.
                     panStartedWhilePlaying = false
+                    touchpadPreviewMode = true
                     resumeAfterLockedSeek = true
                     core?.setProperty("pause", value: "yes")
                     playing = false
@@ -1195,7 +1207,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 circularTurnOrigin = panTurnRadians
             }
             if circularSeekActive {
-                let turnSeconds = max(90.0, min(600.0, bound / 24.0))
+                // Fine control: a full rotation moves 24 seconds instead
+                // of 90-600 seconds. Clockwise adds; counterclockwise subtracts.
+                let turnSeconds = 24.0
                 let revolutions = (panTurnRadians - circularTurnOrigin) / (2.0 * .pi)
                 targetSeconds = max(0, min(bound,
                     circularSeekOrigin + revolutions * turnSeconds))
@@ -1271,6 +1285,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func stopShowingThumbnail() {
+        touchpadPreviewMode = false
         thumbTimer?.invalidate()
         thumbTimer = nil
         previewHideTimer?.invalidate()
@@ -1640,9 +1655,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func scheduleFrames() {
         guard let seconds = targetSeconds else { return }
-        // Always show the floating black preview window immediately. No
-        // "Loading" / "Preparing" overlays. Retain a nearby old image while
-        // its next frame is being fetched, but blank a distant stale still.
         previewIsVisible = true
         filmStrip.alpha = 1
         previewLoadingLabel.isHidden = true
@@ -1656,12 +1668,24 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             lastPreviewImageSecond = nil
         }
 
-        // Throttle instead of debounce: continuously moving fingers should
-        // NEVER keep postponing the decoder request. The timer fetches the
-        // latest target at that moment; SeekFrameService coalesces in flight.
+        if touchpadPreviewMode && isTouchScrubbing {
+            // Continuous gestures previously submitted remote FFmpeg seeks
+            // every 120ms, competing with the main 4K playback renderer.
+            // During active motion, display cached thumbnails or a black
+            // window, without decoding. Decode only when the gesture settles.
+            thumbTimer?.invalidate()
+            thumbTimer = nil
+            if let cached = thumbs.cachedImage(second: Int(seconds.rounded())) {
+                frameViews.first?.image = cached
+                lastPreviewImageSecond = (Int(seconds.rounded()) / 5) * 5
+            }
+            return
+        }
+
         guard thumbTimer == nil else { return }
         let serial = currentPreviewSerial
-        thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.12,
+        thumbTimer = Timer.scheduledTimer(withTimeInterval:
+            touchpadPreviewMode ? 0.42 : 0.12,
             repeats: false) { [weak self] _ in
             guard let self else { return }
             self.thumbTimer = nil
@@ -1671,11 +1695,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func loadFrames(serial: Int) {
         guard previewIsVisible, let link, let targetSeconds,
-              serial == currentPreviewSerial else { return }
+              serial == currentPreviewSerial,
+              !(touchpadPreviewMode && isTouchScrubbing) else { return }
         let second = max(0, Int(targetSeconds.rounded()))
         let bucket = (second / 5) * 5
         guard lastPreviewRequestedBucket != bucket else { return }
         lastPreviewRequestedBucket = bucket
+        if touchpadPreviewMode {
+            PlayerStartupDiagnostics.mark("touchpad-thumbnail-decode")
+        }
         thumbs.request(url: link.url, second: second) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,
@@ -1685,6 +1713,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 self.frameViews.first?.image = image
                 self.lastPreviewImageSecond = bucket
                 self.filmStrip.alpha = 1
+                if self.touchpadPreviewMode {
+                    PlayerStartupDiagnostics.mark("touchpad-thumbnail-ready")
+                }
             }
             self.previewLoadingLabel.isHidden = true
             self.previewStatusLabel.isHidden = true
@@ -1711,6 +1742,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         resumeAfterLockedSeek = false
         circularSeekActive = false
         panStartedWhilePlaying = false
+        touchpadPreviewMode = false
         seekCommitOperationID += 1
         displayNegotiationPending = false
         frameViews.first?.image = nil

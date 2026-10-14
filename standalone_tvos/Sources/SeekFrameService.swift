@@ -8,6 +8,12 @@ import UIKit
 /// unrelated codecs and is intentionally NEVER invoked by this service.
 /// Unsupported formats fail gracefully; disk-cached previews remain intact.
 final class SeekFrameService {
+    struct CacheStats {
+        let slots: [Int]
+        let writeMBPerSecond: Double
+        let frameCount: Int
+    }
+
     private struct Request {
         let url: URL
         let second: Int
@@ -34,6 +40,10 @@ final class SeekFrameService {
     private var legacyScopedDirectory: URL?
     private var backgroundPrefetchUnavailable = false
     private var sourceKey: String?
+    // Only the compressed JPEGs consume persistent disk; memory remains
+    // bounded. These slot indices are loaded once and amended after writes.
+    private var cachedSlots = Set<Int>()
+    private var recentDiskWrites: [(date: Date, bytes: Int)] = []
 
     init() {
         // RAM is bounded to protect playback; the persistent disk cache
@@ -71,8 +81,31 @@ final class SeekFrameService {
         legacyScopedDirectory = legacyRoot.appendingPathComponent(identity,
                                                                   isDirectory: true)
         backgroundPrefetchUnavailable = false
+        cachedSlots.removeAll()
+        recentDiskWrites.removeAll()
         hotImages.removeAllObjects()
+        let version = generation
+        let oldDirectory = legacyScopedDirectory
         lock.unlock()
+        // Populate timeline coverage from this movie's previous sessions.
+        // One directory scan, never one filesystem lookup per UI frame.
+        diskReader.async { [weak self] in
+            guard let self else { return }
+            let files = [dir, oldDirectory].compactMap { $0 }.flatMap { directory in
+                (try? FileManager.default.contentsOfDirectory(
+                    at: directory, includingPropertiesForKeys: nil)) ?? []
+            }
+            let slots = Set(files.compactMap { file -> Int? in
+                let name = file.lastPathComponent
+                guard name.hasPrefix("frame-"), name.hasSuffix(".jpg") else { return nil }
+                return Int(name.dropFirst(6).dropLast(4))
+            })
+            self.lock.lock()
+            if self.scopedDirectory == dir && self.generation == version {
+                self.cachedSlots.formUnion(slots)
+            }
+            self.lock.unlock()
+        }
         diskWriter.async {
             try? FileManager.default.createDirectory(at: dir,
                 withIntermediateDirectories: true)
@@ -82,6 +115,20 @@ final class SeekFrameService {
             values.isExcludedFromBackup = true
             try? backupRoot.setResourceValues(values)
         }
+    }
+
+    /// A rolling eight-second average of actual JPEG bytes successfully
+    /// written to local storage, NOT incoming video bandwidth.
+    func cacheStats() -> CacheStats {
+        lock.lock()
+        let cutoff = Date().addingTimeInterval(-8)
+        recentDiskWrites.removeAll { $0.date < cutoff }
+        let bytes = recentDiskWrites.reduce(0) { $0 + $1.bytes }
+        let result = CacheStats(slots: Array(cachedSlots),
+            writeMBPerSecond: Double(bytes) / 8_000_000.0,
+            frameCount: cachedSlots.count)
+        lock.unlock()
+        return result
     }
 
     /// In-memory lookup is instantaneous for SDR, HDR and DV.
@@ -179,6 +226,8 @@ final class SeekFrameService {
         scopedDirectory = nil
         legacyScopedDirectory = nil
         backgroundPrefetchUnavailable = false
+        cachedSlots.removeAll()
+        recentDiskWrites.removeAll()
         hotImages.removeAllObjects()
         lock.unlock()
         // Intentionally DO NOT delete stored previews.
@@ -247,12 +296,28 @@ final class SeekFrameService {
         // backlog of disk-writing closures retaining full UIImage buffers
         // could otherwise trigger tvOS memory termination while scrubbing.
         guard let bytes = image.jpegData(compressionQuality: 0.8) else { return }
-        diskWriter.async {
+        diskWriter.async { [weak self] in
             let fm = FileManager.default
             guard !fm.fileExists(atPath: file.path) else { return }
             try? fm.createDirectory(at: file.deletingLastPathComponent(),
                                     withIntermediateDirectories: true)
-            try? bytes.write(to: file, options: .atomic)
+            do {
+                try bytes.write(to: file, options: .atomic)
+                guard let self else { return }
+                self.lock.lock()
+                if self.scopedDirectory == directory {
+                    self.cachedSlots.insert(slot)
+                    let now = Date()
+                    self.recentDiskWrites.append((date: now, bytes: bytes.count))
+                    let cutoff = now.addingTimeInterval(-8)
+                    self.recentDiskWrites.removeAll { $0.date < cutoff }
+                }
+                self.lock.unlock()
+            } catch {
+                // Out-of-space or tvOS permission issues must never stop video.
+                NSLog("[NuvioCache] Thumbnail could not be stored: %@",
+                      String(describing: error))
+            }
         }
     }
 

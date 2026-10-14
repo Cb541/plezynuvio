@@ -16,6 +16,7 @@ final class SeekFrameService {
     }
 
     private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .userInitiated)
+    private let decoder = NuvioThumbnailDecoder()
     private let lock = NSLock()
     private var cache: [Int: UIImage] = [:]
     private var cacheOrder: [Int] = []
@@ -40,6 +41,7 @@ final class SeekFrameService {
         cache.removeAll()
         cacheOrder.removeAll()
         lock.unlock()
+        worker.async { [weak self] in self?.decoder.reset() }
     }
 
     /// Request just ONE image above the timeline; while FFmpeg is busy,
@@ -79,7 +81,8 @@ final class SeekFrameService {
             activeToken = token
             lock.unlock()
 
-            let decoded = NuvioDecodedThumbnail(request.url, Int64(request.second), 4.3, token)
+            let decoded = decoder.thumbnail(for: request.url,
+                second: Int64(request.second), timeoutSeconds: 3.2, token: token)
             let image = decoded ?? (token.cancelled ? nil
                 : appleFallback(url: request.url, second: request.second))
 

@@ -1,39 +1,75 @@
 import AVFoundation
+import CryptoKit
 import Foundation
 import UIKit
 
-/// On-device FFmpeg thumbnail decoder for HTTP Matroska/HEVC and compatible
-/// videos. The latest requested preview position wins, without starving the
-/// visible image when a held Siri Remote button advances faster than a
-/// network GOP can be decoded.
-///
-/// Inspired by Cine's quick-keyframe seeking: decode the nearest usable
-/// random-access picture rather than making the preview renderer chase
-/// every intermediate frame. Video data and signed URLs remain on-device.
+/// Independent, serial thumbnail decoder with a persistent, disk-backed
+/// per-stream cache. No fixed cap is placed on stored thumbnails. The small
+/// NSCache is only a RAM hot set; tvOS controls available disk space and may
+/// evict files from its system Caches directory.
 final class SeekFrameService {
     private struct Request {
         let url: URL
         let second: Int
-        let callback: (UIImage?) -> Void
+        let prefetch: Bool
+        let callback: ((UIImage?) -> Void)?
     }
 
-    private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .userInitiated)
+    private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .utility)
+    private let diskWriter = DispatchQueue(label: "com.cb541.nuvio.seek-disk", qos: .utility)
     private let decoder = NuvioThumbnailDecoder()
     private let lock = NSLock()
-    private var cache: [Int: UIImage] = [:]
-    private var cacheOrder: [Int] = []
+    private let hotImages = NSCache<NSString, UIImage>()
     private var generation: UInt64 = 0
     private var isWorkerRunning = false
     private var pending: Request?
+    private var pendingBackground: Request?
     private var activeToken: NuvioThumbnailAbortToken?
+    private var activeWasBackground = false
+    private var scopedDirectory: URL?
+    private var sourceKey: String?
 
-    /// During an actively moving touchpad gesture, show cached stills only.
-    /// FFmpeg network reads are postponed until the finger stops moving.
-    func cachedImage(second: Int) -> UIImage? {
-        let key = max(0, (second / 5) * 5)
+    init() {
+        // RAM is bounded to protect playback; the persistent disk cache
+        // has no application-imposed frame-count or size limit.
+        hotImages.totalCostLimit = 24 * 1_024 * 1_024
+    }
+
+    private func bucket(_ second: Int) -> Int {
+        max(0, (second / 2) * 2)
+    }
+
+    private func key(_ second: Int) -> NSString {
+        String(bucket(second)) as NSString
+    }
+
+    func prepare(url: URL) {
+        let identity = SHA256.hash(data: Data(url.absoluteString.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let root = FileManager.default.urls(for: .cachesDirectory,
+            in: .userDomainMask)[0].appendingPathComponent("NuvioSeekFrames",
+                                                          isDirectory: true)
+        let dir = root.appendingPathComponent(identity, isDirectory: true)
         lock.lock()
-        defer { lock.unlock() }
-        return cache[key]
+        generation &+= 1
+        activeToken?.cancelled = true
+        pending = nil
+        pendingBackground = nil
+        sourceKey = identity
+        scopedDirectory = dir
+        hotImages.removeAllObjects()
+        lock.unlock()
+        diskWriter.async {
+            try? FileManager.default.createDirectory(at: dir,
+                withIntermediateDirectories: true)
+        }
+        worker.async { [weak self] in self?.decoder.reset() }
+    }
+
+    /// Main-thread-safe in-memory lookup for instantaneous swipe feedback.
+    /// Disk hits are fetched on the decoder queue, never on the UI thread.
+    func cachedImage(second: Int) -> UIImage? {
+        hotImages.object(forKey: key(second))
     }
 
     func cancel() {
@@ -41,18 +77,13 @@ final class SeekFrameService {
         generation &+= 1
         activeToken?.cancelled = true
         pending = nil
+        pendingBackground = nil
         lock.unlock()
     }
 
-    /// Cancel preview I/O and wait for the serial FFmpeg worker to finish
-    /// cleaning up its decoder before allowing the main mpv seek to begin.
-    /// A fixed 180ms delay did NOT guarantee that a 4K HEVC decode stopped.
+    /// Finish all queued FFmpeg work before mpv seeks the main movie.
     func cancelAndDrain(_ completion: @escaping () -> Void) {
-        lock.lock()
-        generation &+= 1
-        activeToken?.cancelled = true
-        pending = nil
-        lock.unlock()
+        cancel()
         worker.async { [weak self] in
             self?.decoder.reset()
             DispatchQueue.main.async(execute: completion)
@@ -60,109 +91,153 @@ final class SeekFrameService {
     }
 
     func clear() {
+        cancel()
         lock.lock()
-        generation &+= 1
-        activeToken?.cancelled = true
-        pending = nil
-        cache.removeAll()
-        cacheOrder.removeAll()
+        sourceKey = nil
+        scopedDirectory = nil
+        hotImages.removeAllObjects()
         lock.unlock()
         worker.async { [weak self] in self?.decoder.reset() }
+        // Intentionally DO NOT delete stored previews.
     }
 
-    /// Request just ONE image above the timeline; while FFmpeg is busy,
-    /// replace any pending request with the newest position. Unlike the old
-    /// implementation, we don't abort an actively decoding image every
-    /// 380ms of a remote long-press, so actual previews can be rendered.
     func request(url: URL, second: Int, callback: @escaping (UIImage?) -> Void) {
-        let key = max(0, (second / 5) * 5)
+        let slot = bucket(second)
+        if let cached = hotImages.object(forKey: key(slot)) {
+            DispatchQueue.main.async { callback(cached) }
+            return
+        }
         lock.lock()
-        let cached = cache[key]
-        let version = generation
-        if cached == nil {
-            pending = Request(url: url, second: key, callback: callback)
-            if !isWorkerRunning {
-                isWorkerRunning = true
-                worker.async { [weak self] in self?.processRequests() }
-            }
+        let request = Request(url: url, second: slot,
+                              prefetch: false, callback: callback)
+        pending = request
+        // A foreground preview always supersedes any background decode.
+        if activeWasBackground { activeToken?.cancelled = true }
+        scheduleWorkerLocked()
+        lock.unlock()
+    }
+
+    /// Opportunistically generate one thumbnail near playback. Uses the
+    /// same serial decoder and is always lower priority than user seeking.
+    func prefetch(url: URL, second: Int) {
+        let slot = bucket(second)
+        if hotImages.object(forKey: key(slot)) != nil { return }
+        lock.lock()
+        if pending == nil, pendingBackground == nil {
+            pendingBackground = Request(url: url, second: slot,
+                                        prefetch: true, callback: nil)
+            scheduleWorkerLocked()
         }
         lock.unlock()
+    }
 
-        if let cached {
-            deliver(cached, version: version, callback: callback)
+    private func scheduleWorkerLocked() {
+        if !isWorkerRunning {
+            isWorkerRunning = true
+            worker.async { [weak self] in self?.processRequests() }
+        }
+    }
+
+    private func diskURL(for slot: Int, directory: URL?) -> URL? {
+        directory?.appendingPathComponent("frame-\(slot).jpg")
+    }
+
+    private func readDisk(slot: Int, directory: URL?) -> UIImage? {
+        guard let file = diskURL(for: slot, directory: directory),
+              let data = try? Data(contentsOf: file),
+              let image = UIImage(data: data) else { return nil }
+        return image
+    }
+
+    private func remember(_ image: UIImage, slot: Int,
+                          directory: URL?, writeToDisk: Bool) {
+        let pixels = Int(image.size.width * image.size.height * 4)
+        hotImages.setObject(image, forKey: key(slot), cost: max(1, pixels))
+        guard writeToDisk,
+              let file = diskURL(for: slot, directory: directory) else { return }
+        diskWriter.async {
+            let fm = FileManager.default
+            guard !fm.fileExists(atPath: file.path),
+                  let bytes = image.jpegData(compressionQuality: 0.8) else { return }
+            try? fm.createDirectory(at: file.deletingLastPathComponent(),
+                                    withIntermediateDirectories: true)
+            try? bytes.write(to: file, options: .atomic)
         }
     }
 
     private func processRequests() {
         while true {
             lock.lock()
-            guard let request = pending else {
+            guard let job = pending ?? pendingBackground else {
                 isWorkerRunning = false
+                activeToken = nil
+                activeWasBackground = false
                 lock.unlock()
                 return
             }
-            pending = nil
+            if pending != nil { pending = nil } else { pendingBackground = nil }
             let version = generation
+            let directory = scopedDirectory
             let token = NuvioThumbnailAbortToken()
             activeToken = token
+            activeWasBackground = job.prefetch
             lock.unlock()
 
-            let decoded = decoder.thumbnail(for: request.url,
-                second: Int64(request.second), timeoutSeconds: 5.0, token: token)
-            let image = decoded ?? (token.cancelled ? nil
-                : appleFallback(url: request.url, second: request.second))
+            let cached = hotImages.object(forKey: key(job.second))
+                ?? readDisk(slot: job.second, directory: directory)
+            let decoded: UIImage?
+            if let cached {
+                decoded = cached
+            } else if token.cancelled {
+                decoded = nil
+            } else {
+                decoded = decoder.thumbnail(for: job.url,
+                    second: Int64(job.second),
+                    timeoutSeconds: job.prefetch ? 3.0 : 6.0,
+                    token: token)
+                    ?? (token.cancelled || job.prefetch ? nil
+                        : appleFallback(url: job.url, second: job.second))
+            }
 
             lock.lock()
             let valid = generation == version && !token.cancelled
-            let waitingForNewerFrame = pending != nil
-            if valid, let image {
-                cache[request.second] = image
-                cacheOrder.removeAll { $0 == request.second }
-                cacheOrder.append(request.second)
-                while cacheOrder.count > 12 {
-                    let oldest = cacheOrder.removeFirst()
-                    cache.removeValue(forKey: oldest)
-                }
-            }
+            let foregroundWaiting = pending != nil
             if activeToken === token { activeToken = nil }
+            activeWasBackground = false
             lock.unlock()
 
-            // Even when a newer seek is queued, display this completed image
-            // rather than a permanent placeholder. The next iteration jumps
-            // directly to the latest target; intermediate frames are dropped.
-            if valid && (image != nil || !waitingForNewerFrame) {
-                deliver(image, version: version, callback: request.callback)
+            if valid, let image = decoded {
+                remember(image, slot: job.second, directory: directory,
+                         writeToDisk: cached == nil)
+            }
+            if valid, !job.prefetch, !foregroundWaiting,
+               let callback = job.callback {
+                deliver(decoded, version: version, callback: callback)
             }
         }
     }
 
-    private func deliver(
-        _ image: UIImage?,
-        version: UInt64,
-        callback: @escaping (UIImage?) -> Void
-    ) {
+    private func deliver(_ image: UIImage?, version: UInt64,
+                         callback: @escaping (UIImage?) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            let stillValid = self.generation == version
+            let valid = self.generation == version
             self.lock.unlock()
-            if stillValid { callback(image) }
+            if valid { callback(image) }
         }
     }
 
     private func appleFallback(url: URL, second: Int) -> UIImage? {
-        let extensionName = url.pathExtension.lowercased()
-        // HLS/MP4 sources often arrive as signed extensionless HTTP URLs.
-        // AVFoundation can sometimes handle those even if FFmpeg's seek
-        // failed; leave known non-AVFoundation containers to FFmpeg.
-        guard !["mkv", "webm", "avi", "ts", "m2ts", "vob"].contains(extensionName)
+        let suffix = url.pathExtension.lowercased()
+        guard !["mkv", "webm", "avi", "ts", "m2ts", "vob"].contains(suffix)
             else { return nil }
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 640, height: 360)
-        generator.requestedTimeToleranceBefore = CMTime(seconds: 4, preferredTimescale: 600)
-        generator.requestedTimeToleranceAfter = CMTime(seconds: 4, preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = CMTime(seconds: 3, preferredTimescale: 600)
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 3, preferredTimescale: 600)
         guard let frame = try? generator.copyCGImage(
             at: CMTime(seconds: Double(second), preferredTimescale: 600),
             actualTime: nil

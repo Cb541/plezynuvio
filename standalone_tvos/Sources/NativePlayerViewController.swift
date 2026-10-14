@@ -87,6 +87,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var playbackGeneration = 0
     private var isPreparingPlayback = false
     private var waitingForFirstFrame = false
+    private var displayNegotiationPending = false
     private var firstFrameTimeout: DispatchWorkItem?
     private var subtitleURLToLoad: URL?
     private var subtitleAlreadyRequested = false
@@ -102,6 +103,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // Release keeps it running; further clicks cycle speed and direction.
     private var lockedSeekDirection = 0
     private var lockedSpeedIndex = 0
+    private let lockedSeekSpeeds: [Double] = [8, 20, 50, 110, 240]
+    private let lockedClickSteps: [Double] = [20, 50, 120, 240, 480]
     // Freeze the actual movie while an independent windowed preview moves.
     // Restore its earlier play state only when the target is committed/cancelled.
     private var resumeAfterLockedSeek = false
@@ -115,6 +118,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var verticalStretch: CGFloat = 1
     private var panOriginSeconds: Double = 0
     private var currentPreviewSerial = 0
+    private var lastPreviewRequestedBucket: Int?
+    private var lastPreviewImageSecond: Int?
+    private var seekCommitOperationID = 0
     private var playing = false
     private var showSettings = false
     private var selectedPictureControl = 0
@@ -188,6 +194,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             swipe.direction = direction
             swipe.cancelsTouchesInView = false
             swipe.delegate = self
+            // Do not also deliver a paused swipe after a pan scrub.
+            swipe.require(toFail: panGesture)
             remote.addGestureRecognizer(swipe)
         }
         clock = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(refreshClock),
@@ -236,6 +244,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         holdActivationTimer = nil
         holdTickCount = 0
         isTouchScrubbing = false
+        seekCommitOperationID += 1
+        displayNegotiationPending = false
+        lastPreviewRequestedBucket = nil
+        lastPreviewImageSecond = nil
         repeatTimer?.invalidate()
         repeatTimer = nil
         waitingForFirstFrame = true
@@ -254,8 +266,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         link = media
         frameViews.first?.image = nil
         previewStatusLabel.isHidden = true
-        previewLoadingLabel.text = "Loading preview…"
-        previewLoadingLabel.isHidden = false
+        previewLoadingLabel.isHidden = true
         titleLabel.text = ""
         idleLabel.isHidden = true
         showSettings = false
@@ -387,6 +398,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func finishDisplayNegotiation() {
         guard waitingForFirstFrame, let core else { return }
+        displayNegotiationPending = true
         waitingForFirstFrame = false
         firstFrameTimeout?.cancel()
         firstFrameTimeout = nil
@@ -407,6 +419,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 guard let self, self.playbackGeneration == generation else { return }
                 switch result {
                 case .success:
+                    self.displayNegotiationPending = false
                     self.playing = true
                     PlayerStartupDiagnostics.mark("mpv-unpaused-after-display-switch")
                     // This is a startup breadcrumb, not a permanent error.
@@ -426,6 +439,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.attachInitialSubtitleIfAvailable()
                     self.showPanel()
                 case .failure(let error):
+                    self.displayNegotiationPending = false
                     self.showHandoffError("Playback could not resume: \(error.localizedDescription)")
                 }
             }
@@ -624,7 +638,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // than the original 360 × 204 pt preview. Never cover the movie.
         // Aspect fill crops to the preview window; the FFmpeg decoder
         // also trims source-encoded black letterboxing.
-        preview.backgroundColor = UIColor(white: 0.12, alpha: 0.86)
+        preview.backgroundColor = .black
         preview.layer.cornerRadius = 16
         preview.layer.borderColor = UIColor.white.withAlphaComponent(0.38).cgColor
         preview.layer.borderWidth = 1
@@ -634,10 +648,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         filmStrip.addArrangedSubview(preview)
 
         previewLoadingLabel.translatesAutoresizingMaskIntoConstraints = false
-        previewLoadingLabel.text = "Loading preview…"
+        previewLoadingLabel.text = ""
         previewLoadingLabel.font = .systemFont(ofSize: 18, weight: .medium)
         previewLoadingLabel.textColor = .white.withAlphaComponent(0.78)
         previewLoadingLabel.textAlignment = .center
+        previewLoadingLabel.isHidden = true
         preview.addSubview(previewLoadingLabel)
         NSLayoutConstraint.activate([
             previewLoadingLabel.leadingAnchor.constraint(equalTo: preview.leadingAnchor, constant: 6),
@@ -949,20 +964,28 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func beginDirectionalSeek(_ direction: Int) {
         // HDMI/first-frame startup must complete before seeking. Otherwise
         // heavy preview decode competes with the initial display transition.
-        guard core != nil, !waitingForFirstFrame, !isPreparingPlayback,
-              heldDirection == 0 else { return }
+        guard core != nil, !waitingForFirstFrame, !displayNegotiationPending,
+              !isPreparingPlayback, heldDirection == 0 else { return }
         // Assign on press-began even in a locked transport. UIKit may
         // resend began callbacks for a held button; don't accelerate
         // multiple times from one physical press.
         heldDirection = direction
         if lockedSeekDirection != 0 {
             if direction == lockedSeekDirection {
-                lockedSpeedIndex = min(4, lockedSpeedIndex + 1)
+                lockedSpeedIndex = min(lockedSeekSpeeds.count - 1, lockedSpeedIndex + 1)
             } else {
                 lockedSeekDirection = direction
                 lockedSpeedIndex = 0
             }
+            // Each click moves the preview immediately, as well as raising
+            // the locked fast-forward/rewind rate.
+            let base = targetSeconds ?? currentSeconds
+            let bound = totalSeconds > 0 ? totalSeconds : 86_400
+            targetSeconds = max(0, min(bound,
+                base + Double(direction) * lockedClickSteps[lockedSpeedIndex]))
+            scheduleFrames()
             refreshLabels()
+            showPanel()
             return
         }
         holdActivationTimer?.invalidate()
@@ -1003,11 +1026,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func advanceLockedSeek(elapsed: Double) {
         guard lockedSeekDirection != 0 else { return }
         let direction = lockedSeekDirection
-        let speeds: [Double] = [2, 4, 8, 16, 32]
         let base = targetSeconds ?? currentSeconds
         let bound = totalSeconds > 0 ? totalSeconds : 86_400
         targetSeconds = max(0, min(bound,
-            base + Double(direction) * elapsed * speeds[lockedSpeedIndex]))
+            base + Double(direction) * elapsed * lockedSeekSpeeds[lockedSpeedIndex]))
         scheduleFrames()
         refreshLabels()
         showPanel()
@@ -1037,7 +1059,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func silentSkip(_ direction: Int) {
-        guard let core else { return }
+        guard let core, !waitingForFirstFrame, !displayNegotiationPending else { return }
         // Crucially: NO progress bar and NO thumbnails for a quick click
         // or swipe, whether the film is currently playing or paused.
         let base = committedSeekTarget ?? max(0, core.timePos, currentSeconds)
@@ -1052,7 +1074,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard core != nil, toolPanel == .none, !toolbarFocused,
-              lockedSeekDirection == 0 else { return false }
+              !waitingForFirstFrame, !displayNegotiationPending,
+              !isPreparingPlayback, lockedSeekDirection == 0 else { return false }
         if gestureRecognizer is UIPanGestureRecognizer { return !playing }
         if gestureRecognizer is UISwipeGestureRecognizer { return true }
         return true
@@ -1061,6 +1084,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     @objc private func remoteSwipe(_ recognizer: UISwipeGestureRecognizer) {
         guard recognizer.state == .ended, core != nil,
               toolPanel == .none, !toolbarFocused,
+              !waitingForFirstFrame, !displayNegotiationPending,
               lockedSeekDirection == 0 else { return }
         let direction = recognizer.direction == .right ? 1 : -1
         if playing {
@@ -1077,16 +1101,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             showPanel()
             seekCommitTimer?.invalidate()
             seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 1.1,
-                repeats: false) { [weak self] _ in self?.commitSeek() }
+                repeats: false) { [weak self] _ in
+                self?.commitSeek(retainPreview: true)
+            }
         }
     }
 
     @objc private func touchScrub(_ gesture: UIPanGestureRecognizer) {
-        guard core != nil, toolPanel == .none, !toolbarFocused else { return }
+        guard core != nil, toolPanel == .none, !toolbarFocused,
+              !waitingForFirstFrame, !displayNegotiationPending,
+              !isPreparingPlayback else { return }
         switch gesture.state {
         case .began:
             guard !playing, lockedSeekDirection == 0, heldDirection == 0 else { return }
             isTouchScrubbing = true
+            PlayerStartupDiagnostics.mark("touchpad-preview-active")
             seekCommitTimer?.invalidate()
             seekCommitTimer = nil
             panOriginSeconds = targetSeconds ?? currentSeconds
@@ -1108,7 +1137,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         case .ended:
             guard isTouchScrubbing else { return }
             isTouchScrubbing = false
-            commitSeek() // Leave the video paused until Play is pressed.
+            // Don't cancel a pending preview before it has even started.
+            // Give the last selected frame a short chance to become visible.
+            scheduleFrames()
+            refreshLabels()
+            seekCommitTimer?.invalidate()
+            seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.75,
+                repeats: false) { [weak self] _ in
+                self?.commitSeek(retainPreview: true)
+            }
         case .cancelled, .failed:
             guard isTouchScrubbing else { return }
             isTouchScrubbing = false
@@ -1404,7 +1441,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewHideTimer?.invalidate()
         previewIsVisible = true
         if frameViews.first?.image == nil {
-            previewLoadingLabel.text = "Loading preview…"
+            previewLoadingLabel.text = ""
             previewLoadingLabel.isHidden = false
         }
         currentPreviewSerial += 1
@@ -1459,8 +1496,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
         resumeAfterLockedSeek = false
+        seekCommitOperationID += 1
+        displayNegotiationPending = false
         frameViews.first?.image = nil
-        previewLoadingLabel.text = "Loading preview…"
+        previewLoadingLabel.text = ""
         previewLoadingLabel.isHidden = false
         heldDirection = 0
         holdTickCount = 0

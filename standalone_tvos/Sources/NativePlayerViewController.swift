@@ -1114,6 +1114,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         switch gesture.state {
         case .began:
             guard !playing, lockedSeekDirection == 0, heldDirection == 0 else { return }
+            seekCommitOperationID += 1
             isTouchScrubbing = true
             PlayerStartupDiagnostics.mark("touchpad-preview-active")
             seekCommitTimer?.invalidate()
@@ -1182,7 +1183,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewIsVisible = false
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
+        previewLoadingLabel.isHidden = true
         previewStatusLabel.isHidden = true
+        frameViews.first?.image = nil
+        lastPreviewRequestedBucket = nil
+        lastPreviewImageSecond = nil
         thumbs.cancel()
         currentPreviewSerial += 1
     }
@@ -1401,80 +1406,113 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
-    private func commitSeek(resumeAfter: Bool = false) {
+    private func commitSeek(resumeAfter: Bool = false, retainPreview: Bool = false) {
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         guard let seconds = targetSeconds, let seekCore = core else { return }
-        // Only the final destination reaches the main player. Keep its
-        // movie frame frozen until the independent thumbnail is dismissed.
+
         currentSeconds = seconds
         committedSeekTarget = seconds
         committedSeekDate = Date()
         targetSeconds = nil
-        stopShowingThumbnail()
-        showPanel()
-        seekCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) {
-            [weak self, weak seekCore] result in
-            guard let self, let seekCore, self.core === seekCore else { return }
-            if case .failure = result {
-                self.statusLabel.text = "Seek failed; playback can continue"
+        seekCommitOperationID += 1
+        let operation = seekCommitOperationID
+
+        // Stop independent FFmpeg reads before making the main hardware
+        // decoder seek. tvOS was sometimes terminating during overlapping
+        // touchpad-preview decode and mpv seek/display recovery.
+        thumbTimer?.invalidate()
+        thumbTimer = nil
+        thumbs.cancel()
+        if retainPreview && frameViews.first?.image != nil {
+            // Keep only the already decoded still briefly while the main
+            // player lands at the target. Do not decode more background frames.
+            previewHideTimer?.invalidate()
+            previewHideTimer = Timer.scheduledTimer(withTimeInterval: 1.1,
+                repeats: false) { [weak self] _ in
+                self?.stopShowingThumbnail()
             }
-            if resumeAfter {
-                // Resume only after the main player accepts the single seek.
-                seekCore.setProperty("pause", value: "no")
-                self.playing = true
-                self.showPanel()
+        } else {
+            stopShowingThumbnail()
+        }
+        if retainPreview {
+            PlayerStartupDiagnostics.mark("touchpad-seek-commit")
+        }
+        showPanel()
+
+        // Give the thumbnail worker a short opportunity to observe the
+        // cancellation before the main mpv player requests its seek.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            [weak self, weak seekCore] in
+            guard let self, let seekCore, self.core === seekCore,
+                  operation == self.seekCommitOperationID else { return }
+            seekCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) {
+                [weak self, weak seekCore] result in
+                guard let self, let seekCore, self.core === seekCore,
+                      operation == self.seekCommitOperationID else { return }
+                if case .failure = result {
+                    self.statusLabel.text = "Seek failed; playback can continue"
+                }
+                if retainPreview { PlayerStartupDiagnostics.clear() }
+                if resumeAfter {
+                    seekCore.setProperty("pause", value: "no")
+                    self.playing = true
+                    self.showPanel()
+                }
             }
         }
     }
 
     private func scheduleFrames() {
-        guard targetSeconds != nil else { return }
-        // Show loading state without obscuring live video with a black
-        // windowed preview. Reveal the independent frame once decoded.
-        let decoded = frameViews.first?.image != nil
-        filmStrip.alpha = decoded ? 1 : 0
-        previewStatusLabel.text = "Preparing thumbnail…"
-        previewStatusLabel.isHidden = decoded
-        seekTimeLabel.alpha = 1
-        thumbTimer?.invalidate()
-        previewHideTimer?.invalidate()
+        guard let seconds = targetSeconds else { return }
+        // Always show the floating black preview window immediately. No
+        // "Loading" / "Preparing" overlays. Retain a nearby old image while
+        // its next frame is being fetched, but blank a distant stale still.
         previewIsVisible = true
-        if frameViews.first?.image == nil {
-            previewLoadingLabel.text = ""
-            previewLoadingLabel.isHidden = false
+        filmStrip.alpha = 1
+        previewLoadingLabel.isHidden = true
+        previewStatusLabel.isHidden = true
+        seekTimeLabel.alpha = 1
+        previewHideTimer?.invalidate()
+        previewHideTimer = nil
+        if let previous = lastPreviewImageSecond,
+           abs(seconds - Double(previous)) > 75 {
+            frameViews.first?.image = nil
+            lastPreviewImageSecond = nil
         }
-        currentPreviewSerial += 1
+
+        // Throttle instead of debounce: continuously moving fingers should
+        // NEVER keep postponing the decoder request. The timer fetches the
+        // latest target at that moment; SeekFrameService coalesces in flight.
+        guard thumbTimer == nil else { return }
         let serial = currentPreviewSerial
-        // Leave cached images visible while another seek batch is queued.
-        thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: false) { [weak self] _ in
-            self?.loadFrames(serial: serial)
+        thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.12,
+            repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.thumbTimer = nil
+            self.loadFrames(serial: serial)
         }
     }
 
     private func loadFrames(serial: Int) {
-        guard let link, let targetSeconds,
+        guard previewIsVisible, let link, let targetSeconds,
               serial == currentPreviewSerial else { return }
-        // One high-priority decoder request for the CURRENT playhead only.
-        // Five competing MKV decoder contexts starved the center preview.
         let second = max(0, Int(targetSeconds.rounded()))
-        // Do not abort the in-flight 4K decoder on every remote tick.
-        // SeekFrameService coalesces to the most recent target and delivers
-        // completed frames as they become available.
+        let bucket = (second / 5) * 5
+        guard lastPreviewRequestedBucket != bucket else { return }
+        lastPreviewRequestedBucket = bucket
         thumbs.request(url: link.url, second: second) { [weak self] image in
             guard let self, self.previewIsVisible,
+                  self.currentPreviewSerial == serial,
                   self.link?.url == link.url else { return }
             if let image {
+                // One latest available preview, with no status message.
                 self.frameViews.first?.image = image
+                self.lastPreviewImageSecond = bucket
                 self.filmStrip.alpha = 1
-                self.previewLoadingLabel.isHidden = true
-                self.previewStatusLabel.isHidden = true
-            } else if self.frameViews.first?.image == nil {
-                self.previewLoadingLabel.text = "Preview unavailable"
-                self.previewLoadingLabel.isHidden = false
-                self.previewStatusLabel.text = "No thumbnail available from this stream"
-                self.previewStatusLabel.isHidden = false
             }
+            self.previewLoadingLabel.isHidden = true
+            self.previewStatusLabel.isHidden = true
         }
     }
 
@@ -1500,7 +1538,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         displayNegotiationPending = false
         frameViews.first?.image = nil
         previewLoadingLabel.text = ""
-        previewLoadingLabel.isHidden = false
+        previewLoadingLabel.isHidden = true
         heldDirection = 0
         holdTickCount = 0
         isTouchScrubbing = false
@@ -1593,7 +1631,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         endLabel.text = totalSeconds > 0 ? clockString(totalSeconds) : "--:--"
         seekTimeLabel.text = lockedSeekDirection != 0
             ? (lockedSeekDirection > 0 ? "FAST FORWARD" : "REWIND") +
-              "  ·  " + ["2×", "4×", "8×", "16×", "32×"][lockedSpeedIndex] +
+              "  ·  " + ["8×", "20×", "50×", "110×", "240×"][lockedSpeedIndex] +
               "  ·  " + clockString(seconds)
             : clockString(seconds)
     }

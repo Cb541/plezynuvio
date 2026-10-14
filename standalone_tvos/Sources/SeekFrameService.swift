@@ -27,6 +27,15 @@ final class SeekFrameService {
     private var pending: Request?
     private var activeToken: NuvioThumbnailAbortToken?
 
+    /// During an actively moving touchpad gesture, show cached stills only.
+    /// FFmpeg network reads are postponed until the finger stops moving.
+    func cachedImage(second: Int) -> UIImage? {
+        let key = max(0, (second / 5) * 5)
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[key]
+    }
+
     func cancel() {
         lock.lock()
         generation &+= 1
@@ -95,7 +104,7 @@ final class SeekFrameService {
                 cache[request.second] = image
                 cacheOrder.removeAll { $0 == request.second }
                 cacheOrder.append(request.second)
-                while cacheOrder.count > 36 {
+                while cacheOrder.count > 12 {
                     let oldest = cacheOrder.removeFirst()
                     cache.removeValue(forKey: oldest)
                 }

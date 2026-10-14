@@ -301,10 +301,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 case .success:
                     self.playing = true
                     PlayerStartupDiagnostics.mark("mpv-unpaused-after-display-switch")
-                    self.statusLabel.text = "Left/Right: seek  ·  Up: picture  ·  Menu: close"
+                    self.statusLabel.text = ""
                     self.showPanel()
                     // Defer subtitles until after the video is running.
                     self.attachInitialSubtitleIfAvailable()
+                    self.showPanel()
                 case .failure(let error):
                     self.showHandoffError("Playback could not resume: \(error.localizedDescription)")
                 }
@@ -891,18 +892,29 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         showPanel()
     }
 
-    private func stepSeek(_ dir: Int) {
+    private func stepSeek(_ direction: Int) {
         guard core != nil else { return }
-        let next = (targetSeconds ?? core?.timePos ?? currentSeconds) + Double(dir) * 10
-        targetSeconds = max(0, min(totalSeconds > 0 ? totalSeconds : 86_400, next))
+        let base = targetSeconds ?? max(0, currentSeconds)
+        let bound = totalSeconds > 0 ? totalSeconds : 86_400
+        targetSeconds = max(0, min(bound, base + Double(direction) * 15))
         scheduleFrames()
         refreshLabels()
         showPanel()
+        seekCommitTimer?.invalidate()
+        // Short, consistent delay allows several consecutive remote swipes
+        // to accumulate, instead of seeking back to a stale mpv time-pos.
+        seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.82, repeats: false) { [weak self] _ in
+            self?.commitSeek()
+        }
     }
 
     private func commitSeek() {
+        seekCommitTimer?.invalidate()
+        seekCommitTimer = nil
         guard let seconds = targetSeconds else { return }
-        core?.command(["seek", String(format: "%.3f", seconds), "absolute+exact"])
+        // Keyframe seek decodes substantially faster than +exact on remote MKV.
+        // The target remains pinned until the asynchronous seek has been sent.
+        core?.command(["seek", String(format: "%.3f", seconds), "absolute"])
         currentSeconds = seconds
         targetSeconds = nil
         filmStrip.alpha = 0
@@ -912,24 +924,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         showPanel()
     }
 
-    @objc private func pan(_ gesture: UIPanGestureRecognizer) {
-        guard core != nil, !showSettings else { return }
-        switch gesture.state {
-        case .began:
-            panOriginSeconds = targetSeconds ?? core?.timePos ?? 0
-            showPanel()
-        case .changed:
-            let translation = gesture.translation(in: remote)
-            let bound = totalSeconds > 0 ? totalSeconds : 86_400
-            targetSeconds = max(0, min(bound, panOriginSeconds + Double(translation.x) * 0.4))
-            scheduleFrames()
-            refreshLabels()
-        case .ended, .cancelled, .failed:
-            commitSeek()
-        default: break
-        }
-    }
-
     private func scheduleFrames() {
         guard targetSeconds != nil else { return }
         filmStrip.alpha = 1
@@ -937,21 +931,22 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         thumbTimer?.invalidate()
         currentPreviewSerial += 1
         let serial = currentPreviewSerial
-        for cell in frameViews { cell.image = nil }
-        thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.17, repeats: false) { [weak self] _ in
+        // Leave cached images visible while another seek batch is queued.
+        thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.18, repeats: false) { [weak self] _ in
             self?.loadFrames(serial: serial)
         }
     }
 
     private func loadFrames(serial: Int) {
         guard let link, let targetSeconds else { return }
-        thumbs.cancel()
         let center = Int(targetSeconds)
+        thumbs.cancel()
         for index in [2, 1, 3, 0, 4] {
-            let second = max(0, center + (index - 2) * 10)
+            let second = max(0, center + (index - 2) * 15)
             thumbs.request(url: link.url, second: second) { [weak self] image in
-                guard let self, self.currentPreviewSerial == serial, self.targetSeconds != nil else { return }
-                self.frameViews[index].image = image
+                guard let self, self.currentPreviewSerial == serial,
+                      self.targetSeconds != nil else { return }
+                if let image { self.frameViews[index].image = image }
             }
         }
     }
@@ -967,6 +962,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         PlayerStartupDiagnostics.clear()
         thumbs.clear()
         thumbTimer?.invalidate()
+        seekCommitTimer?.invalidate()
+        seekCommitTimer = nil
+        toolPanel = .none
+        toolbarFocused = false
+        trackPanel.isHidden = true
+        trackRefreshID += 1
         core?.setVisible(false)
         core?.dispose()
         core = nil
@@ -974,9 +975,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         targetSeconds = nil
         playing = false
         picturePanel.isHidden = true
+        statusLabel.isHidden = false
         idleLabel.isHidden = false
         statusLabel.text = "Choose a stream from Nuvio"
-        titleLabel.text = "Nuvio Player"
+        titleLabel.text = ""
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
         showPanel()
@@ -984,10 +986,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
     private func showPanel() {
         controlsVisible = true
-        panel.isHidden = false
+        panel.isHidden = core == nil
+        statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
+        updateToolbarFocus()
         hideTimer?.invalidate()
-        if core != nil && targetSeconds == nil && !showSettings {
-            hideTimer = Timer.scheduledTimer(withTimeInterval: 7, repeats: false) { [weak self] _ in
+        if core != nil && playing && targetSeconds == nil &&
+           toolPanel == .none && !toolbarFocused {
+            hideTimer = Timer.scheduledTimer(withTimeInterval: 4.5, repeats: false) { [weak self] _ in
                 guard let self else { return }
                 self.controlsVisible = false
                 self.panel.isHidden = true
@@ -1004,11 +1009,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     }
 
     private func refreshLabels() {
-        let t = targetSeconds ?? currentSeconds
-        currentLabel.text = clockString(t)
-        endLabel.text = totalSeconds > 0 ? clockString(totalSeconds) : "--:--"
-        progress.progress = Float(max(0, min(1, totalSeconds > 0 ? t / totalSeconds : 0)))
-        seekTimeLabel.text = "Seek to " + clockString(t)
+        let seconds = targetSeconds ?? currentSeconds
+        progress.progress = Float(max(0, min(1, totalSeconds > 0 ? seconds / totalSeconds : 0)))
+        seekTimeLabel.text = clockString(seconds) + "  /  " +
+            (totalSeconds > 0 ? clockString(totalSeconds) : "--:--")
     }
 
     private func clockString(_ seconds: Double) -> String {
@@ -1024,6 +1028,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         firstFrameTimeout?.cancel()
         repeatTimer?.invalidate()
         thumbTimer?.invalidate()
+        seekCommitTimer?.invalidate()
         hideTimer?.invalidate()
         core?.dispose()
     }

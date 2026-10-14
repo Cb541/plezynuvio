@@ -498,7 +498,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         toolbar.axis = .horizontal
         toolbar.alignment = .center
         toolbar.spacing = 12
-        toolbar.distribution = .fillEqually
+        toolbar.distribution = .fill
         // Text-based controls are intentionally used rather than SF Symbols:
         // the assetless sideloaded tvOS app returned nil for some of the
         // requested system icons, leaving three invisible buttons.
@@ -899,7 +899,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func advanceLockedSeek(elapsed: Double) {
-        guard let direction = lockedSeekDirection == 0 ? nil : lockedSeekDirection else { return }
+        guard lockedSeekDirection != 0 else { return }
+        let direction = lockedSeekDirection
         let speeds: [Double] = [2, 4, 8, 16, 32]
         let base = targetSeconds ?? currentSeconds
         let bound = totalSeconds > 0 ? totalSeconds : 86_400
@@ -1014,11 +1015,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         controlsVisible = false
         panel.isHidden = true
         statusLabel.isHidden = true
-        filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
-        previewHideTimer?.invalidate()
-        previewIsVisible = false
-        thumbs.cancel()
+        stopShowingThumbnail()
         updateToolbarFocus()
     }
 
@@ -1026,9 +1023,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         targetSeconds = nil
-        thumbTimer?.invalidate()
-        currentPreviewSerial += 1
+        stopShowingThumbnail()
         refreshLabels()
+    }
+
+    private func stopShowingThumbnail() {
+        thumbTimer?.invalidate()
+        thumbTimer = nil
+        previewHideTimer?.invalidate()
+        previewHideTimer = nil
+        previewIsVisible = false
+        filmStrip.alpha = 0
+        seekTimeLabel.alpha = 0
+        thumbs.cancel()
+        currentPreviewSerial += 1
     }
 
     private func confirmExit() {
@@ -1249,31 +1257,22 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         guard let seconds = targetSeconds else { return }
-        // Keyframe seek decodes substantially faster than +exact on remote MKV.
-        // The target remains pinned until the asynchronous seek has been sent.
+        // One network seek when the locked transport is confirmed or paused
+        // touch scrubbing finishes. Never seek on every thumbnail update.
         core?.command(["seek", String(format: "%.3f", seconds), "absolute"])
         currentSeconds = seconds
         committedSeekTarget = seconds
         committedSeekDate = Date()
         targetSeconds = nil
-        // Keep the preview on-screen long enough for remote MKV/4K decode.
-        // Cancelling here used to discard every picture before it arrived.
-        previewHideTimer?.invalidate()
-        previewHideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
-            guard let self, self.targetSeconds == nil else { return }
-            self.filmStrip.alpha = 0
-            self.seekTimeLabel.alpha = 0
-            self.previewIsVisible = false
-            self.thumbs.cancel()
-            self.currentPreviewSerial += 1
-            self.showPanel()
-        }
+        stopShowingThumbnail()
         showPanel()
     }
 
     private func scheduleFrames() {
         guard targetSeconds != nil else { return }
-        filmStrip.alpha = 1
+        // Don't cover the actual film with a black full-screen placeholder.
+        // Reveal the independent preview only once a decoded frame exists.
+        filmStrip.alpha = frameViews.first?.image == nil ? 0 : 1
         seekTimeLabel.alpha = 1
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()
@@ -1304,6 +1303,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                   self.link?.url == link.url else { return }
             if let image {
                 self.frameViews.first?.image = image
+                self.filmStrip.alpha = 1
                 self.previewLoadingLabel.isHidden = true
             } else if self.frameViews.first?.image == nil {
                 self.previewLoadingLabel.text = "Preview unavailable"
@@ -1325,6 +1325,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()
         previewIsVisible = false
+        holdActivationTimer?.invalidate()
+        holdActivationTimer = nil
+        lockedSeekDirection = 0
+        lockedSpeedIndex = 0
         frameViews.first?.image = nil
         previewLoadingLabel.text = "Loading preview…"
         previewLoadingLabel.isHidden = false
@@ -1358,17 +1362,26 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func showPanel() {
-        controlsVisible = true
-        panel.isHidden = core == nil
+        hideTimer?.invalidate()
+        let wantsTimeline = core != nil && (
+            !playing || lockedSeekDirection != 0 ||
+            isTouchScrubbing || targetSeconds != nil ||
+            toolbarFocused || toolPanel != .none
+        )
+        controlsVisible = wantsTimeline
+        panel.isHidden = !wantsTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
         updateToolbarFocus()
-        hideTimer?.invalidate()
-        if core != nil && targetSeconds == nil && heldDirection == 0 &&
-           !isTouchScrubbing && toolPanel == .none {
-            // Both paused and playing timelines hide after 3 seconds of
-            // inactivity. Leaving a menu open intentionally suspends timeout.
-            hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
-                guard let self, self.toolPanel == .none, self.targetSeconds == nil else { return }
+        // No timeout while the FF/RW lock is running or a finger is moving
+        // across the touch surface. Only genuine inactivity can hide chrome.
+        if wantsTimeline && lockedSeekDirection == 0 &&
+           !isTouchScrubbing && targetSeconds == nil &&
+           toolPanel == .none {
+            hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0,
+                repeats: false) { [weak self] _ in
+                guard let self, self.lockedSeekDirection == 0,
+                      !self.isTouchScrubbing, self.targetSeconds == nil,
+                      self.toolPanel == .none else { return }
                 self.hidePlaybackChrome()
             }
         }
@@ -1420,6 +1433,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         clock?.invalidate()
         firstFrameTimeout?.cancel()
         repeatTimer?.invalidate()
+        holdActivationTimer?.invalidate()
         thumbTimer?.invalidate()
         seekCommitTimer?.invalidate()
         previewHideTimer?.invalidate()

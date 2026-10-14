@@ -155,10 +155,13 @@ final class SeekFrameService {
         hotImages.setObject(image, forKey: key(slot), cost: max(1, pixels))
         guard writeToDisk,
               let file = diskURL(for: slot, directory: directory) else { return }
+        // JPEG encode immediately on the serial decoder worker. An unlimited
+        // backlog of disk-writing closures retaining full UIImage buffers
+        // could otherwise trigger tvOS memory termination while scrubbing.
+        guard let bytes = image.jpegData(compressionQuality: 0.8) else { return }
         diskWriter.async {
             let fm = FileManager.default
-            guard !fm.fileExists(atPath: file.path),
-                  let bytes = image.jpegData(compressionQuality: 0.8) else { return }
+            guard !fm.fileExists(atPath: file.path) else { return }
             try? fm.createDirectory(at: file.deletingLastPathComponent(),
                                     withIntermediateDirectories: true)
             try? bytes.write(to: file, options: .atomic)

@@ -144,6 +144,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // Dolby Vision or HDR during startup or across separate movies.
     private var experimentalHDRColorBoost = false
     private var colorFilterInFlight = false
+    private var colorCopyMode = false
+    private var colorFilterVerified = false
     private var colorFilterActive = false
     private var colorFilterOperation = 0
     private var colorFilterTimer: Timer?
@@ -365,6 +367,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         experimentalHDRColorBoost = false
         colorFilterActive = false
         colorFilterInFlight = false
+        colorCopyMode = false
+        colorFilterVerified = false
         colorFilterFailed = false
         colorFilterOperation += 1
         colorFilterTimer?.invalidate()
@@ -1033,16 +1037,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             ? (selectedPictureControl == 4 ? .white : .lightGray) : .gray
         if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
+        } else if colorFilterInFlight {
+            colorStatusLabel.text = "Configuring color processing…"
         } else if colorFilterFailed {
             colorStatusLabel.text = "Video filter failed or HDR mode changed.\nBoost disabled; reset to try again."
         } else if sourceIsHDR && !experimentalHDRColorBoost {
             colorStatusLabel.text = "Native \(sourceIsDolbyVision ? "Dolby Vision" : "HDR") protected.\nTurn boost ON to test color changes."
         } else if sourceIsDolbyVision {
-            colorStatusLabel.text = "EXPERIMENTAL: Dolby Vision metadata may be lost.\nConfirm Dolby Vision on TV; turn OFF to restore."
+            colorStatusLabel.text = "EXPERIMENTAL: Dolby Vision metadata may be lost.\n\(colorFilterVerified ? "Filter loaded" : "Verify picture changes") • OFF restores original."
         } else if sourceIsHDR {
-            colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\nTurn OFF if playback or highlights change."
+            colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\n\(colorFilterVerified ? "Filter loaded" : "Verify picture changes") • OFF restores original."
         } else {
-            colorStatusLabel.text = "SDR enhancement • 100% is original\nLeft/Right adjusts • Select resets all"
+            colorStatusLabel.text = "SDR: \(colorFilterVerified ? "filter loaded" : "original picture")\n100% is original • Select resets all"
         }
     }
 

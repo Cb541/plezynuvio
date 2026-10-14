@@ -276,6 +276,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var videoInputRateMbps: Double?
     private var videoDiskCacheBytes: Double?
     private var frameTapInstalled = false
+    // Playback frames and downloaded compressed bytes are separate caches.
+    // Keep a brief on-screen diagnostic until thumbnails are persisted.
+    private let thumbnailCacheHealthLabel = UILabel()
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
     private let filmStrip = UIStackView()
@@ -391,6 +394,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
         cacheRateLabel.text = "VIDEO — Mb/s · 0 previews"
+        thumbnailCacheHealthLabel.text = ""
+        thumbnailCacheHealthLabel.isHidden = true
         explicitChromeHidden = false
         lastCaptureDuration = 0
         backgroundCaptureFailures = 0
@@ -880,6 +885,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cacheRateLabel.isUserInteractionEnabled = false
         panel.addSubview(cacheRateLabel)
 
+        thumbnailCacheHealthLabel.translatesAutoresizingMaskIntoConstraints = false
+        thumbnailCacheHealthLabel.font = .monospacedDigitSystemFont(
+            ofSize: 12, weight: .regular)
+        thumbnailCacheHealthLabel.textColor = UIColor.white.withAlphaComponent(0.74)
+        thumbnailCacheHealthLabel.textAlignment = .right
+        thumbnailCacheHealthLabel.text = ""
+        thumbnailCacheHealthLabel.isUserInteractionEnabled = false
+        thumbnailCacheHealthLabel.isHidden = true
+        panel.addSubview(thumbnailCacheHealthLabel)
+
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.axis = .horizontal
         toolbar.alignment = .center
@@ -1057,6 +1072,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             cacheRateLabel.bottomAnchor.constraint(equalTo: progress.topAnchor, constant: -5),
             cacheRateLabel.widthAnchor.constraint(equalToConstant: 390),
             cacheRateLabel.heightAnchor.constraint(equalToConstant: 18),
+            thumbnailCacheHealthLabel.trailingAnchor.constraint(
+                equalTo: cacheRateLabel.trailingAnchor),
+            thumbnailCacheHealthLabel.bottomAnchor.constraint(
+                equalTo: cacheRateLabel.topAnchor, constant: -2),
+            thumbnailCacheHealthLabel.widthAnchor.constraint(equalToConstant: 390),
+            thumbnailCacheHealthLabel.heightAnchor.constraint(equalToConstant: 15),
             endLabel.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -17),
             endLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             endLabel.widthAnchor.constraint(equalToConstant: 105),
@@ -2878,9 +2899,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // The existing mpv pause-property cache can lag actual playback.
         // When samples are being enqueued and the controller says playing,
         // collecting an already-decoded still is safe independently of it.
-        let captureAllowed = frameTapInstalled && playing
-            && !waitingForFirstFrame && !isPreparingPlayback
-            && !displayNegotiationPending
+        // Decode-time capture must not depend on the view controller's
+        // manually maintained 'playing' flag. Disk-backed media read-ahead
+        // changes buffering/startup timing, but mpv can still enqueue real
+        // decoded video frames when that flag is stale.
+        let captureAllowed = frameTapInstalled
+            && core != nil && !isPreparingPlayback
             && targetSeconds == nil && !previewIsVisible
             && mainFramePreviewOrigin == nil
             && playbackSecond.isFinite && playbackSecond >= 0
@@ -2933,6 +2957,29 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 cacheRateLabel.text = String(
                     format: "VIDEO — Mb/s · %d previews",
                     stats.frameCount)
+            }
+            // Show capture pipeline health only while no JPEG has been
+            // persisted. I = images converted, C = callbacks delivered,
+            // R = images handed to cache, J = JPEG encodes, X = failures.
+            // This avoids conflating a 2-GB compressed-video buffer with
+            // zero generated seek previews.
+            if stats.frameCount == 0 {
+                thumbnailCacheHealthLabel.isHidden = false
+                if !frameTapInstalled {
+                    thumbnailCacheHealthLabel.text = "Preview renderer unavailable"
+                } else {
+                    thumbnailCacheHealthLabel.text = String(
+                        format: "I:%llu C:%llu R:%d J:%d X:%d",
+                        NuvioFrameTapImageCount(),
+                        NuvioFrameTapCallbackCount(),
+                        stats.deliveredFrames,
+                        stats.jpegEncodedFrames,
+                        stats.failedEncodes + stats.failedWrites
+                            + stats.missingDirectories)
+                }
+            } else {
+                thumbnailCacheHealthLabel.isHidden = true
+                thumbnailCacheHealthLabel.text = ""
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

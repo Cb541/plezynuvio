@@ -26,6 +26,12 @@ jobs:
           brew install xcodegen
           xcodegen --version
 
+      - name: Generate layered Apple TV app icon
+        run: |
+          python3 -m venv /tmp/nuvio-icon-venv
+          /tmp/nuvio-icon-venv/bin/python -m pip install --quiet Pillow
+          /tmp/nuvio-icon-venv/bin/python standalone_tvos/tools/generate_app_icon.py
+
       - name: Create independent Xcode project
         run: |
           cd standalone_tvos

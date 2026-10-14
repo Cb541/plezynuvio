@@ -28,6 +28,25 @@ jobs:
           flutter-version: "3.47.1"
           cache: true
 
+      # Flutter 3.47.1 release AOT can abort with:
+      # "Class with illegal cid, full-aot: _window_macos.dart _Rect"
+      # (flutter/flutter#191575). This experimental windowing feature is
+      # unused on tvOS. Disable it inside this disposable build runner only.
+      - name: Disable unused experimental Flutter windowing during tvOS AOT
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          sdk = Path(shutil.which("flutter")).resolve().parent.parent
+          features = sdk / "packages/flutter/lib/src/foundation/_features.dart"
+          original = features.read_text()
+          before = "bool isWindowingEnabled = debugEnabledFeatureFlags.contains('windowing');"
+          if before not in original:
+              raise SystemExit(f"Flutter windowing workaround target missing: {features}")
+          features.write_text(original.replace(before, "bool isWindowingEnabled = false;"))
+          print("Disabled unused Flutter experimental windowing for this tvOS CI build.")
+          PY
+
       - name: Resolve locked Dart dependencies
         run: flutter pub get --enforce-lockfile --no-example
 

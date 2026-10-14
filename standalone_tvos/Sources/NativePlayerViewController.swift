@@ -2887,11 +2887,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
             let stats = thumbs.cacheStats()
-            let enqueues = NuvioFrameTapEnqueueCount()
-            let received = NuvioFrameTapMatchedCount()
             let images = NuvioFrameTapImageCount()
-            let missing = NuvioFrameTapMissingPixelCount()
-            let failures = NuvioFrameTapConvertFailureCount()
+            let callbacks = NuvioFrameTapCallbackCount()
             if stats.frameCount > 0 {
                 cacheRateLabel.text = String(
                     format: "CACHE %.3f MB/s · %d frames",
@@ -2899,12 +2896,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             } else if !frameTapInstalled {
                 cacheRateLabel.text = "CACHE HOOK UNAVAILABLE"
             } else {
-                // E=intercepted enqueues, M=main-player sample matches,
-                // I=converted images, N=nil pixel buffers, F=conversion fails.
-                // A visible status is essential for hardware-only tvOS bugs.
+                // I = converted by GPU, C = callback delivered to Swift,
+                // R = frame received by cache, J = JPEG encoded,
+                // X = JPEG/disk errors, W = files successfully written.
+                // This isolates the exact stage failing on a real Apple TV.
                 cacheRateLabel.text = String(
-                    format: "TAP E:%llu M:%llu I:%llu N:%llu F:%llu",
-                    enqueues, received, images, missing, failures)
+                    format: "I:%llu C:%llu R:%d J:%d W:%d X:%d",
+                    images, callbacks, stats.deliveredFrames,
+                    stats.jpegEncodedFrames, stats.frameCount,
+                    stats.failedEncodes + stats.failedWrites
+                        + stats.missingDirectories)
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

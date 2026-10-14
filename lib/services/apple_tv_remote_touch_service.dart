@@ -11,6 +11,14 @@ import 'gamepad_service.dart';
 
 enum _SwipeAxis { horizontal, vertical }
 
+/// Raw touchpad samples surfaced independently of focus-navigation swipes.
+class NuvioTouchSample {
+  const NuvioTouchSample({required this.type, this.x, this.y});
+  final String type;
+  final double? x;
+  final double? y;
+}
+
 class AppleTvRemotePlayPauseAction {
   final String source;
   final String? detail;
@@ -82,6 +90,12 @@ class AppleTvRemoteTouchService {
   final VoidCallback _scheduleFrame;
   final DateTime Function() _now;
   final GamepadDuplicateInputGuard _duplicateInputGuard;
+
+  final StreamController<NuvioTouchSample> _nuvioTouchController =
+      StreamController<NuvioTouchSample>.broadcast();
+  bool captureNuvioTouch = false;
+
+  Stream<NuvioTouchSample> get nuvioTouches => _nuvioTouchController.stream;
 
   final StreamController<AppleTvRemotePlayPauseAction> _playPauseController =
       StreamController<AppleTvRemotePlayPauseAction>.broadcast();
@@ -162,6 +176,18 @@ class AppleTvRemoteTouchService {
     }
 
     _logTouch(type, arguments);
+
+    if (captureNuvioTouch &&
+        (type == 'started' || type == 'move' || type == 'ended' || type == 'cancelled')) {
+      final position = _positionFrom(arguments);
+      _nuvioTouchController.add(NuvioTouchSample(
+        type: type,
+        x: position?.$1,
+        y: position?.$2,
+      ));
+      _resetTouch();
+      return;
+    }
 
     switch (type) {
       case 'started':

@@ -415,7 +415,8 @@ class MpvPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHandler, MpvPluginS
       result(FlutterError(code: "INVALID_ARGS", message: "setVideoZoom requires scale", details: nil))
       return
     }
-    playerCore?.setVideoZoom(scale)
+    let verticalScale = doubleValue(args["verticalScale"]) ?? 1.0
+    playerCore?.setVideoZoom(scale, verticalScale: verticalScale)
     result(nil)
   }
 

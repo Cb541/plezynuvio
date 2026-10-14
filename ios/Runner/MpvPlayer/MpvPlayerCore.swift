@@ -130,14 +130,15 @@ class MpvPlayerCore: MpvPlayerCoreBase {
   /// the inline OSD sibling layer keeps its own geometry. PiP is unaffected:
   /// the Dart side resets zoom before entry, and the system presents the
   /// layer's buffers, not its on-screen transform.
-  func setVideoZoom(_ scale: Double) {
+  func setVideoZoom(_ scale: Double, verticalScale: Double = 1.0) {
     let clamped = min(max(scale, 0.25), 4.0)
-    Self.log("setVideoZoom(\(scale)) -> \(clamped)")
+    let stretched = min(max(verticalScale, 0.60), 1.80)
+    Self.log("setVideoZoom(\(scale), verticalScale=\(stretched)) -> \(clamped)")
     DispatchQueue.main.async { [weak self] in
       guard let self, let container = self.containerView, let videoLayer = self.videoLayer else {
         return
       }
-      let zoomed = abs(clamped - 1.0) >= 0.0005
+      let zoomed = abs(clamped - 1.0) >= 0.0005 || abs(stretched - 1.0) >= 0.0005
       self.withoutLayerAnimations {
         // Clip only while zoomed: at 100% the layer tree stays identical to a
         // build without custom zoom, so the unzoomed path cannot regress
@@ -145,7 +146,7 @@ class MpvPlayerCore: MpvPlayerCoreBase {
         container.clipsToBounds = zoomed
         videoLayer.transform =
           zoomed
-          ? CATransform3DMakeScale(CGFloat(clamped), CGFloat(clamped), 1)
+          ? CATransform3DMakeScale(CGFloat(clamped), CGFloat(clamped * stretched), 1)
           : CATransform3DIdentity
       }
     }

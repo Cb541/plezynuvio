@@ -1859,6 +1859,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if touchpadPreviewMode {
             PlayerStartupDiagnostics.mark("touchpad-thumbnail-decode")
         }
+        // Matroska isn't a supported AVAssetImageGenerator container.
+        // Go directly to mpv fallback rather than wasting seconds probing it.
+        if ["mkv", "webm", "avi", "m2ts", "vob"].contains(link.url.pathExtension.lowercased()) {
+            requestNativePreviewTarget(bucket, serial: serial)
+            return
+        }
         thumbs.request(url: link.url, second: second) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,
@@ -1886,6 +1892,179 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
+    // MARK: - Native mpv single-decoder preview fallback
+    //
+    // AVFoundation cannot read MKV reliably. Rather than create the second
+    // FFmpeg decoder that repeatedly crashed tvOS, use mpv's own screenshot
+    // command on the EXISTING decoder. The original frame is frozen above
+    // the movie while paused mpv seeks to candidate frames.
+    private func takeMpvStill(_ completion: @escaping (UIImage?) -> Void) {
+        guard let previewCore = core else { completion(nil); return }
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nuvio-preview-\(UUID().uuidString).jpg")
+        previewCore.commandAsync(["screenshot-to-file", file.path, "video"]) {
+            [weak self, weak previewCore] result in
+            guard let self, let previewCore, self.core === previewCore else {
+                try? FileManager.default.removeItem(at: file)
+                return
+            }
+            // ImageIO downsamples without materializing a giant 4K UIImage.
+            DispatchQueue.global(qos: .utility).async {
+                var image: UIImage?
+                if case .success = result,
+                   let source = CGImageSourceCreateWithURL(file as CFURL, nil) {
+                    let options: [CFString: Any] = [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 720,
+                        kCGImageSourceShouldCacheImmediately: false
+                    ]
+                    if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0,
+                        options as CFDictionary) {
+                        image = UIImage(cgImage: cgImage)
+                    }
+                }
+                try? FileManager.default.removeItem(at: file)
+                DispatchQueue.main.async { completion(image) }
+            }
+        }
+    }
+
+    private func requestNativePreviewTarget(_ second: Int, serial: Int) {
+        guard serial == currentPreviewSerial, previewIsVisible, targetSeconds != nil,
+              core?.isPaused == true, !mainFramePreviewUnsupported,
+              !waitingForFirstFrame, !displayNegotiationPending else { return }
+        mainFramePreviewPending = second
+        if mainFramePreviewBusy { return }
+        if mainFramePreviewOrigin == nil {
+            mainFramePreviewBusy = true
+            let generation = mainFramePreviewGeneration
+            let position = max(0, core?.timePos ?? currentSeconds)
+            takeMpvStill { [weak self] image in
+                guard let self, generation == self.mainFramePreviewGeneration,
+                      self.previewIsVisible, self.targetSeconds != nil else { return }
+                guard let image else {
+                    // If this AVSampleBuffer VO has no screenshot support,
+                    // don't seek the main movie or allow a hidden video jump.
+                    self.mainFramePreviewUnsupported = true
+                    self.mainFramePreviewBusy = false
+                    PlayerStartupDiagnostics.mark("native-screenshot-not-supported")
+                    return
+                }
+                self.mainFramePreviewOrigin = position
+                self.frozenVideo.image = image
+                self.frozenVideo.isHidden = false
+                self.mainFramePreviewBusy = false
+                self.continueNativePreview()
+            }
+        } else {
+            continueNativePreview()
+        }
+    }
+
+    private func continueNativePreview() {
+        guard !mainFramePreviewBusy, let origin = mainFramePreviewOrigin,
+              let desired = mainFramePreviewPending,
+              previewIsVisible, targetSeconds != nil, let previewCore = core else { return }
+        mainFramePreviewPending = nil
+        mainFramePreviewBusy = true
+        mainFramePreviewTarget = desired
+        let generation = mainFramePreviewGeneration
+        if abs((previewCore.timePos) - Double(desired)) <= 1.0 {
+            captureNativePreviewTarget(desired, generation: generation)
+            return
+        }
+        mainFramePreviewAwaitingSeek = true
+        previewCore.commandAsync(["seek", String(format: "%.3f", Double(desired)),
+                                  "absolute"]) { [weak self] result in
+            guard let self, generation == self.mainFramePreviewGeneration else { return }
+            if case .failure = result {
+                self.mainFramePreviewAwaitingSeek = false
+                self.mainFramePreviewBusy = false
+                self.mainFramePreviewPending = nil
+                self.abortNativePreviewToOrigin(origin)
+            }
+        }
+        // Network streams may never emit playback-restart for a broken seek.
+        // Do not leave the frame-capture state or frozen overlay stuck.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self, generation == self.mainFramePreviewGeneration,
+                  self.mainFramePreviewAwaitingSeek,
+                  self.mainFramePreviewTarget == desired else { return }
+            self.mainFramePreviewAwaitingSeek = false
+            let measured = self.core?.timePos ?? -999
+            if abs(measured - Double(desired)) <= 5 {
+                self.captureNativePreviewTarget(desired, generation: generation)
+            } else {
+                self.mainFramePreviewBusy = false
+                self.abortNativePreviewToOrigin(origin)
+            }
+        }
+    }
+
+    private func captureNativePreviewTarget(_ desired: Int, generation: Int) {
+        guard generation == mainFramePreviewGeneration,
+              mainFramePreviewBusy, previewIsVisible, let link else { return }
+        mainFramePreviewAwaitingSeek = false
+        takeMpvStill { [weak self] image in
+            guard let self, generation == self.mainFramePreviewGeneration,
+                  self.previewIsVisible else { return }
+            if let image {
+                self.thumbs.cachePlaybackFrame(image, second: desired)
+                let selected = max(0, (Int((self.targetSeconds ?? -1).rounded()) / 2) * 2)
+                if selected == desired {
+                    self.frameViews.first?.image = image
+                    self.lastPreviewImageSecond = desired
+                    self.filmStrip.alpha = 1
+                }
+                PlayerStartupDiagnostics.mark("native-preview-frame-ready")
+            } else {
+                self.mainFramePreviewUnsupported = true
+                PlayerStartupDiagnostics.mark("native-preview-capture-unavailable")
+            }
+            self.mainFramePreviewBusy = false
+            self.mainFramePreviewTarget = nil
+            if self.mainFramePreviewUnsupported {
+                if let original = self.mainFramePreviewOrigin {
+                    self.abortNativePreviewToOrigin(original)
+                }
+            } else if self.link?.url == link.url {
+                self.continueNativePreview()
+            }
+        }
+    }
+
+    private func abortNativePreviewToOrigin(_ origin: Double) {
+        // Missing snapshot / seek support should never break normal playback.
+        mainFramePreviewGeneration += 1
+        mainFramePreviewPending = nil
+        mainFramePreviewTarget = nil
+        mainFramePreviewOrigin = nil
+        mainFramePreviewBusy = false
+        mainFramePreviewAwaitingSeek = false
+        mainFramePreviewRestoreTarget = origin
+        core?.commandAsync(["seek", String(format: "%.3f", origin), "absolute"]) {
+            [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                guard let self, self.mainFramePreviewRestoreTarget == origin else { return }
+                self.finishNativePreviewRestore()
+            }
+        }
+    }
+
+    private func finishNativePreviewRestore() {
+        let resume = mainFramePreviewResumeAfterRestore
+        mainFramePreviewResumeAfterRestore = false
+        mainFramePreviewRestoreTarget = nil
+        frozenVideo.isHidden = true
+        frozenVideo.image = nil
+        if resume {
+            core?.setProperty("pause", value: "no")
+            playing = true
+            showPanel()
+        }
+    }
+
     private func leavePlayback() {
         playbackGeneration += 1
         isPreparingPlayback = false
@@ -1895,6 +2074,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         subtitleURLToLoad = nil
         subtitleAlreadyRequested = false
         PlayerStartupDiagnostics.clear()
+        mainFramePreviewGeneration += 1
+        mainFramePreviewOrigin = nil
+        mainFramePreviewPending = nil
+        mainFramePreviewRestoreTarget = nil
+        mainFramePreviewBusy = false
+        mainFramePreviewAwaitingSeek = false
+        frozenVideo.isHidden = true
+        frozenVideo.image = nil
         thumbs.clear()
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()

@@ -53,6 +53,26 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var showSettings = false
     private var selectedPictureControl = 0
     private var controlsVisible = true
+    private enum ToolPanel { case none, picture, audio, subtitles, info }
+    private enum TrackKind: String { case audio, sub }
+    private struct TrackChoice {
+        let id: String
+        let caption: String
+        let selected: Bool
+    }
+    private var toolPanel: ToolPanel = .none
+    private var toolbarFocused = false
+    private var toolbarIndex = 0
+    private var trackChoices: [TrackChoice] = []
+    private var choiceIndex = 0
+    private var trackRefreshID = 0
+    private var infoRows: [String] = []
+    private var seekCommitTimer: Timer?
+    private let toolbar = UIStackView()
+    private var toolbarButtons: [UIButton] = []
+    private let trackPanel = UIView()
+    private let trackTitle = UILabel()
+    private var trackLabels: [UILabel] = []
 
     private let remote = RemoteSurface()
     private let panel = UIView()
@@ -82,9 +102,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             idleLabel.text = "NUVIO PLAYER\n\nLast playback stopped during: \(unfinished)\n\nTry opening a stream again. If the app closes, reopen it from the Home Screen to see the last stage."
             statusLabel.text = "Diagnostics: \(unfinished)"
         }
-        let gesture = UIPanGestureRecognizer(target: self, action: #selector(pan(_:)))
-        gesture.cancelsTouchesInView = false
-        remote.addGestureRecognizer(gesture)
+        // One directional swipe = one 15 second step, regardless of swipe velocity.
+        for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
+            let swipe = UISwipeGestureRecognizer(target: self, action: #selector(remoteSwipe(_:)))
+            swipe.direction = direction
+            swipe.cancelsTouchesInView = true
+            remote.addGestureRecognizer(swipe)
+        }
         clock = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(refreshClock),
                                      userInfo: nil, repeats: true)
     }
@@ -133,12 +157,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
         thumbs.clear()
         link = media
-        titleLabel.text = media.title
+        titleLabel.text = ""
         idleLabel.isHidden = true
         showSettings = false
         picturePanel.isHidden = true
         zoom = 1
         verticalStretch = 1
+        toolPanel = .none
+        toolbarFocused = false
+        trackPanel.isHidden = true
+        toolbarIndex = 0
         targetSeconds = nil
         currentSeconds = 0
         totalSeconds = 0
@@ -366,156 +394,183 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         remote.receiver = self
         view.addSubview(remote)
 
-        let center = UIView()
-        center.translatesAutoresizingMaskIntoConstraints = false
-        center.isUserInteractionEnabled = false
-        center.backgroundColor = .clear
-        view.addSubview(center)
-
         idleLabel.translatesAutoresizingMaskIntoConstraints = false
-        idleLabel.text = "NUVIO PLAYER\n\nOpen a video in Nuvio and select Nuvio Player."
-        idleLabel.font = .systemFont(ofSize: 32, weight: .medium)
+        idleLabel.text = "NUVIO PLAYER\n\nChoose a stream in Nuvio"
+        idleLabel.font = .systemFont(ofSize: 30, weight: .medium)
         idleLabel.textAlignment = .center
         idleLabel.numberOfLines = 0
         idleLabel.textColor = .white
-        center.addSubview(idleLabel)
+        view.addSubview(idleLabel)
 
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.text = "Choose a stream in Nuvio"
+        statusLabel.textColor = .white.withAlphaComponent(0.88)
+        statusLabel.font = .systemFont(ofSize: 17)
+        statusLabel.textAlignment = .center
+        statusLabel.numberOfLines = 2
+        view.addSubview(statusLabel)
+
+        // A transparent, one-line timeline replaces the large black transport box.
         panel.translatesAutoresizingMaskIntoConstraints = false
-        panel.backgroundColor = UIColor(white: 0.03, alpha: 0.86)
-        panel.layer.cornerRadius = 24
-        panel.clipsToBounds = true
+        panel.backgroundColor = .clear
+        panel.isUserInteractionEnabled = false
         view.addSubview(panel)
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.progressTintColor = .white
+        progress.trackTintColor = UIColor.white.withAlphaComponent(0.35)
+        progress.layer.cornerRadius = 2
+        progress.clipsToBounds = true
+        panel.addSubview(progress)
 
-        titleLabel.textColor = .white
-        titleLabel.font = .systemFont(ofSize: 29, weight: .semibold)
-        titleLabel.text = "Nuvio Player"
-        titleLabel.lineBreakMode = .byTruncatingTail
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.axis = .horizontal
+        toolbar.alignment = .center
+        toolbar.spacing = 12
+        toolbar.distribution = .fillEqually
+        for symbol in ["waveform", "captions.bubble", "info.circle"] {
+            let button = UIButton(type: .system)
+            button.setImage(UIImage(systemName: symbol, withConfiguration:
+                UIImage.SymbolConfiguration(pointSize: 26, weight: .medium)), for: .normal)
+            button.tintColor = .white
+            button.backgroundColor = UIColor.white.withAlphaComponent(0.12)
+            button.layer.cornerRadius = 15
+            button.isUserInteractionEnabled = false
+            button.accessibilityLabel = symbol == "waveform" ? "Audio" :
+                (symbol == "captions.bubble" ? "Subtitles" : "File information")
+            toolbarButtons.append(button)
+            toolbar.addArrangedSubview(button)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.widthAnchor.constraint(equalToConstant: 52).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        }
+        panel.addSubview(toolbar)
 
-        statusLabel.textColor = .white.withAlphaComponent(0.66)
-        statusLabel.font = .systemFont(ofSize: 17, weight: .regular)
-        statusLabel.text = "Choose a stream from Nuvio"
-
-        seekTimeLabel.textColor = .white
-        seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
-        seekTimeLabel.textAlignment = .center
-        seekTimeLabel.isHidden = false
-
+        filmStrip.translatesAutoresizingMaskIntoConstraints = false
         filmStrip.axis = .horizontal
-        filmStrip.spacing = 11
+        filmStrip.spacing = 9
         filmStrip.distribution = .fillEqually
+        filmStrip.alignment = .fill
+        filmStrip.isUserInteractionEnabled = false
+        view.addSubview(filmStrip)
         for i in 0..<5 {
             let image = UIImageView()
-            image.contentMode = .scaleAspectFit
-            image.backgroundColor = UIColor(white: 0.15, alpha: 1)
-            image.layer.cornerRadius = 11
-            image.clipsToBounds = true
-            image.layer.borderColor = UIColor.white.withAlphaComponent(i == 2 ? 0.95 : 0.15).cgColor
+            image.contentMode = .scaleAspectFill
+            image.backgroundColor = UIColor(white: 0.15, alpha: 0.65)
+            image.layer.cornerRadius = 9
+            image.layer.borderColor = UIColor.white.withAlphaComponent(i == 2 ? 0.96 : 0.15).cgColor
             image.layer.borderWidth = i == 2 ? 3 : 1
+            image.clipsToBounds = true
+            image.isUserInteractionEnabled = false
             frameViews.append(image)
             filmStrip.addArrangedSubview(image)
         }
-        filmStrip.isHidden = false
+        filmStrip.alpha = 0
+        seekTimeLabel.translatesAutoresizingMaskIntoConstraints = false
+        seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
+        seekTimeLabel.textColor = .white
+        seekTimeLabel.textAlignment = .center
+        seekTimeLabel.alpha = 0
+        view.addSubview(seekTimeLabel)
 
-        currentLabel.textColor = .white
-        currentLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .medium)
-        currentLabel.text = "0:00"
-        endLabel.textColor = .white
-        endLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .medium)
-        endLabel.text = "0:00"
-        endLabel.textAlignment = .right
-        progress.progressTintColor = .white
-        progress.trackTintColor = UIColor(white: 0.4, alpha: 0.6)
-
-        instructionsLabel.text = "Touch remote: scrub    ·    Select: pause/play    ·    ↑ Picture controls"
-        instructionsLabel.textColor = .white.withAlphaComponent(0.74)
-        instructionsLabel.font = .systemFont(ofSize: 16)
-        instructionsLabel.textAlignment = .center
-
-        for item in [titleLabel, statusLabel, seekTimeLabel, filmStrip, currentLabel,
-                     endLabel, progress, instructionsLabel] {
-            item.translatesAutoresizingMaskIntoConstraints = false
-            panel.addSubview(item)
-        }
-
+        // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
-        picturePanel.backgroundColor = UIColor(white: 0.07, alpha: 0.94)
+        picturePanel.backgroundColor = UIColor(white: 0.075, alpha: 0.94)
         picturePanel.layer.cornerRadius = 18
         picturePanel.isHidden = true
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
-
-        zoomLabel.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
-        stretchLabel.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
-        zoomLabel.textColor = .white
-        stretchLabel.textColor = .white
         for label in [zoomLabel, stretchLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
+            label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
+            label.textColor = .white
             picturePanel.addSubview(label)
         }
         updatePictureLabels()
 
+        // Audio/subtitle/info menu shares the zoom panel's simple vertical layout.
+        trackPanel.translatesAutoresizingMaskIntoConstraints = false
+        trackPanel.backgroundColor = UIColor(white: 0.075, alpha: 0.94)
+        trackPanel.layer.cornerRadius = 18
+        trackPanel.isUserInteractionEnabled = false
+        trackPanel.isHidden = true
+        view.addSubview(trackPanel)
+        let rows = UIStackView()
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        rows.axis = .vertical
+        rows.spacing = 9
+        trackPanel.addSubview(rows)
+        trackTitle.font = .systemFont(ofSize: 23, weight: .semibold)
+        trackTitle.textColor = .white
+        rows.addArrangedSubview(trackTitle)
+        trackTitle.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        for _ in 0..<7 {
+            let label = UILabel()
+            label.font = .systemFont(ofSize: 19)
+            label.textColor = .white
+            label.adjustsFontSizeToFitWidth = true
+            label.minimumScaleFactor = 0.75
+            label.heightAnchor.constraint(equalToConstant: 35).isActive = true
+            trackLabels.append(label)
+            rows.addArrangedSubview(label)
+        }
         NSLayoutConstraint.activate([
             remote.topAnchor.constraint(equalTo: view.topAnchor),
             remote.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             remote.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             remote.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-
-            center.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            center.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            center.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.85),
-            idleLabel.leadingAnchor.constraint(equalTo: center.leadingAnchor),
-            idleLabel.trailingAnchor.constraint(equalTo: center.trailingAnchor),
-            idleLabel.centerYAnchor.constraint(equalTo: center.centerYAnchor),
-
-            panel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 68),
-            panel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -68),
-            panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -42),
-
-            titleLabel.topAnchor.constraint(equalTo: panel.topAnchor, constant: 20),
-            titleLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 28),
-            titleLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -28),
-            statusLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
-            statusLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            statusLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-
-            seekTimeLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 9),
-            seekTimeLabel.centerXAnchor.constraint(equalTo: panel.centerXAnchor),
-            filmStrip.topAnchor.constraint(equalTo: seekTimeLabel.bottomAnchor, constant: 10),
-            filmStrip.heightAnchor.constraint(equalToConstant: 105),
-            filmStrip.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 28),
-            filmStrip.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -28),
-
-            progress.topAnchor.constraint(equalTo: filmStrip.bottomAnchor, constant: 21),
-            progress.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 28),
-            progress.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -28),
-            progress.heightAnchor.constraint(equalToConstant: 7),
-
-            currentLabel.topAnchor.constraint(equalTo: progress.bottomAnchor, constant: 8),
-            currentLabel.leadingAnchor.constraint(equalTo: progress.leadingAnchor),
-            endLabel.topAnchor.constraint(equalTo: currentLabel.topAnchor),
-            endLabel.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
-
-            instructionsLabel.topAnchor.constraint(equalTo: currentLabel.bottomAnchor, constant: 11),
-            instructionsLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 22),
-            instructionsLabel.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -22),
-            instructionsLabel.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -20),
-
+            idleLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            idleLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            idleLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.85),
+            statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            statusLabel.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -20),
+            statusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.85),
+            panel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            panel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -19),
+            panel.heightAnchor.constraint(equalToConstant: 56),
+            progress.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 14),
+            progress.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -26),
+            progress.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
+            progress.heightAnchor.constraint(equalToConstant: 5),
+            toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
+            filmStrip.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 140),
+            filmStrip.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -140),
+            filmStrip.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -22),
+            filmStrip.heightAnchor.constraint(equalToConstant: 115),
+            seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
+            seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
-            picturePanel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -75),
-            picturePanel.widthAnchor.constraint(equalToConstant: 435),
+            picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
+            picturePanel.widthAnchor.constraint(equalToConstant: 440),
             zoomLabel.topAnchor.constraint(equalTo: picturePanel.topAnchor, constant: 23),
             zoomLabel.leadingAnchor.constraint(equalTo: picturePanel.leadingAnchor, constant: 22),
             zoomLabel.trailingAnchor.constraint(equalTo: picturePanel.trailingAnchor, constant: -22),
             stretchLabel.topAnchor.constraint(equalTo: zoomLabel.bottomAnchor, constant: 18),
             stretchLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             stretchLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            stretchLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -24)
+            stretchLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -24),
+            trackPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -35),
+            trackPanel.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -22),
+            trackPanel.widthAnchor.constraint(equalToConstant: 550),
+            rows.leadingAnchor.constraint(equalTo: trackPanel.leadingAnchor, constant: 23),
+            rows.trailingAnchor.constraint(equalTo: trackPanel.trailingAnchor, constant: -23),
+            rows.topAnchor.constraint(equalTo: trackPanel.topAnchor, constant: 20),
+            rows.bottomAnchor.constraint(equalTo: trackPanel.bottomAnchor, constant: -20)
         ])
-        // Hide imagery by alpha instead of isHidden, which would collapse the
-        // filmstrip's timeline geometry while seeking.
-        filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
-        panel.isHidden = false
+        panel.isHidden = true
+        updateToolbarFocus()
+    }
+
+    private func updateToolbarFocus() {
+        for (index, button) in toolbarButtons.enumerated() {
+            let selected = toolbarFocused && toolPanel == .none && index == toolbarIndex
+            button.layer.borderWidth = selected ? 2.2 : 0
+            button.layer.borderColor = UIColor.white.cgColor
+            button.backgroundColor = selected
+                ? UIColor.white.withAlphaComponent(0.30)
+                : UIColor.white.withAlphaComponent(0.12)
+        }
     }
 
     private func updatePictureLabels() {
@@ -524,6 +579,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
     }
+
 
     private func applyPictureTransform() {
         guard let layer = core?.sampleBufferDisplayLayer else { return }

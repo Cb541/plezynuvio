@@ -1128,7 +1128,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func checkColorSourceMetadata() {
-        guard let playbackCore = core, playbackCore.videoSize != nil else { return }
+        // Some streams don't publish dimensions before their first
+        // playback-restart notification. The user can open Picture later;
+        // query the decoded stream's color metadata directly instead of
+        // permanently refusing to initialize the controls.
+        guard let playbackCore = core, !waitingForFirstFrame else { return }
         let generation = playbackGeneration
         playbackCore.getPropertyAsync("video-params/gamma") {
             [weak self, weak playbackCore] result in
@@ -1367,6 +1371,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 toolPanel = .picture
                 picturePanel.isHidden = false
                 selectedPictureControl = 0
+                checkColorSourceMetadata()
                 updatePictureLabels()
                 showPanel()
             }

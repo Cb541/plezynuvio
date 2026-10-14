@@ -1158,17 +1158,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
         let restorePlayback = resumeAfterLockedSeek
-        resumeAfterLockedSeek = false
         if commit {
+            resumeAfterLockedSeek = false
             commitSeek(resumeAfter: resumeWhenCommitted ?? restorePlayback)
         } else {
+            // cancelUncommittedScrub restores the original mpv position
+            // BEFORE resuming, instead of briefly playing the preview frame.
+            resumeAfterLockedSeek = restorePlayback
             cancelUncommittedScrub()
-            if restorePlayback {
-                core?.setProperty("pause", value: "no")
-                playing = true
-            }
         }
-        stopShowingThumbnail()
         showPanel()
     }
 
@@ -1859,12 +1857,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if touchpadPreviewMode {
             PlayerStartupDiagnostics.mark("touchpad-thumbnail-decode")
         }
-        // Matroska isn't a supported AVAssetImageGenerator container.
-        // Go directly to mpv fallback rather than wasting seconds probing it.
-        if ["mkv", "webm", "avi", "m2ts", "vob"].contains(link.url.pathExtension.lowercased()) {
-            requestNativePreviewTarget(bucket, serial: serial)
-            return
-        }
+        // Always check the persistent disk cache FIRST, even for MKV.
+        // For unsupported containers Apple's generator returns nil and the
+        // existing mpv decoder takes over without starting a second FFmpeg.
         thumbs.request(url: link.url, second: second) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,

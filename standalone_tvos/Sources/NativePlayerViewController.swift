@@ -160,6 +160,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let idleLabel = UILabel()
     private let seekTimeLabel = UILabel()
     private let previewLoadingLabel = UILabel()
+    private let previewStatusLabel = UILabel()
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
 
@@ -248,6 +249,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.alpha = 0
         link = media
         frameViews.first?.image = nil
+        previewStatusLabel.isHidden = true
         previewLoadingLabel.text = "Loading preview…"
         previewLoadingLabel.isHidden = false
         titleLabel.text = ""
@@ -632,6 +634,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.textAlignment = .center
         seekTimeLabel.alpha = 0
         view.addSubview(seekTimeLabel)
+        // A separate status label remains visible even when the full-screen
+        // image stays hidden until FFmpeg has produced the first real frame.
+        previewStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        previewStatusLabel.text = "Preparing thumbnail…"
+        previewStatusLabel.textAlignment = .center
+        previewStatusLabel.textColor = .white
+        previewStatusLabel.font = .systemFont(ofSize: 21, weight: .medium)
+        previewStatusLabel.layer.shadowColor = UIColor.black.cgColor
+        previewStatusLabel.layer.shadowRadius = 5
+        previewStatusLabel.layer.shadowOpacity = 0.85
+        previewStatusLabel.isHidden = true
+        view.addSubview(previewStatusLabel)
 
         // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
@@ -707,8 +721,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             filmStrip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             filmStrip.topAnchor.constraint(equalTo: view.topAnchor),
             filmStrip.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
-            seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
+            seekTimeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            seekTimeLabel.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -24),
+            previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            previewStatusLabel.bottomAnchor.constraint(equalTo: seekTimeLabel.topAnchor, constant: -16),
+            previewStatusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.9),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
             picturePanel.widthAnchor.constraint(equalToConstant: 440),
@@ -732,6 +749,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // surface beneath it continues to receive presses and gestures.
         view.bringSubviewToFront(panel)
         view.bringSubviewToFront(seekTimeLabel)
+        view.bringSubviewToFront(previewStatusLabel)
         view.bringSubviewToFront(picturePanel)
         view.bringSubviewToFront(trackPanel)
         view.bringSubviewToFront(statusLabel)
@@ -1017,7 +1035,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let base = targetSeconds ?? currentSeconds
             let bound = totalSeconds > 0 ? totalSeconds : 86_400
             targetSeconds = max(0, min(bound,
-                base + Double(direction) * max(30, min(240, bound / 30))))
+                base + Double(direction) * 15.0))
             scheduleFrames()
             refreshLabels()
             showPanel()
@@ -1044,7 +1062,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             guard isTouchScrubbing, !playing else { return }
             let dx = Double(gesture.translation(in: remote).x)
             let bound = totalSeconds > 0 ? totalSeconds : 86_400
-            let sensitivity = max(0.7, min(5.0, bound / 1800))
+            // Significantly gentler than the old 0.7–5.0 sec/point.
+            // A 100-point swipe on a two-hour movie now moves ~15 seconds.
+            let sensitivity = max(0.08, min(0.24, bound / 48_000.0))
             targetSeconds = max(0, min(bound, panOriginSeconds + dx * sensitivity))
             scheduleFrames()
             refreshLabels()
@@ -1089,6 +1109,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewIsVisible = false
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
+        previewStatusLabel.isHidden = true
         thumbs.cancel()
         currentPreviewSerial += 1
     }
@@ -1318,15 +1339,27 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         committedSeekTarget = seconds
         committedSeekDate = Date()
         targetSeconds = nil
-        stopShowingThumbnail()
+        // A paused scrub can finish before FFmpeg decodes the frame.
+        // Give it a short grace interval instead of killing that request
+        // exactly when the user's finger leaves the touch surface.
+        if !playing && previewIsVisible && lockedSeekDirection == 0 {
+            previewHideTimer?.invalidate()
+            previewHideTimer = Timer.scheduledTimer(withTimeInterval: 2.6,
+                repeats: false) { [weak self] _ in self?.stopShowingThumbnail() }
+        } else {
+            stopShowingThumbnail()
+        }
         showPanel()
     }
 
     private func scheduleFrames() {
         guard targetSeconds != nil else { return }
-        // Don't cover the actual film with a black full-screen placeholder.
-        // Reveal the independent preview only once a decoded frame exists.
-        filmStrip.alpha = frameViews.first?.image == nil ? 0 : 1
+        // Show loading state without obscuring live video with a black
+        // full-screen surface. Reveal the independent frame once decoded.
+        let decoded = frameViews.first?.image != nil
+        filmStrip.alpha = decoded ? 1 : 0
+        previewStatusLabel.text = "Preparing thumbnail…"
+        previewStatusLabel.isHidden = decoded
         seekTimeLabel.alpha = 1
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()
@@ -1359,9 +1392,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 self.frameViews.first?.image = image
                 self.filmStrip.alpha = 1
                 self.previewLoadingLabel.isHidden = true
+                self.previewStatusLabel.isHidden = true
             } else if self.frameViews.first?.image == nil {
                 self.previewLoadingLabel.text = "Preview unavailable"
                 self.previewLoadingLabel.isHidden = false
+                self.previewStatusLabel.text = "No thumbnail available from this stream"
+                self.previewStatusLabel.isHidden = false
             }
         }
     }

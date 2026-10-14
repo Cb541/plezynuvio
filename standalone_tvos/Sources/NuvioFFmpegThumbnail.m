@@ -13,13 +13,18 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <limits.h>
 
+@implementation NuvioThumbnailAbortToken
+@end
+
 typedef struct {
     CFAbsoluteTime deadline;
+    __unsafe_unretained NuvioThumbnailAbortToken *token;
 } NuvioReadDeadline;
 
 static int nuvioInterrupt(void *opaque) {
     if (!opaque) return 1;
-    return CFAbsoluteTimeGetCurrent() > ((NuvioReadDeadline *)opaque)->deadline;
+    NuvioReadDeadline *state = (NuvioReadDeadline *)opaque;
+    return state->token.cancelled || CFAbsoluteTimeGetCurrent() > state->deadline;
 }
 
 static UIImage *nuvioMakeImage(AVFrame *frame) {
@@ -62,11 +67,16 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
     return image;
 }
 
-UIImage *NuvioDecodedThumbnail(NSURL *url, int64_t seconds, double timeoutSeconds) {
+UIImage *NuvioDecodedThumbnail(NSURL *url, int64_t seconds, double timeoutSeconds,
+                                    NuvioThumbnailAbortToken *token) {
     @autoreleasepool {
         if (!url || ![@"http" isEqualToString:url.scheme.lowercaseString] &&
                     ![@"https" isEqualToString:url.scheme.lowercaseString]) return nil;
-        NuvioReadDeadline deadline = { .deadline = CFAbsoluteTimeGetCurrent() + MAX(0.5, timeoutSeconds) };
+        if (token.cancelled) return nil;
+        NuvioReadDeadline deadline = {
+            .deadline = CFAbsoluteTimeGetCurrent() + MAX(0.5, timeoutSeconds),
+            .token = token
+        };
         AVFormatContext *format = avformat_alloc_context();
         if (!format) return nil;
         format->interrupt_callback.callback = nuvioInterrupt;
@@ -113,7 +123,8 @@ UIImage *NuvioDecodedThumbnail(NSURL *url, int64_t seconds, double timeoutSecond
         }
 
         int videoPackets = 0;
-        while (CFAbsoluteTimeGetCurrent() < deadline.deadline && videoPackets < 60) {
+        while (!token.cancelled && CFAbsoluteTimeGetCurrent() < deadline.deadline &&
+               videoPackets < 60) {
             if (av_read_frame(format, packet) < 0) break;
             if (packet->stream_index != streamIndex) {
                 av_packet_unref(packet);
@@ -123,7 +134,7 @@ UIImage *NuvioDecodedThumbnail(NSURL *url, int64_t seconds, double timeoutSecond
             int sent = avcodec_send_packet(decoder, packet);
             av_packet_unref(packet);
             if (sent < 0) continue;
-            while (avcodec_receive_frame(decoder, frame) == 0) {
+            while (!token.cancelled && avcodec_receive_frame(decoder, frame) == 0) {
                 int64_t ts = frame->best_effort_timestamp;
                 // Keep the first decoded video frame as an emergency preview,
                 // then replace it if decoding approaches the requested time.

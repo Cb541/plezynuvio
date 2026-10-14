@@ -13,15 +13,20 @@ final class SeekFrameService {
     private var cache: [Int: UIImage] = [:]
     private var cacheOrder: [Int] = []
     private var generation: UInt64 = 0
+    private var activeToken: NuvioThumbnailAbortToken?
 
     func cancel() {
         lock.lock()
+        activeToken?.cancelled = true
+        activeToken = nil
         generation &+= 1
         lock.unlock()
     }
 
     func clear() {
         lock.lock()
+        activeToken?.cancelled = true
+        activeToken = nil
         generation &+= 1
         cache.removeAll()
         cacheOrder.removeAll()
@@ -29,8 +34,14 @@ final class SeekFrameService {
     }
 
     func request(url: URL, second: Int, callback: @escaping (UIImage?) -> Void) {
-        let key = max(0, (second / 15) * 15)
+        // Quantize to 5s for useful caching without returning a
+        // neighboring movie scene that is 15s away.
+        let key = max(0, (second / 5) * 5)
+        let token = NuvioThumbnailAbortToken()
         lock.lock()
+        activeToken?.cancelled = true
+        activeToken = token
+        generation &+= 1
         let version = generation
         let image = cache[key]
         lock.unlock()
@@ -47,16 +58,17 @@ final class SeekFrameService {
 
             // A real local decode. Unlike vo=image, this works with FFmpeg
             // sources independently from what mpv's VO was compiled to support.
-            let decoded = NuvioDecodedThumbnail(url, Int64(key), 4.3)
-            let frame = decoded ?? self.appleFallback(url: url, second: key)
+            let decoded = NuvioDecodedThumbnail(url, Int64(key), 4.3, token)
+            let frame = decoded ?? (token.cancelled ? nil : self.appleFallback(url: url, second: key))
 
             self.lock.lock()
-            let deliver = self.generation == version
+            let deliver = self.generation == version && !token.cancelled
+            if deliver { self.activeToken = nil }
             if deliver, let frame {
                 self.cache[key] = frame
                 self.cacheOrder.removeAll { $0 == key }
                 self.cacheOrder.append(key)
-                while self.cacheOrder.count > 36 {
+                while self.cacheOrder.count > 64 {
                     let oldest = self.cacheOrder.removeFirst()
                     self.cache.removeValue(forKey: oldest)
                 }

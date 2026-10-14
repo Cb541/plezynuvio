@@ -1262,6 +1262,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let shouldResume = resumeAfterLockedSeek
         resumeAfterLockedSeek = false
         stopShowingThumbnail()
+        PlayerStartupDiagnostics.clear()
         if shouldResume {
             core?.setProperty("pause", value: "no")
             playing = true
@@ -1625,7 +1626,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 if case .failure = result {
                     self.statusLabel.text = "Seek failed; playback can continue"
                 }
-                if retainPreview { PlayerStartupDiagnostics.clear() }
+                // An acknowledged mpv seek is not an unfinished
+                // thumbnail operation; don't leave a false crash marker.
+                PlayerStartupDiagnostics.clear()
                 if resumeAfter {
                     seekCore.setProperty("pause", value: "no")
                     self.playing = true

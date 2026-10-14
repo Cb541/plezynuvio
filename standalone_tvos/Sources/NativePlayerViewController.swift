@@ -109,6 +109,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // unlike unrestricted per-pan decoding, it bounds decoder pressure.
     private var lastLiveTouchpadRequest = Date.distantPast
     private var lastBackgroundPreviewAttempt = Date.distantPast
+    private var lastSDRIndexAttempt = Date.distantPast
+    private var nextSDRIndexSlot = 0
+    private var backgroundSnapshotsUnavailable = false
     private var playbackSnapshotInFlight = false
     // Only one small CoreImage output is created at a time. This captures
     // the already-presented Apple video frame without opening another codec.
@@ -331,6 +334,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         touchpadPreviewMode = false
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
+        lastSDRIndexAttempt = .distantPast
+        nextSDRIndexSlot = 0
+        backgroundSnapshotsUnavailable = false
         playbackSnapshotInFlight = false
         lastConfirmedPauseAt = nil
         mainFramePreviewOrigin = nil
@@ -2248,7 +2254,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let interval: TimeInterval
         if touchpadPreviewMode && isTouchScrubbing {
             let sincePrevious = Date().timeIntervalSince(lastLiveTouchpadRequest)
-            interval = max(0.12, 0.95 - max(0, sincePrevious))
+            // More live updates on SDR; HDR/DV keeps the proven 0.95s cap.
+            let cadence = sourceColorMetadataReady && !sourceIsHDR
+                && !requiresNativeDolbyVision ? 0.48 : 0.95
+            interval = max(0.12, cadence - max(0, sincePrevious))
         } else {
             interval = touchpadPreviewMode ? 0.20 : 0.12
         }
@@ -2324,7 +2333,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // FFmpeg decoder that repeatedly crashed tvOS, use mpv's own screenshot
     // command on the EXISTING decoder. The original frame is frozen above
     // the movie while paused mpv seeks to candidate frames.
-    private func takeMpvStill(_ completion: @escaping (UIImage?) -> Void) {
+    private func takeMpvStill(allowSoftwareFallback: Bool = true,
+                              _ completion: @escaping (UIImage?) -> Void) {
         guard let previewCore = core else { completion(nil); return }
         // This native player renders into AVSampleBufferDisplayLayer, not
         // vo=gpu-next. The normal mpv screenshot command often cannot read
@@ -2338,7 +2348,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 let longer = max(frame.extent.width, frame.extent.height)
                 guard longer > 0 else {
                     DispatchQueue.main.async { [weak self] in
-                        self?.takeMpvSoftwareStill(completion)
+                        if allowSoftwareFallback { self?.takeMpvSoftwareStill(completion) }
+                        else { completion(nil) }
                     }
                     return
                 }
@@ -2358,15 +2369,22 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                         // Some 10-bit/DV pixel buffers cannot be converted by
                         // CIImage on all tvOS models. Do not abandon a valid
                         // movie: try mpv's software framebuffer conversion.
-                        self?.takeMpvSoftwareStill(completion)
+                        if allowSoftwareFallback { self?.takeMpvSoftwareStill(completion) }
+                        else { completion(nil) }
                     }
                 }
             }
             return
         }
 
-        PlayerStartupDiagnostics.mark("displayed-pixel-buffer-unavailable")
-        takeMpvSoftwareStill(completion)
+        if allowSoftwareFallback {
+            PlayerStartupDiagnostics.mark("displayed-pixel-buffer-unavailable")
+            takeMpvSoftwareStill(completion)
+        } else {
+            // Periodic caching must not trigger expensive software screenshots
+            // or a 4K CPU copy when HDR/DV uses an inaccessible video layer.
+            completion(nil)
+        }
     }
 
     // A second capture route, NOT a second video decoder. mpv converts a
@@ -2673,30 +2691,52 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
-        // Capture an already-decoded frame from the PRIMARY renderer every
-        // ~20 seconds. This progressively warms the disk cache without any
-        // second FFmpeg codec or seeking while watching. If the native VO
-        // doesn't provide screenshots, stop trying on this media.
-        if playing, core?.isPaused == false, !isPreparingPlayback,
-           !waitingForFirstFrame, !displayNegotiationPending,
-           !mainFramePreviewUnsupported, !playbackSnapshotInFlight,
-           !previewIsVisible, targetSeconds == nil, link != nil,
-           currentSeconds.isFinite,
-           Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= 20 {
+        // Dense disk indexing from the playback decoder (never re-seeks).
+        // SDR captures about every 3s; HDR/DV stays conservative at 12s.
+        // A displayed pixel buffer is required: background snapshots must
+        // NEVER fall back to a CPU screenshot on high-bitrate HDR/DV streams.
+        let confirmedSDR = sourceColorMetadataReady && !sourceIsHDR
+            && !requiresNativeDolbyVision
+        let cacheCadence: TimeInterval = confirmedSDR ? 3.0 : 12.0
+        let safePlayback = playing && core?.isPaused == false
+            && !isPreparingPlayback && !waitingForFirstFrame
+            && !displayNegotiationPending && !previewIsVisible
+            && targetSeconds == nil && mainFramePreviewOrigin == nil
+            && currentSeconds.isFinite && link != nil
+        if safePlayback, !backgroundSnapshotsUnavailable,
+           !playbackSnapshotInFlight,
+           Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= cacheCadence {
             lastBackgroundPreviewAttempt = Date()
             playbackSnapshotInFlight = true
             let generation = playbackGeneration
             let second = Int(max(0, currentSeconds.rounded()))
-            takeMpvStill { [weak self] image in
+            takeMpvStill(allowSoftwareFallback: false) { [weak self] image in
                 guard let self, self.playbackGeneration == generation else { return }
                 self.playbackSnapshotInFlight = false
                 if let image {
                     self.thumbs.cachePlaybackFrame(image, second: second)
                 } else {
-                    self.mainFramePreviewUnsupported = true
-                    PlayerStartupDiagnostics.mark("native-screenshot-not-supported")
+                    // Do not blacklist normal paused seek previews on failure.
+                    self.backgroundSnapshotsUnavailable = true
                 }
             }
+        }
+        // Native-container SDR only: opportunistically fill a coarse index
+        // across the entire movie, including yet-unwatched chapters. A single
+        // lower-priority AVFoundation request at a time, spaced at 12s, with
+        // automatic disable if this remote stream cannot generate images.
+        // MKV, HDR and Dolby Vision never use a competing background decoder.
+        if safePlayback, confirmedSDR, let media = link,
+           totalSeconds.isFinite, totalSeconds > 60,
+           !isTouchScrubbing && !playbackSnapshotInFlight,
+           Date().timeIntervalSince(lastSDRIndexAttempt) >= 12 {
+            lastSDRIndexAttempt = Date()
+            let stride = 45
+            let slots = max(1, Int(ceil(totalSeconds / Double(stride))))
+            let index = nextSDRIndexSlot % slots
+            nextSDRIndexSlot = (index + 1) % slots
+            let second = min(max(0, Int(totalSeconds) - 1), 15 + index * stride)
+            thumbs.prefetch(url: media.url, second: second)
         }
         refreshLabels()
     }

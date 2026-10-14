@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import ImageIO
 import QuartzCore
 import UIKit
@@ -109,6 +110,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var lastLiveTouchpadRequest = Date.distantPast
     private var lastBackgroundPreviewAttempt = Date.distantPast
     private var playbackSnapshotInFlight = false
+    // Only one small CoreImage output is created at a time. This captures
+    // the already-presented Apple video frame without opening another codec.
+    private let thumbnailImageContext = CIContext(options: [
+        .useSoftwareRenderer: false
+    ])
     private var lastConfirmedPauseAt: Date?
     // Locked transport is engaged by holding the left/right edge once.
     // Release keeps it running; further clicks cycle speed and direction.
@@ -1897,6 +1903,37 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // the movie while paused mpv seeks to candidate frames.
     private func takeMpvStill(_ completion: @escaping (UIImage?) -> Void) {
         guard let previewCore = core else { completion(nil); return }
+        // This native player renders into AVSampleBufferDisplayLayer, not
+        // vo=gpu-next. The normal mpv screenshot command often cannot read
+        // that output. Apple's renderer provides the actual displayed
+        // CVPixelBuffer; capture it without another demuxer or video decoder.
+        if #available(tvOS 17.0, *),
+           let buffer = previewCore.videoLayer?.sampleBufferRenderer.displayedPixelBuffer() {
+            let context = thumbnailImageContext
+            DispatchQueue.global(qos: .utility).async {
+                let frame = CIImage(cvPixelBuffer: buffer)
+                let longer = max(frame.extent.width, frame.extent.height)
+                guard longer > 0 else {
+                    DispatchQueue.main.async { completion(nil) }
+                    return
+                }
+                let scale = min(1, 720.0 / longer)
+                let reduced = frame.transformed(by: CGAffineTransform(
+                    scaleX: scale, y: scale))
+                let image: UIImage?
+                if let cg = context.createCGImage(reduced, from: reduced.extent) {
+                    image = UIImage(cgImage: cg)
+                } else {
+                    image = nil
+                }
+                DispatchQueue.main.async { completion(image) }
+            }
+            return
+        }
+
+        // No displayed pixel buffer: retain the software screenshot fallback
+        // for format/output modes that allow it. It may fail gracefully.
+        PlayerStartupDiagnostics.mark("displayed-pixel-buffer-unavailable")
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("nuvio-preview-\(UUID().uuidString).jpg")
         previewCore.commandAsync(["screenshot-to-file", file.path, "video"]) {
@@ -1905,7 +1942,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 try? FileManager.default.removeItem(at: file)
                 return
             }
-            // ImageIO downsamples without materializing a giant 4K UIImage.
             DispatchQueue.global(qos: .utility).async {
                 var image: UIImage?
                 if case .success = result,

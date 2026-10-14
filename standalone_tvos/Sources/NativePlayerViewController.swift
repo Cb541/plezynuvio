@@ -144,6 +144,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var lastBackgroundPreviewAttempt = Date.distantPast
     private var lastCaptureDuration = 0.0
     private var backgroundCaptureFailures = 0
+    // Fallback uses the active mpv decoder, not a second network stream.
+    private var backgroundNeedsSoftwareSnapshot = false
+    private var backgroundSnapshotRequestID = 0
     private var lastPlaybackCapturedBucket: Int?
     private var lastCacheLookupBucket: Int?
     private var lastSDRIndexAttempt = Date.distantPast
@@ -378,10 +381,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.frameSlots = []
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
-        cacheRateLabel.text = "CACHE 0.00 MB/s"
+        cacheRateLabel.text = "CACHE 0.000 MB/s · 0 frames"
         explicitChromeHidden = false
         lastCaptureDuration = 0
         backgroundCaptureFailures = 0
+        backgroundNeedsSoftwareSnapshot = false
+        backgroundSnapshotRequestID += 1
         lastPlaybackCapturedBucket = nil
         lastCacheLookupBucket = nil
         lastSDRIndexAttempt = .distantPast
@@ -840,7 +845,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.clipsToBounds = true
         panel.addSubview(cachedTimeline)
         cacheRateLabel.translatesAutoresizingMaskIntoConstraints = false
-        cacheRateLabel.text = "CACHE 0.00 MB/s"
+        cacheRateLabel.text = "CACHE 0.000 MB/s · 0 frames"
         cacheRateLabel.textColor = UIColor.white.withAlphaComponent(0.88)
         cacheRateLabel.font = .monospacedDigitSystemFont(
             ofSize: 15, weight: .medium)
@@ -2831,13 +2836,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
-        // Progressive unlimited thumbnail caching for SDR, HDR and DV:
-        // capture the already-decoded video during playback, never re-seek
-        // the movie or force an extra decoder/CPU-only HDR conversion.
-        // Aim for a frame every 2s; back off if conversion becomes expensive.
+        // Hardware renderer often provides no displayed pixel buffer during
+        // playback. Switch to mpv's own software screenshot of the ALREADY
+        // decoded frame rather than disable all thumbnail caching.
+        // Throttle software HDR/DV captures to avoid the previous 4K lag.
         let confirmedSDR = sourceColorMetadataReady && !sourceIsHDR
             && !requiresNativeDolbyVision
-        let cacheCadence = max(2.0, min(8.0, lastCaptureDuration * 4.0))
+        let cadenceBase: Double = backgroundNeedsSoftwareSnapshot
+            ? (sourceIsHDR || requiresNativeDolbyVision ? 8.0 : 5.0) : 2.0
+        let cacheCadence = max(cadenceBase, min(30.0, lastCaptureDuration * 6.0))
         let safePlayback = playing && core?.isPaused == false
             && !isPreparingPlayback && !waitingForFirstFrame
             && !displayNegotiationPending && !previewIsVisible
@@ -2845,30 +2852,64 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             && currentSeconds.isFinite && link != nil
         let snapshotSecond = max(0, Int(currentSeconds.rounded()))
         let snapshotBucket = (snapshotSecond / 2) * 2
-        if safePlayback, !backgroundSnapshotsUnavailable,
-           !playbackSnapshotInFlight,
-           lastPlaybackCapturedBucket != snapshotBucket,
-           Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= cacheCadence {
+        if safePlayback && !backgroundSnapshotsUnavailable
+            && !playbackSnapshotInFlight
+            && lastPlaybackCapturedBucket != snapshotBucket
+            && Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= cacheCadence {
             lastBackgroundPreviewAttempt = Date()
             playbackSnapshotInFlight = true
+            backgroundSnapshotRequestID += 1
+            let requestID = backgroundSnapshotRequestID
             let generation = playbackGeneration
             let started = Date()
-            takeMpvStill(allowSoftwareFallback: false) { [weak self] image in
-                guard let self, self.playbackGeneration == generation else { return }
+            let software = backgroundNeedsSoftwareSnapshot
+            let complete: (UIImage?) -> Void = { [weak self] image in
+                guard let self, self.playbackGeneration == generation,
+                      self.backgroundSnapshotRequestID == requestID else { return }
                 self.playbackSnapshotInFlight = false
                 self.lastCaptureDuration = Date().timeIntervalSince(started)
                 if let image {
                     self.backgroundCaptureFailures = 0
                     self.lastPlaybackCapturedBucket = snapshotBucket
                     self.thumbs.cachePlaybackFrame(image, second: snapshotSecond)
+                    if software && self.lastCaptureDuration > 2.0 {
+                        self.backgroundSnapshotsUnavailable = true
+                        NSLog("[NuvioCache] Screenshot too slow; disabled to protect playback")
+                    }
+                } else if !software {
+                    self.backgroundNeedsSoftwareSnapshot = true
+                    self.backgroundCaptureFailures = 0
+                    NSLog("[NuvioCache] Hardware frame unavailable; using mpv fallback")
                 } else {
                     self.backgroundCaptureFailures += 1
                     if self.backgroundCaptureFailures >= 3 {
-                        // This video layer exposes no readable frame.
-                        // Foreground native seeking stays functional.
+                        self.backgroundSnapshotsUnavailable = true
+                        NSLog("[NuvioCache] No frames from mpv screenshot fallback")
+                    }
+                }
+            }
+            if software {
+                takeMpvSoftwareStill(complete)
+            } else {
+                takeMpvStill(allowSoftwareFallback: false, complete)
+            }
+            // MPV command callbacks might never arrive on unusual remuxes.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                guard let self, self.playbackGeneration == generation,
+                      self.backgroundSnapshotRequestID == requestID,
+                      self.playbackSnapshotInFlight else { return }
+                self.backgroundSnapshotRequestID += 1
+                self.playbackSnapshotInFlight = false
+                self.lastCaptureDuration = 4
+                if !software {
+                    self.backgroundNeedsSoftwareSnapshot = true
+                } else {
+                    self.backgroundCaptureFailures += 1
+                    if self.backgroundCaptureFailures >= 2 {
                         self.backgroundSnapshotsUnavailable = true
                     }
                 }
+                NSLog("[NuvioCache] Screenshot capture timed out")
             }
         }
         // Native-container SDR only: opportunistically fill a coarse index
@@ -2894,8 +2935,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
             let stats = thumbs.cacheStats()
-            cacheRateLabel.text = String(format: "CACHE %.2f MB/s",
-                                          stats.writeMBPerSecond)
+            if backgroundSnapshotsUnavailable && stats.frameCount == 0 {
+                cacheRateLabel.text = "CACHE UNAVAILABLE · 0 frames"
+            } else {
+                // JPEG thumbnails are small: 0.00 MB/s can mask real writes.
+                cacheRateLabel.text = String(
+                    format: "CACHE %.3f MB/s · %d frames",
+                    stats.writeMBPerSecond, stats.frameCount)
+            }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots
             cachedTimeline.setNeedsDisplay()

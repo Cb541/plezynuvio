@@ -1079,7 +1079,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // Only explicit Siri Remote interaction enables the experimental
             // HDR/DV path, per media item. Left = safe/off, right = test/on.
             experimentalHDRColorBoost = direction > 0
-            if !experimentalHDRColorBoost { colorFilterFailed = false }
+            if experimentalHDRColorBoost {
+                // Make the opt-in visibly useful at neutral: a conservative
+                // boost that users can fine-tune with the rows above.
+                if abs(colorSaturation - 1.0) < 0.001
+                    && abs(colorContrast - 1.0) < 0.001 {
+                    colorSaturation = 1.10
+                    colorContrast = 1.05
+                }
+            } else {
+                colorFilterFailed = false
+            }
             scheduleColorFilterUpdate()
         default: break
         }

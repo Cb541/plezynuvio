@@ -1117,8 +1117,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             && (abs(colorSaturation - 1.0) > 0.001
                 || abs(colorContrast - 1.0) > 0.001)
         if !enabled {
-            // Remove on neutral values or HDR, even after an earlier
-            // asynchronous add, so source passthrough stays unfiltered.
+            // Neutral defaults must never touch the existing video pipeline.
+            // An in-flight add will mark active and schedule a later remove.
+            guard colorFilterActive else { return }
             playbackCore.commandAsync(["vf", "remove", "@nuvio-color"]) {
                 [weak self, weak playbackCore] _ in
                 guard let self, let playbackCore,

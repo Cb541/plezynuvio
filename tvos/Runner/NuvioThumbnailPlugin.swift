@@ -94,7 +94,11 @@ final class NuvioThumbnailPlugin: NSObject, FlutterPlugin {
     guard mpv_initialize(context) >= 0 else { return nil }
 
     let command = ["loadfile", url.absoluteString, "replace"]
-    let owned = command.map { strdup($0) }
+    let owned = command.compactMap { strdup($0) }
+    guard owned.count == command.count else {
+      for item in owned { free(item) }
+      return nil
+    }
     defer { for item in owned { free(item) } }
     var argv: [UnsafePointer<CChar>?] = owned.map { UnsafePointer($0) }
     argv.append(nil)

@@ -17,6 +17,7 @@ class WireMpvTest < Minitest::Test
     MpvPipController.swift
     MpvAudioPlayerCore.swift
     MpvAudioPlayerPlugin.swift
+    NuvioThumbnailPlugin.swift
   ].freeze
   AFFECTED_NAMES = %w[
     MpvAudioPlayerCore.swift

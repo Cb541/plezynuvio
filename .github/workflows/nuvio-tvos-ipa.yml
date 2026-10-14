@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - nuvio-direct-stream-tvos
+      - nuvio-on-demand-thumbnails-tvos
 
 permissions:
   contents: read
@@ -32,8 +33,11 @@ jobs:
       - name: Run Nuvio URL parser tests
         run: flutter test --no-pub test/services/nuvio_stream_link_test.dart
 
+      - name: Test seek preview cache and Nuvio parsing
+        run: flutter test --no-pub test/services/nuvio_seek_thumbnails_test.dart
+
       - name: Analyze changed Dart integration
-        run: dart analyze lib/services/nuvio_stream_link.dart lib/screens/nuvio_stream_player_screen.dart lib/main.dart
+        run: dart analyze lib/services/nuvio_stream_link.dart lib/services/nuvio_seek_thumbnails.dart lib/screens/nuvio_stream_player_screen.dart lib/main.dart
 
       - name: Prepare verified tvOS Flutter engine
         run: bash tvos/scripts/fetch_engine.sh
@@ -43,6 +47,7 @@ jobs:
 
       - name: Verify tvOS native wiring
         run: |
+          ruby tvos/scripts/wire_mpv.rb
           ruby tvos/scripts/test_wire_mpv.rb
           ruby tvos/scripts/test_wire_top_shelf.rb
 

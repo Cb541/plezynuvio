@@ -177,6 +177,9 @@ import wakelock_plus
     if let r = pluginRegistry.registrar(forPlugin: "WakelockPlusPlugin") {
       WakelockPlusPlugin.register(with: r)
     }
+    if let r = pluginRegistry.registrar(forPlugin: "NuvioThumbnailPlugin") {
+      NuvioThumbnailPlugin.register(with: r)
+    }
     if let r = pluginRegistry.registrar(forPlugin: "SystemShelfPlugin") {
       SystemShelfPlugin.register(with: r)
     }

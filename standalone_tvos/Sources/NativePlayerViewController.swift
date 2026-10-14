@@ -220,6 +220,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         }
 
         PlayerStartupDiagnostics.mark("mpv-initialized")
+        // Required for MpvPlayerCore's cached timePos/duration. Unlike Plezy
+        // Flutter's player plugin, this standalone app never subscribed.
+        // Without these observers both caches permanently read 0, so every
+        // seek calculates from the start of the movie. This is the root cause.
+        newCore.observeProperty("time-pos", format: "double")
+        newCore.observeProperty("duration", format: "double")
+        newCore.observeProperty("pause", format: "flag")
         core = newCore
         newCore.setVisible(true)
         newCore.updateFrame()
@@ -442,21 +449,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         toolbar.alignment = .center
         toolbar.spacing = 12
         toolbar.distribution = .fillEqually
-        for symbol in ["waveform", "captions.bubble", "info.circle"] {
+        // Text-based controls are intentionally used rather than SF Symbols:
+        // the assetless sideloaded tvOS app returned nil for some of the
+        // requested system icons, leaving three invisible buttons.
+        for (name, label) in [("Audio", "AUDIO"), ("Subtitles", "CC"), ("Info", "INFO")] {
             let button = UIButton(type: .system)
-            button.setImage(UIImage(systemName: symbol, withConfiguration:
-                UIImage.SymbolConfiguration(pointSize: 26, weight: .medium)), for: .normal)
-            button.tintColor = .white
-            button.backgroundColor = UIColor.white.withAlphaComponent(0.12)
-            button.layer.cornerRadius = 15
+            button.setTitle(label, for: .normal)
+            button.titleLabel?.font = .systemFont(ofSize: 17, weight: .bold)
+            button.setTitleColor(.white, for: .normal)
+            button.backgroundColor = UIColor.white.withAlphaComponent(0.14)
+            button.layer.cornerRadius = 13
             button.isUserInteractionEnabled = false
-            button.accessibilityLabel = symbol == "waveform" ? "Audio" :
-                (symbol == "captions.bubble" ? "Subtitles" : "File information")
+            button.accessibilityLabel = name
             toolbarButtons.append(button)
             toolbar.addArrangedSubview(button)
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: 52).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 52).isActive = true
+            button.widthAnchor.constraint(equalToConstant: name == "Audio" ? 90 : (name == "Info" ? 75 : 58)).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 48).isActive = true
         }
         panel.addSubview(toolbar)
 
@@ -686,10 +695,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         case .menu:
             if toolPanel != .none {
                 closeToolPanel()
-            } else if toolbarFocused {
-                toolbarFocused = false
-                updateToolbarFocus()
-                showPanel()
+            } else if targetSeconds != nil {
+                cancelUncommittedScrub()
+                hidePlaybackChrome()
+            } else if !panel.isHidden || previewIsVisible || toolbarFocused {
+                hidePlaybackChrome()
             } else {
                 confirmExit()
             }
@@ -707,6 +717,29 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         toolbarFocused = false
         updateToolbarFocus()
         stepSeek(recognizer.direction == .right ? 1 : -1)
+    }
+
+    private func hidePlaybackChrome() {
+        hideTimer?.invalidate()
+        toolbarFocused = false
+        controlsVisible = false
+        panel.isHidden = true
+        statusLabel.isHidden = true
+        filmStrip.alpha = 0
+        seekTimeLabel.alpha = 0
+        previewHideTimer?.invalidate()
+        previewIsVisible = false
+        thumbs.cancel()
+        updateToolbarFocus()
+    }
+
+    private func cancelUncommittedScrub() {
+        seekCommitTimer?.invalidate()
+        seekCommitTimer = nil
+        targetSeconds = nil
+        thumbTimer?.invalidate()
+        currentPreviewSerial += 1
+        refreshLabels()
     }
 
     private func confirmExit() {
@@ -1020,12 +1053,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
         updateToolbarFocus()
         hideTimer?.invalidate()
-        if core != nil && playing && targetSeconds == nil &&
-           toolPanel == .none && !toolbarFocused {
-            hideTimer = Timer.scheduledTimer(withTimeInterval: 4.5, repeats: false) { [weak self] _ in
-                guard let self else { return }
-                self.controlsVisible = false
-                self.panel.isHidden = true
+        if core != nil && targetSeconds == nil && toolPanel == .none {
+            // Both paused and playing timelines hide after 3 seconds of
+            // inactivity. Leaving a menu open intentionally suspends timeout.
+            hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+                guard let self, self.toolPanel == .none, self.targetSeconds == nil else { return }
+                self.hidePlaybackChrome()
             }
         }
     }

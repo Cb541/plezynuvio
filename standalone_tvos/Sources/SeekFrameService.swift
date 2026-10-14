@@ -1,18 +1,18 @@
 import AVFoundation
 import Foundation
-import ImageIO
-import Libmpv
 import UIKit
 
-/// Independent preview engine. Does not seek or reconfigure the playback core.
-/// Serialized requests and a small cache bound decoder pressure on Apple TV.
+/// Decodes preview pictures locally from the actual remote stream.
+///
+/// FFmpeg handles HTTP Matroska/HEVC/Dolby Vision base layers without
+/// external servers or thumbnail APIs. AVAssetImageGenerator remains a
+/// backup for containers tvOS knows how to open directly.
 final class SeekFrameService {
-    private let worker = DispatchQueue(label: "com.cb541.nuvio.frames", qos: .utility)
+    private let queue = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .userInitiated)
     private let lock = NSLock()
     private var cache: [Int: UIImage] = [:]
-    private var recentKeys: [Int] = []
+    private var cacheOrder: [Int] = []
     private var generation: UInt64 = 0
-    private let maxEntries = 48
 
     func cancel() {
         lock.lock()
@@ -24,133 +24,62 @@ final class SeekFrameService {
         lock.lock()
         generation &+= 1
         cache.removeAll()
-        recentKeys.removeAll()
+        cacheOrder.removeAll()
         lock.unlock()
     }
 
-    /// Callback occurs on main. Priority is center frame first, then its neighbors.
     func request(url: URL, second: Int, callback: @escaping (UIImage?) -> Void) {
-        let key = max(0, second / 10 * 10)
+        let key = max(0, (second / 15) * 15)
         lock.lock()
-        let current = generation
-        if let cached = cache[key] {
-            lock.unlock()
-            DispatchQueue.main.async { callback(cached) }
+        let version = generation
+        let image = cache[key]
+        lock.unlock()
+        if let image {
+            DispatchQueue.main.async { callback(image) }
             return
         }
-        lock.unlock()
-
-        worker.async { [weak self] in
+        queue.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            let obsolete = self.generation != current
+            let valid = self.generation == version
             self.lock.unlock()
-            guard !obsolete else { return }
-            let image = self.extract(url: url, second: key)
-                ?? self.assetFallback(url: url, second: key)
+            guard valid else { return }
+
+            // A real local decode. Unlike vo=image, this works with FFmpeg
+            // sources independently from what mpv's VO was compiled to support.
+            let decoded = NuvioDecodedThumbnail(url as NSURL, Int64(key), 4.3)
+            let frame = decoded ?? self.appleFallback(url: url, second: key)
+
             self.lock.lock()
-            if let image, self.generation == current {
-                self.cache[key] = image
-                self.recentKeys.removeAll { $0 == key }
-                self.recentKeys.append(key)
-                while self.recentKeys.count > self.maxEntries {
-                    let oldest = self.recentKeys.removeFirst()
+            let deliver = self.generation == version
+            if deliver, let frame {
+                self.cache[key] = frame
+                self.cacheOrder.removeAll { $0 == key }
+                self.cacheOrder.append(key)
+                while self.cacheOrder.count > 36 {
+                    let oldest = self.cacheOrder.removeFirst()
                     self.cache.removeValue(forKey: oldest)
                 }
             }
-            let usable = self.generation == current
             self.lock.unlock()
-            if usable { DispatchQueue.main.async { callback(image) } }
+            if deliver { DispatchQueue.main.async { callback(frame) } }
         }
     }
 
-    /// `vo=image` outputs just a still frame into a private temporary folder.
-    /// `start` + fast-keyframe seeking avoids downloading the entire file.
-    private func extract(url: URL, second: Int) -> UIImage? {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("nuvio-seek-" + UUID().uuidString, isDirectory: true)
-        do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
-        catch { return nil }
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        guard let mpv = mpv_create() else { return nil }
-        defer { mpv_terminate_destroy(mpv) }
-
-        let options: [(String, String)] = [
-            ("config", "no"),
-            ("vo", "image"),
-            ("vo-image-format", "png"),
-            ("vo-image-outdir", dir.path),
-            ("audio", "no"),
-            ("aid", "no"),
-            ("sid", "no"),
-            ("hwdec", "no"),
-            ("start", String(second)),
-            ("hr-seek", "no"),
-            ("frames", "1"),
-            ("cache", "no"),
-            ("demuxer-readahead-secs", "0"),
-            ("force-window", "no"),
-            ("msg-level", "all=error")
-        ]
-        for (key, value) in options {
-            guard mpv_set_option_string(mpv, key, value) >= 0 else { return nil }
-        }
-        guard mpv_initialize(mpv) >= 0 else { return nil }
-
-        let words = ["loadfile", url.absoluteString, "replace"]
-        let owned = words.compactMap { strdup($0) }
-        guard owned.count == words.count else {
-            for entry in owned { free(entry) }
-            return nil
-        }
-        defer { for entry in owned { free(entry) } }
-        var args: [UnsafePointer<CChar>?] = owned.map { UnsafePointer($0) }
-        args.append(nil)
-        let rc = args.withUnsafeMutableBufferPointer { mpv_command(mpv, $0.baseAddress) }
-        guard rc >= 0 else { return nil }
-
-        let deadline = Date().addingTimeInterval(4.0)
-        while Date() < deadline {
-            let event = mpv_wait_event(mpv, 0.10)
-            let files = (try? FileManager.default.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: [.fileSizeKey])) ?? []
-            for path in files where ["png", "jpg", "jpeg"].contains(path.pathExtension.lowercased()) {
-                // An image may still be in the process of being written.
-                if let frame = decodeSmallImage(path) { return frame }
-            }
-            if let event, event.pointee.event_id == MPV_EVENT_END_FILE { break }
-        }
-        return nil
-    }
-
-    private func decodeSmallImage(_ file: URL) -> UIImage? {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
-              let n = attrs[.size] as? NSNumber, n.intValue > 0, n.intValue < 16_000_000,
-              let source = CGImageSourceCreateWithURL(file as CFURL, nil) else { return nil }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 360
-        ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
-        else { return nil }
-        return UIImage(cgImage: image)
-    }
-
-    /// MP4/HLS fallback when `vo=image` cannot initialize; AVFoundation
-    /// cannot reliably decode an arbitrary MKV.
-    private func assetFallback(url: URL, second: Int) -> UIImage? {
+    private func appleFallback(url: URL, second: Int) -> UIImage? {
+        // AVFoundation cannot demux an MKV over HTTP, so don't waste a
+        // second long timeout on formats only the FFmpeg path understands.
+        let extensionName = url.pathExtension.lowercased()
+        guard ["m3u8", "mp4", "mov", "m4v"].contains(extensionName) else { return nil }
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 360, height: 220)
+        generator.maximumSize = CGSize(width: 340, height: 200)
         generator.requestedTimeToleranceBefore = CMTime(seconds: 4, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 4, preferredTimescale: 600)
-        guard let frame = try? generator.copyCGImage(
-            at: CMTime(seconds: Double(second), preferredTimescale: 600),
-            actualTime: nil
+        guard let cg = try? generator.copyCGImage(
+            at: CMTime(seconds: Double(second), preferredTimescale: 600), actualTime: nil
         ) else { return nil }
-        return UIImage(cgImage: frame)
+        return UIImage(cgImage: cg)
     }
 }

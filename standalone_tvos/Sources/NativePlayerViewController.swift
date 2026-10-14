@@ -1152,47 +1152,89 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         guard let playbackCore = core,
               operation == colorFilterOperation,
               sourceColorMetadataReady else { return }
+        // Never stack duplicate lavfi filters during rapid remote clicks.
+        // All add/remove operations are serialized through the main queue.
+        guard !colorFilterInFlight else { return }
         let generation = playbackGeneration
-        let enabled = !sourceIsHDR && !colorFilterFailed
-            && (abs(colorSaturation - 1.0) > 0.001
-                || abs(colorContrast - 1.0) > 0.001)
-        if !enabled {
-            // Neutral defaults must never touch the existing video pipeline.
-            // An in-flight add will mark active and schedule a later remove.
-            guard colorFilterActive else { return }
+        let nonneutral = abs(colorSaturation - 1.0) > 0.001
+            || abs(colorContrast - 1.0) > 0.001
+        let canProcess = !sourceIsHDR || experimentalHDRColorBoost
+        let enabled = nonneutral && canProcess && !colorFilterFailed
+
+        if colorFilterActive {
+            // A filter already exists. Remove before replacing; do not let
+            // rapid adjustments accumulate multiple 4K conversion stages.
+            colorFilterInFlight = true
             playbackCore.commandAsync(["vf", "remove", "@nuvio-color"]) {
                 [weak self, weak playbackCore] _ in
                 guard let self, let playbackCore,
                       self.core === playbackCore,
                       self.playbackGeneration == generation else { return }
-                if self.colorFilterOperation != operation {
+                self.colorFilterInFlight = false
+                self.colorFilterActive = false
+                if enabled && operation == self.colorFilterOperation
+                    || self.colorFilterOperation != operation {
                     self.scheduleColorFilterUpdate()
-                } else {
-                    self.colorFilterActive = false
                 }
             }
             return
         }
+        // No filter at neutral levels. HDR/DV is strictly opt-in and the
+        // genuine VideoToolbox -> AVFoundation path remains the default.
+        guard enabled else { return }
 
-        // The stock avfoundation VO has no VOCTRL_SET_EQUALIZER handler:
-        // mpv's 'saturation' and 'contrast' properties would silently do
-        // nothing. A labeled lavfi eq filter ACTUALLY transforms SDR video.
-        // Never enable this automatically at 100%, or on HDR/DV sources.
+        // Dolby Vision per-frame RPU metadata cannot be assumed valid after
+        // an image-space EQ. This experiment MAY drop native DV. Its use is
+        // limited to the current video, explicitly labeled as experimental.
         let spec = String(format:
             "@nuvio-color:lavfi=[eq=contrast=%.2f:saturation=%.2f]",
             colorContrast, colorSaturation)
+        colorFilterInFlight = true
         playbackCore.commandAsync(["vf", "add", spec]) {
             [weak self, weak playbackCore] result in
             guard let self, let playbackCore,
                   self.core === playbackCore,
                   self.playbackGeneration == generation else { return }
+            self.colorFilterInFlight = false
             if case .failure(let error) = result {
                 self.colorFilterActive = false
                 self.colorFilterFailed = true
-                NSLog("[NuvioNative] SDR color filter unavailable: %@", error.localizedDescription)
+                self.experimentalHDRColorBoost = false
+                NSLog("[NuvioNative] Video color filter failed: %@",
+                      error.localizedDescription)
                 playbackCore.command(["vf", "remove", "@nuvio-color"])
             } else {
                 self.colorFilterActive = true
+                if self.sourceIsHDR {
+                    // Runtime color metadata is checked again after the
+                    // renderer responds to the new video filter. Revert
+                    // immediately if the HDR output reports an SDR transfer.
+                    let expected = self.playbackGeneration
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                        [weak self, weak playbackCore] in
+                        guard let self, let playbackCore,
+                              self.core === playbackCore,
+                              self.playbackGeneration == expected,
+                              self.experimentalHDRColorBoost else { return }
+                        playbackCore.getPropertyAsync("video-out-params/gamma") {
+                            [weak self] gammaResult in
+                            guard let self,
+                                  self.core === playbackCore,
+                                  self.playbackGeneration == expected,
+                                  self.experimentalHDRColorBoost else { return }
+                            let gamma = (try? gammaResult.get())?.lowercased() ?? ""
+                            if gamma.contains("bt.1886")
+                                || gamma.contains("srgb")
+                                || gamma.contains("gamma2") {
+                                self.experimentalHDRColorBoost = false
+                                self.colorFilterFailed = true
+                                self.updatePictureLabels()
+                                self.scheduleColorFilterUpdate()
+                                NSLog("[NuvioNative] Reverted boost: HDR output became SDR")
+                            }
+                        }
+                    }
+                }
             }
             self.updatePictureLabels()
             if self.colorFilterOperation != operation {

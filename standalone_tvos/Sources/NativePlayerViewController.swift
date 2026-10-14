@@ -417,9 +417,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 // MPV only emits playback-restart after it has decoded at
                 // the new position. It is the authoritative point to release
                 // our temporary seek pin, even with a nearby keyframe seek.
-                if let _ = self.committedSeekTarget,
+                if let destination = self.committedSeekTarget,
                    let measured = (data?["positionSeconds"] as? NSNumber)?.doubleValue,
-                   measured.isFinite {
+                   measured.isFinite,
+                   abs(measured - destination) <= 4.5 {
+                    // Multiple 15s clicks can queue several MPV seeks. Do
+                    // not release the target pin for an older restart event;
+                    // that's what made later clicks jump toward 0 again.
                     self.committedSeekTarget = nil
                     self.committedSeekDate = nil
                     self.currentSeconds = max(0, measured)

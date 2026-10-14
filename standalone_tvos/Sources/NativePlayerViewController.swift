@@ -102,6 +102,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // Release keeps it running; further clicks cycle speed and direction.
     private var lockedSeekDirection = 0
     private var lockedSpeedIndex = 0
+    // Freeze the actual movie while an independent windowed preview moves.
+    // Restore its earlier play state only when the target is committed/cancelled.
+    private var resumeAfterLockedSeek = false
     private var holdActivationTimer: Timer?
     private var explicitChromeHidden = false
 
@@ -228,6 +231,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         heldDirection = 0
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
+        resumeAfterLockedSeek = false
         holdActivationTimer?.invalidate()
         holdActivationTimer = nil
         holdTickCount = 0
@@ -405,6 +409,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 case .success:
                     self.playing = true
                     PlayerStartupDiagnostics.mark("mpv-unpaused-after-display-switch")
+                    // This is a startup breadcrumb, not a permanent error.
+                    // Once playback settles, clear it so a later tvOS
+                    // termination is not falsely blamed on the HDMI switch.
+                    let startedCore = core
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self, weak startedCore] in
+                        guard let self, let startedCore,
+                              self.core === startedCore,
+                              self.playbackGeneration == generation,
+                              !self.waitingForFirstFrame else { return }
+                        PlayerStartupDiagnostics.clear()
+                    }
                     self.statusLabel.text = ""
                     self.showPanel()
                     // Defer subtitles until after the video is running.
@@ -891,11 +906,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         case .playPause:
             if toolPanel == .none {
                 if lockedSeekDirection != 0 {
-                    finishLockedSeek(commit: true)
-                } else if targetSeconds != nil {
-                    commitSeek()
+                    // Play commits this thumbnail target and resumes. Do not
+                    // immediately toggle back to Pause after seeking.
+                    finishLockedSeek(commit: true, resumeWhenCommitted: true)
+                } else {
+                    if targetSeconds != nil { commitSeek() }
+                    togglePlayback()
                 }
-                togglePlayback()
             }
         case .menu:
             if toolPanel != .none {
@@ -930,7 +947,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func beginDirectionalSeek(_ direction: Int) {
-        guard core != nil, heldDirection == 0 else { return }
+        // HDMI/first-frame startup must complete before seeking. Otherwise
+        // heavy preview decode competes with the initial display transition.
+        guard core != nil, !waitingForFirstFrame, !isPreparingPlayback,
+              heldDirection == 0 else { return }
         // Assign on press-began even in a locked transport. UIKit may
         // resend began callbacks for a held button; don't accelerate
         // multiple times from one physical press.
@@ -954,7 +974,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func engageLockedSeek(_ direction: Int) {
-        guard lockedSeekDirection == 0, heldDirection == direction, core != nil else { return }
+        guard lockedSeekDirection == 0, heldDirection == direction,
+              core != nil, !waitingForFirstFrame else { return }
+        resumeAfterLockedSeek = playing
+        if playing {
+            // Hold the last real video frame. No native full-screen seeking
+            // or second moving timeline while the preview window updates.
+            core?.setProperty("pause", value: "yes")
+            playing = false
+        }
         lockedSeekDirection = direction
         lockedSpeedIndex = 0
         holdActivationTimer?.invalidate()
@@ -985,7 +1013,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         showPanel()
     }
 
-    private func finishLockedSeek(commit: Bool) {
+    private func finishLockedSeek(commit: Bool, resumeWhenCommitted: Bool? = nil) {
         repeatTimer?.invalidate()
         repeatTimer = nil
         holdActivationTimer?.invalidate()
@@ -993,10 +1021,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         heldDirection = 0
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
+        let restorePlayback = resumeAfterLockedSeek
+        resumeAfterLockedSeek = false
         if commit {
-            commitSeek()
+            commitSeek(resumeAfter: resumeWhenCommitted ?? restorePlayback)
         } else {
             cancelUncommittedScrub()
+            if restorePlayback {
+                core?.setProperty("pause", value: "no")
+                playing = true
+            }
         }
         stopShowingThumbnail()
         showPanel()
@@ -1330,28 +1364,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
-    private func commitSeek() {
+    private func commitSeek(resumeAfter: Bool = false) {
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
-        guard let seconds = targetSeconds else { return }
-        // One network seek when the locked transport is confirmed or paused
-        // touch scrubbing finishes. Never seek on every thumbnail update.
-        core?.command(["seek", String(format: "%.3f", seconds), "absolute"])
+        guard let seconds = targetSeconds, let seekCore = core else { return }
+        // Only the final destination reaches the main player. Keep its
+        // movie frame frozen until the independent thumbnail is dismissed.
         currentSeconds = seconds
         committedSeekTarget = seconds
         committedSeekDate = Date()
         targetSeconds = nil
-        // A paused scrub can finish before FFmpeg decodes the frame.
-        // Give it a short grace interval instead of killing that request
-        // exactly when the user's finger leaves the touch surface.
-        if !playing && previewIsVisible && lockedSeekDirection == 0 {
-            previewHideTimer?.invalidate()
-            previewHideTimer = Timer.scheduledTimer(withTimeInterval: 2.6,
-                repeats: false) { [weak self] _ in self?.stopShowingThumbnail() }
-        } else {
-            stopShowingThumbnail()
-        }
+        stopShowingThumbnail()
         showPanel()
+        seekCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) {
+            [weak self, weak seekCore] result in
+            guard let self, let seekCore, self.core === seekCore else { return }
+            if case .failure = result {
+                self.statusLabel.text = "Seek failed; playback can continue"
+            }
+            if resumeAfter {
+                // Resume only after the main player accepts the single seek.
+                seekCore.setProperty("pause", value: "no")
+                self.playing = true
+                self.showPanel()
+            }
+        }
     }
 
     private func scheduleFrames() {
@@ -1421,6 +1458,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         holdActivationTimer = nil
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
+        resumeAfterLockedSeek = false
         frameViews.first?.image = nil
         previewLoadingLabel.text = "Loading preview…"
         previewLoadingLabel.isHidden = false

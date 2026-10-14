@@ -124,6 +124,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var panTravelPoints: Double = 0
     private var panTurnRadians: Double = 0
     private var circularSeekActive = false
+    private var panStartedWhilePlaying = false
     private var circularSeekOrigin = 0.0
     private var circularTurnOrigin = 0.0
     private var hasSelectedPreferredAudio = false
@@ -255,6 +256,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         holdTickCount = 0
         isTouchScrubbing = false
         circularSeekActive = false
+        panStartedWhilePlaying = false
         hasSelectedPreferredAudio = false
         seekCommitOperationID += 1
         displayNegotiationPending = false
@@ -891,7 +893,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 choiceIndex = max(0, choiceIndex - 1)
                 renderTrackPanel()
             } else if toolPanel == .none {
-                if lockedSeekDirection != 0 { finishLockedSeek(commit: true) }
+                // A preview is confirmed only by the center button.
+                if previewIsVisible || targetSeconds != nil { showPanel(); return }
                 toolbarFocused = false
                 updateToolbarFocus()
                 toolPanel = .picture
@@ -909,7 +912,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 choiceIndex = min(max(0, trackChoices.count - 1), choiceIndex + 1)
                 renderTrackPanel()
             } else if toolPanel == .none {
-                if lockedSeekDirection != 0 { finishLockedSeek(commit: true) }
+                if previewIsVisible || targetSeconds != nil { showPanel(); return }
                 toolbarFocused = true
                 updateToolbarFocus()
                 showPanel()
@@ -927,7 +930,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             } else if lockedSeekDirection != 0 {
                 finishLockedSeek(commit: true)
             } else if targetSeconds != nil {
-                commitSeek()
+                // Preserve whichever playback state existed before seeking.
+                let shouldResume = resumeAfterLockedSeek
+                resumeAfterLockedSeek = false
+                commitSeek(resumeAfter: shouldResume)
             } else {
                 togglePlayback()
             }
@@ -937,8 +943,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     // Play commits this thumbnail target and resumes. Do not
                     // immediately toggle back to Pause after seeking.
                     finishLockedSeek(commit: true, resumeWhenCommitted: true)
+                } else if targetSeconds != nil {
+                    // Explicit preview confirmation is reserved for Select.
+                    showPanel()
                 } else {
-                    if targetSeconds != nil { commitSeek() }
                     togglePlayback()
                 }
             }
@@ -1088,9 +1096,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard core != nil, toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
-              !isPreparingPlayback, lockedSeekDirection == 0 else { return false }
-        if gestureRecognizer is UIPanGestureRecognizer { return !playing }
-        if gestureRecognizer is UISwipeGestureRecognizer { return true }
+              !isPreparingPlayback else { return false }
+        // A pan can begin while playing as a circular-seek candidate.
+        // A normal straight swipe still performs the regular silent skip.
+        if gestureRecognizer is UIPanGestureRecognizer { return true }
+        if gestureRecognizer is UISwipeGestureRecognizer {
+            return lockedSeekDirection == 0 && !previewIsVisible
+        }
         return true
     }
 
@@ -1098,13 +1110,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         guard recognizer.state == .ended, core != nil,
               toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
-              lockedSeekDirection == 0 else { return }
+              lockedSeekDirection == 0, !isTouchScrubbing else { return }
         let direction = recognizer.direction == .right ? 1 : -1
         if playing {
             silentSkip(direction)
-        } else if !isTouchScrubbing {
-            // A flick in pause mode moves a meaningful fraction of the movie.
-            // Show the independently decoded thumbnail at this target.
+        } else {
+            // Touchpad preview is sticky until Select, even after a flick.
             let base = targetSeconds ?? currentSeconds
             let bound = totalSeconds > 0 ? totalSeconds : 86_400
             targetSeconds = max(0, min(bound,
@@ -1112,11 +1123,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             scheduleFrames()
             refreshLabels()
             showPanel()
-            seekCommitTimer?.invalidate()
-            seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 1.1,
-                repeats: false) { [weak self] _ in
-                self?.commitSeek(retainPreview: true)
-            }
         }
     }
 
@@ -1126,46 +1132,116 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
               !isPreparingPlayback else { return }
         switch gesture.state {
         case .began:
-            guard !playing, lockedSeekDirection == 0, heldDirection == 0 else { return }
+            guard heldDirection == 0 else { return }
             seekCommitOperationID += 1
             isTouchScrubbing = true
-            PlayerStartupDiagnostics.mark("touchpad-preview-active")
+            panLastTranslation = .zero
+            panLastHeading = nil
+            panTravelPoints = 0
+            panTurnRadians = 0
+            circularSeekActive = false
             seekCommitTimer?.invalidate()
             seekCommitTimer = nil
-            panOriginSeconds = targetSeconds ?? currentSeconds
-            targetSeconds = panOriginSeconds
-            scheduleFrames()
-            refreshLabels()
-            showPanel()
+
+            if lockedSeekDirection != 0 {
+                // Enter circular/linear touch browsing from a locked FF/RW
+                // without losing its original resume-after-commit intent.
+                repeatTimer?.invalidate()
+                repeatTimer = nil
+                lockedSeekDirection = 0
+                lockedSpeedIndex = 0
+            }
+            panStartedWhilePlaying = playing && targetSeconds == nil
+            if !panStartedWhilePlaying {
+                panOriginSeconds = targetSeconds ?? currentSeconds
+                targetSeconds = panOriginSeconds
+                PlayerStartupDiagnostics.mark("touchpad-preview-active")
+                scheduleFrames()
+                refreshLabels()
+                showPanel()
+            }
         case .changed:
-            guard isTouchScrubbing, !playing else { return }
-            let dx = Double(gesture.translation(in: remote).x)
+            guard isTouchScrubbing else { return }
+            let translation = gesture.translation(in: remote)
+            let deltaX = Double(translation.x - panLastTranslation.x)
+            let deltaY = Double(translation.y - panLastTranslation.y)
+            panLastTranslation = translation
+            let length = hypot(deltaX, deltaY)
+            if length >= 2.0 {
+                let heading = atan2(deltaY, deltaX)
+                if let previous = panLastHeading {
+                    var turn = heading - previous
+                    if turn > .pi { turn -= 2 * .pi }
+                    if turn < -.pi { turn += 2 * .pi }
+                    // Ignore implausible jumps produced by sparse UIKit
+                    // touch updates instead of mistaking them for a circle.
+                    if abs(turn) < 1.1 { panTurnRadians += turn }
+                }
+                panLastHeading = heading
+                panTravelPoints += length
+            }
             let bound = totalSeconds > 0 ? totalSeconds : 86_400
-            // Significantly gentler than the old 0.7–5.0 sec/point.
-            // A 100-point swipe on a two-hour movie now moves ~15 seconds.
-            let sensitivity = max(0.08, min(0.24, bound / 48_000.0))
-            targetSeconds = max(0, min(bound, panOriginSeconds + dx * sensitivity))
-            scheduleFrames()
-            refreshLabels()
-            showPanel()
+            if !circularSeekActive &&
+                panTravelPoints > 34 && abs(panTurnRadians) > 0.85 {
+                circularSeekActive = true
+                if panStartedWhilePlaying {
+                    // A straight swipe skips silently. Only after genuine
+                    // curvature do we freeze video and enter thumbnail mode.
+                    panStartedWhilePlaying = false
+                    resumeAfterLockedSeek = true
+                    core?.setProperty("pause", value: "yes")
+                    playing = false
+                    targetSeconds = committedSeekTarget ?? currentSeconds
+                    PlayerStartupDiagnostics.mark("touchpad-circular-preview")
+                }
+                circularSeekOrigin = targetSeconds ?? currentSeconds
+                circularTurnOrigin = panTurnRadians
+            }
+            if circularSeekActive {
+                let turnSeconds = max(90.0, min(600.0, bound / 24.0))
+                let revolutions = (panTurnRadians - circularTurnOrigin) / (2.0 * .pi)
+                targetSeconds = max(0, min(bound,
+                    circularSeekOrigin + revolutions * turnSeconds))
+            } else if !panStartedWhilePlaying {
+                // Preserve the existing, gentle straight-line scrubbing.
+                let sensitivity = max(0.08, min(0.24, bound / 48_000.0))
+                targetSeconds = max(0, min(bound,
+                    panOriginSeconds + Double(translation.x) * sensitivity))
+            }
+            if !panStartedWhilePlaying {
+                scheduleFrames()
+                refreshLabels()
+                showPanel()
+            }
         case .ended:
             guard isTouchScrubbing else { return }
             isTouchScrubbing = false
-            // Don't cancel a pending preview before it has even started.
-            // Give the last selected frame a short chance to become visible.
+            if panStartedWhilePlaying {
+                // A normal straight flick keeps the previous 15-second
+                // no-thumbnail seek behavior while the video is running.
+                let translation = gesture.translation(in: remote)
+                if abs(translation.x) >= 35 &&
+                    abs(translation.x) > abs(translation.y) * 1.2 {
+                    silentSkip(translation.x > 0 ? 1 : -1)
+                }
+                panStartedWhilePlaying = false
+                return
+            }
+            // Release NEVER commits or dismisses a seek preview.
+            // Users can rotate several times, lift, then resume browsing.
             scheduleFrames()
             refreshLabels()
-            seekCommitTimer?.invalidate()
-            seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.75,
-                repeats: false) { [weak self] _ in
-                self?.commitSeek(retainPreview: true)
-            }
+            showPanel()
         case .cancelled, .failed:
             guard isTouchScrubbing else { return }
             isTouchScrubbing = false
-            cancelUncommittedScrub()
-            stopShowingThumbnail()
-            showPanel()
+            panStartedWhilePlaying = false
+            // A cancelled gesture does not silently commit; Select remains
+            // the only way to accept the indicated target.
+            if targetSeconds != nil {
+                scheduleFrames()
+                showPanel()
+            }
         default: break
         }
     }
@@ -1184,7 +1260,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         targetSeconds = nil
+        circularSeekActive = false
+        panStartedWhilePlaying = false
+        let shouldResume = resumeAfterLockedSeek
+        resumeAfterLockedSeek = false
         stopShowingThumbnail()
+        if shouldResume {
+            core?.setProperty("pause", value: "no")
+            playing = true
+        }
         refreshLabels()
     }
 
@@ -1504,6 +1588,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         committedSeekTarget = seconds
         committedSeekDate = Date()
         targetSeconds = nil
+        circularSeekActive = false
+        panStartedWhilePlaying = false
         seekCommitOperationID += 1
         let operation = seekCommitOperationID
 
@@ -1623,6 +1709,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
         resumeAfterLockedSeek = false
+        circularSeekActive = false
+        panStartedWhilePlaying = false
         seekCommitOperationID += 1
         displayNegotiationPending = false
         frameViews.first?.image = nil
@@ -1679,12 +1767,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // No timeout while the FF/RW lock is running or a finger is moving
         // across the touch surface. Only genuine inactivity can hide chrome.
         if hasPlayerControls && lockedSeekDirection == 0 &&
-           !isTouchScrubbing && targetSeconds == nil &&
-           toolPanel == .none {
+           !previewIsVisible && !isTouchScrubbing &&
+           targetSeconds == nil && toolPanel == .none {
             hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0,
                 repeats: false) { [weak self] _ in
                 guard let self, self.lockedSeekDirection == 0,
-                      !self.isTouchScrubbing, self.targetSeconds == nil,
+                      !self.previewIsVisible, !self.isTouchScrubbing,
+                      self.targetSeconds == nil,
                       self.toolPanel == .none else { return }
                 self.hidePlaybackChrome()
             }

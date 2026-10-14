@@ -7,6 +7,8 @@ import 'package:flutter/services.dart';
 import '../mpv/mpv.dart';
 import '../services/nuvio_stream_link.dart';
 import '../services/nuvio_seek_thumbnails.dart';
+import '../services/nuvio_touch_seek.dart';
+import '../services/apple_tv_remote_touch_service.dart';
 import '../services/playback_coordinator.dart';
 
 /// Standalone native-mpv playback for a URL Nuvio has already resolved.
@@ -41,6 +43,17 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
   bool _playing = false;
   bool _buffering = false;
   bool _closing = false;
+  bool _settingsOpen = false;
+  int _selectedSetting = 0;
+  int _dvMode = 0;
+  double _zoom = 1.0;
+  double _verticalStretch = 1.0;
+  double? _touchStartX;
+  double? _touchStartY;
+  Duration _touchOrigin = Duration.zero;
+  bool _touchScrubbing = false;
+  static const _dvModes = ['dv81', 'auto', 'hevc_strip'];
+  static const _dvLabels = ['Dolby Vision P8.1', 'Automatic', 'HDR10 fallback'];
   String? _failure;
 
   @override
@@ -48,6 +61,9 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
     super.initState();
     _player = Player();
     _thumbnails = NuvioSeekThumbnails(widget.link.url);
+    final touch = AppleTvRemoteTouchService.instance;
+    touch.captureNuvioTouch = true;
+    _subscriptions.add(touch.nuvioTouches.listen(_onTouchSample));
     _subscriptions.add(_player.streams.position.listen((value) {
       if (mounted && _seekPreview == null) setState(() => _position = value);
     }));
@@ -80,6 +96,8 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
     try {
       await PlaybackCoordinator.instance.claimVideo();
       if (!mounted || _closing) return;
+      // Apply conversion before the first decode, not after file-loaded.
+      await _player.setProperty('dv-conversion-mode', _dvModes[_dvMode]);
       final sidecar = widget.link.subtitleUrl;
       await _player.open(
         Media(widget.link.url),
@@ -88,6 +106,7 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
             : [SubtitleTrack.uri(sidecar, title: 'Nuvio subtitles')],
       );
       if (mounted) setState(() => _playing = true);
+      await _applyGeometry();
     } catch (_) {
       if (mounted) {
         setState(() {
@@ -101,12 +120,104 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
   void _previewSeek(int direction) {
     final maxMs = _duration.inMilliseconds;
     final origin = _seekPreview ?? _player.currentPosition;
-    final next = (origin.inMilliseconds + direction * 10000).clamp(0, maxMs > 0 ? maxMs : 86400000).toInt();
-    final target = Duration(milliseconds: next);
+    final next = (origin.inMilliseconds + direction * 10000)
+        .clamp(0, maxMs > 0 ? maxMs : 86400000).toInt();
+    _previewAt(Duration(milliseconds: next), autoCommit: true);
+  }
+
+  void _previewAt(Duration target, {required bool autoCommit}) {
+    if (!mounted || _closing) return;
     setState(() => _seekPreview = target);
     _scheduleThumbnail(target);
     _seekDebounce?.cancel();
-    _seekDebounce = Timer(const Duration(milliseconds: 400), _commitSeek);
+    _seekDebounce = autoCommit
+        ? Timer(const Duration(milliseconds: 650), _commitSeek)
+        : null;
+  }
+
+  void _onTouchSample(NuvioTouchSample sample) {
+    if (_settingsOpen || _closing || !mounted || _duration <= Duration.zero) return;
+    switch (sample.type) {
+      case 'started':
+        _touchStartX = sample.x;
+        _touchStartY = sample.y;
+        _touchOrigin = _seekPreview ?? _position;
+        _touchScrubbing = false;
+      case 'move':
+        final x = sample.x;
+        final y = sample.y;
+        final startX = _touchStartX;
+        final startY = _touchStartY;
+        if (x == null || y == null || startX == null || startY == null) return;
+        final deltaX = x - startX;
+        final deltaY = y - startY;
+        if (!_touchScrubbing &&
+            (deltaX.abs() < 12 || deltaX.abs() < deltaY.abs() * 1.15)) return;
+        _touchScrubbing = true;
+        _previewAt(NuvioTouchSeek.target(
+          origin: _touchOrigin,
+          total: _duration,
+          deltaX: deltaX,
+        ), autoCommit: false);
+      case 'ended':
+        _touchStartX = null;
+        _touchStartY = null;
+        if (_touchScrubbing) _commitSeek();
+        _touchScrubbing = false;
+      case 'cancelled':
+        _touchStartX = null;
+        _touchStartY = null;
+        _touchScrubbing = false;
+        _seekDebounce?.cancel();
+        setState(() => _seekPreview = null);
+    }
+  }
+
+  Future<void> _applyGeometry() async {
+    try {
+      await _player.invoke('setVideoZoom', {
+        'scale': _zoom,
+        'verticalScale': _verticalStretch,
+      });
+    } catch (_) {
+      // Preserve playback if native geometry control is unavailable.
+    }
+  }
+
+  void _adjustSetting(int direction) {
+    switch (_selectedSetting) {
+      case 0:
+        _dvMode = (_dvMode + direction + _dvModes.length) % _dvModes.length;
+        setState(() {});
+        unawaited(_reloadForDv());
+      case 1:
+        setState(() => _zoom = (_zoom + direction * 0.10).clamp(1.0, 2.0));
+        unawaited(_applyGeometry());
+      case 2:
+        setState(() => _verticalStretch =
+            (_verticalStretch + direction * 0.05).clamp(0.70, 1.60));
+        unawaited(_applyGeometry());
+    }
+  }
+
+  Future<void> _reloadForDv() async {
+    try {
+      final resume = _seekPreview ?? _position;
+      await _player.setProperty('dv-conversion-mode', _dvModes[_dvMode]);
+      if (_closing || !mounted) return;
+      await _player.open(
+        Media(widget.link.url, start: resume),
+        play: _playing,
+        externalSubtitles: widget.link.subtitleUrl == null
+            ? null
+            : [SubtitleTrack.uri(widget.link.subtitleUrl!, title: 'Nuvio subtitles')],
+      );
+      await _applyGeometry();
+    } catch (_) {
+      if (mounted) setState(() {
+        _failure = 'Could not restart the stream with the new Dolby Vision mode.';
+      });
+    }
   }
 
   void _scheduleThumbnail(Duration target) {
@@ -166,6 +277,33 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
   KeyEventResult _onRemoteKey(FocusNode node, KeyEvent event) {
     final key = event.logicalKey;
     final down = event is KeyDownEvent || event is KeyRepeatEvent;
+    if (down && (key == LogicalKeyboardKey.arrowUp ||
+        key == LogicalKeyboardKey.arrowDown)) {
+      if (!_settingsOpen) {
+        setState(() {
+          _settingsOpen = true;
+          _selectedSetting = 0;
+        });
+      } else {
+        setState(() {
+          _selectedSetting = (_selectedSetting +
+              (key == LogicalKeyboardKey.arrowDown ? 1 : -1) + 3) % 3;
+        });
+      }
+      return KeyEventResult.handled;
+    }
+    if (_settingsOpen) {
+      if (down && (key == LogicalKeyboardKey.arrowRight ||
+          key == LogicalKeyboardKey.arrowLeft)) {
+        _adjustSetting(key == LogicalKeyboardKey.arrowRight ? 1 : -1);
+      } else if (down && (key == LogicalKeyboardKey.select ||
+          key == LogicalKeyboardKey.enter ||
+          key == LogicalKeyboardKey.escape ||
+          key == LogicalKeyboardKey.browserBack)) {
+        setState(() => _settingsOpen = false);
+      }
+      return KeyEventResult.handled;
+    }
     if (key == LogicalKeyboardKey.arrowRight || key == LogicalKeyboardKey.arrowLeft) {
       if (down) {
         _previewSeek(key == LogicalKeyboardKey.arrowRight ? 1 : -1);
@@ -209,6 +347,7 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
     _thumbnailDebounce?.cancel();
     _queuedThumbnail = null;
     _thumbnails.dispose();
+    AppleTvRemoteTouchService.instance.captureNuvioTouch = false;
     for (final sub in _subscriptions) {
       unawaited(sub.cancel());
     }
@@ -251,6 +390,48 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
                     Text(_failure!, style: const TextStyle(color: Colors.white, fontSize: 21)),
                     const SizedBox(height: 24),
                     FilledButton(onPressed: _close, child: const Text('Return to Plezy')),
+                  ],
+                ),
+              ),
+            ),
+          if (_settingsOpen && _failure == null)
+            Align(
+              alignment: Alignment.topRight,
+              child: Container(
+                width: 415,
+                margin: const EdgeInsets.all(32),
+                padding: const EdgeInsets.all(22),
+                decoration: BoxDecoration(
+                  color: const Color(0xF2151823),
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('VIDEO SETTINGS',
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 10),
+                    for (final item in [
+                      'Dolby Vision conversion   ${_dvLabels[_dvMode]}',
+                      'Zoom   ${_zoom.toStringAsFixed(2)}×',
+                      'Vertical stretch   ${(_verticalStretch * 100).round()}%',
+                    ].asMap().entries)
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+                        margin: const EdgeInsets.symmetric(vertical: 3),
+                        decoration: BoxDecoration(
+                          color: _selectedSetting == item.key
+                              ? const Color(0xFF284F8D) : Colors.transparent,
+                          borderRadius: BorderRadius.circular(7),
+                        ),
+                        child: Text(item.value, style: const TextStyle(fontSize: 17)),
+                      ),
+                    const SizedBox(height: 8),
+                    const Text('Up/Down: select • Left/Right: change • Select: close',
+                        style: TextStyle(color: Colors.white60, fontSize: 12)),
                   ],
                 ),
               ),
@@ -339,7 +520,9 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
                     const SizedBox(height: 5),
                     Text(_seekPreview != null
                             ? 'Previewing • release to seek'
-                            : (_playing ? 'Select: pause • Left/Right: seek • Menu: back' : 'Select: play • Menu: back'),
+                            : (_playing
+                                ? 'Touchpad: scrub • Up: video settings • Select: pause • Menu: back'
+                                : 'Select: play • Touchpad: scrub • Up: video settings'),
                         style: const TextStyle(color: Colors.white70, fontSize: 13)),
                   ],
                 ),

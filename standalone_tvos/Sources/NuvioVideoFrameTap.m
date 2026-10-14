@@ -26,6 +26,7 @@ static atomic_uintptr_t sTargetLayer;
 static atomic_int_fast64_t sMediaSecond;
 static atomic_int_fast64_t sAnchorNs;
 static atomic_int_fast64_t sLastSlot;
+static atomic_bool sIsPaused;
 static atomic_uint_fast64_t sGeneration;
 static atomic_uint_fast64_t sEnqueueCount;
 static atomic_uint_fast64_t sMatchedCount;
@@ -58,6 +59,8 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
         return;
 
     atomic_fetch_add_explicit(&sMatchedCount, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&sIsPaused, memory_order_acquire))
+        return;
     int64_t second = atomic_load_explicit(&sMediaSecond, memory_order_acquire);
     if (second < 0 || !sample)
         return;
@@ -228,6 +231,7 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sImageCount, 0);
     atomic_store(&sCallbackCount, 0);
     atomic_store(&sConvertFailures, 0);
+    atomic_store(&sIsPaused, true);
     atomic_store(&sMediaSecond, -1);
     atomic_store(&sAnchorNs, 0);
     atomic_store(&sLastSlot, -1);
@@ -254,6 +258,8 @@ void NuvioFrameTapRefreshTargets(AVSampleBufferDisplayLayer *layer,
 
 void NuvioFrameTapSetPlaybackSecond(int64_t second)
 {
+    if (atomic_load_explicit(&sIsPaused, memory_order_relaxed))
+        return;
     if (second < 0) {
         atomic_store_explicit(&sMediaSecond, -1, memory_order_release);
         atomic_store(&sAnchorNs, 0);
@@ -271,10 +277,26 @@ void NuvioFrameTapSetPlaybackSecond(int64_t second)
     }
 }
 
+void NuvioFrameTapSetPaused(BOOL paused)
+{
+    bool old = atomic_exchange_explicit(&sIsPaused, !!paused,
+                                         memory_order_acq_rel);
+    if (old == !!paused)
+        return;
+
+    // Starting playback afresh must not extrapolate from the time a
+    // paused frame was shown minutes earlier. The next mpv time-pos event
+    // will provide a new media timestamp and anchor.
+    atomic_store(&sMediaSecond, -1);
+    atomic_store(&sAnchorNs, 0);
+    atomic_store(&sLastSlot, -1);
+}
+
 void NuvioFrameTapStop(void)
 {
     atomic_store_explicit(&sTargetRenderer, 0, memory_order_release);
     atomic_store_explicit(&sTargetLayer, 0, memory_order_release);
+    atomic_store(&sIsPaused, true);
     atomic_store(&sMediaSecond, -1);
     atomic_store(&sAnchorNs, 0);
     atomic_store(&sLastSlot, -1);

@@ -2,6 +2,7 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <objc/runtime.h>
 #import <os/lock.h>
@@ -23,6 +24,7 @@ static IMP sOriginalLayerEnqueue;
 static atomic_uintptr_t sTargetRenderer;
 static atomic_uintptr_t sTargetLayer;
 static atomic_int_fast64_t sMediaSecond;
+static atomic_int_fast64_t sAnchorNs;
 static atomic_int_fast64_t sLastSlot;
 static atomic_uint_fast64_t sGeneration;
 static atomic_uint_fast64_t sEnqueueCount;
@@ -33,6 +35,16 @@ static atomic_uint_fast64_t sCallbackCount;
 static atomic_uint_fast64_t sConvertFailures;
 static atomic_bool sInFlight;
 static dispatch_queue_t sConvertQueue;
+
+// Use the monotonic host clock to advance frame-index timestamps when the
+// tvOS main runloop or mpv's time-pos observer is temporarily delayed.
+// mpv's AVFoundation VO presents video on the HOST timebase in this app,
+// so the elapsed host time advances in step with normally played frames.
+// No second decoder or separate video request is involved.
+static int64_t nuvio_host_ns(void)
+{
+    return (int64_t)(CACurrentMediaTime() * 1000000000.0);
+}
 
 static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool viaLayer)
 {
@@ -46,10 +58,19 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
         return;
 
     atomic_fetch_add_explicit(&sMatchedCount, 1, memory_order_relaxed);
-    int64_t second = atomic_load_explicit(&sMediaSecond, memory_order_relaxed);
+    int64_t second = atomic_load_explicit(&sMediaSecond, memory_order_acquire);
     if (second < 0 || !sample)
         return;
 
+    int64_t anchor = atomic_load_explicit(&sAnchorNs, memory_order_relaxed);
+    if (anchor > 0) {
+        int64_t elapsed = (nuvio_host_ns() - anchor) / 1000000000LL;
+        // A delayed main runloop must not pin playback thumbnails to a
+        // single timestamp. Extrapolate while video samples keep arriving.
+        // If playback stalls there are no new decoded sample callbacks.
+        if (elapsed > 0 && elapsed < 86400)
+            second += elapsed;
+    }
     int64_t slot = (second / 2) * 2;
     if (atomic_load_explicit(&sLastSlot, memory_order_relaxed) == slot)
         return;
@@ -208,6 +229,7 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sCallbackCount, 0);
     atomic_store(&sConvertFailures, 0);
     atomic_store(&sMediaSecond, -1);
+    atomic_store(&sAnchorNs, 0);
     atomic_store(&sLastSlot, -1);
     NuvioFrameTapRefreshTargets(layer, renderer);
     NSLog(@"[NuvioCache] Frame tap: layer=%d renderer=%d",
@@ -232,9 +254,21 @@ void NuvioFrameTapRefreshTargets(AVSampleBufferDisplayLayer *layer,
 
 void NuvioFrameTapSetPlaybackSecond(int64_t second)
 {
-    atomic_store(&sMediaSecond, second >= 0 ? second : -1);
-    if (second < 0)
+    if (second < 0) {
+        atomic_store_explicit(&sMediaSecond, -1, memory_order_release);
+        atomic_store(&sAnchorNs, 0);
         atomic_store(&sLastSlot, -1);
+        return;
+    }
+
+    // Do not reset the elapsed-time anchor on every quarter-second UI tick.
+    // Only a genuine progress update or seek reanchors this clock. Repeated
+    // stale time-pos events therefore cannot suppress continuous capture.
+    int64_t previous = atomic_load_explicit(&sMediaSecond, memory_order_relaxed);
+    if (previous != second) {
+        atomic_store(&sAnchorNs, nuvio_host_ns());
+        atomic_store_explicit(&sMediaSecond, second, memory_order_release);
+    }
 }
 
 void NuvioFrameTapStop(void)
@@ -242,6 +276,7 @@ void NuvioFrameTapStop(void)
     atomic_store_explicit(&sTargetRenderer, 0, memory_order_release);
     atomic_store_explicit(&sTargetLayer, 0, memory_order_release);
     atomic_store(&sMediaSecond, -1);
+    atomic_store(&sAnchorNs, 0);
     atomic_store(&sLastSlot, -1);
     atomic_fetch_add(&sGeneration, 1);
     os_unfair_lock_lock(&sCallbackLock);

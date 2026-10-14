@@ -93,7 +93,7 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
   void _previewSeek(int direction) {
     final maxMs = _duration.inMilliseconds;
     final origin = _seekPreview ?? _player.currentPosition;
-    final next = (origin.inMilliseconds + direction * 10000).clamp(0, maxMs > 0 ? maxMs : 86400000);
+    final next = (origin.inMilliseconds + direction * 10000).clamp(0, maxMs > 0 ? maxMs : 86400000).toInt();
     setState(() => _seekPreview = Duration(milliseconds: next));
     _seekDebounce?.cancel();
     _seekDebounce = Timer(const Duration(milliseconds: 400), _commitSeek);
@@ -168,7 +168,7 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
     final durationMs = _duration.inMilliseconds;
     final progress = durationMs <= 0
         ? 0.0
-        : (target.inMilliseconds / durationMs).clamp(0.0, 1.0);
+        : (target.inMilliseconds / durationMs).clamp(0.0, 1.0).toDouble();
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(

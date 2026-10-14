@@ -1,0 +1,63 @@
+name: Standalone native Apple TV player IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - standalone-native-tvos-player
+    paths:
+      - 'standalone_tvos/**'
+      - '.github/workflows/native-apple-tv.yml'
+      - 'ios/Runner/MpvPlayer/MpvPlayerCore.swift'
+      - 'shared/apple/MpvPlayer/MpvPlayerCoreBase.swift'
+
+permissions:
+  contents: read
+
+jobs:
+  tvos:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Create independent Xcode project
+        run: |
+          cd standalone_tvos
+          xcodegen generate --spec project.yml
+          test -f NuvioNativePlayer.xcodeproj/project.pbxproj
+
+      - name: Build native tvOS archive (unsigned)
+        run: |
+          xcodebuild archive \
+            -project standalone_tvos/NuvioNativePlayer.xcodeproj \
+            -scheme NuvioNativePlayer \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -archivePath "$PWD/build/NuvioNativePlayer.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(find build/NuvioNativePlayer.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -type d | head -n1)"
+          test -n "$APP"
+          mkdir -p build/native-ipa/Payload
+          cp -R "$APP" build/native-ipa/Payload/
+          (cd build/native-ipa && zip -qry Nuvio-Native-tvOS-unsigned.ipa Payload)
+          test -s build/native-ipa/Nuvio-Native-tvOS-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nuvio-Native-tvOS-unsigned
+          path: build/native-ipa/Nuvio-Native-tvOS-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error

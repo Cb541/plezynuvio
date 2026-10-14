@@ -205,7 +205,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         seekTimeLabel.textColor = .white
         seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .semibold)
         seekTimeLabel.textAlignment = .center
-        seekTimeLabel.isHidden = true
+        seekTimeLabel.isHidden = false
 
         filmStrip.axis = .horizontal
         filmStrip.spacing = 11
@@ -221,7 +221,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             frameViews.append(image)
             filmStrip.addArrangedSubview(image)
         }
-        filmStrip.isHidden = true
+        filmStrip.isHidden = false
 
         currentLabel.textColor = .white
         currentLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .medium)

@@ -45,7 +45,9 @@ static bool nuvioIsBlackBandRow(const uint8_t *pixels, int stride, int width, in
 static UIImage *nuvioMakeImage(AVFrame *frame) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return nil;
 
-    const int width = 800;
+    // A 640px preview comfortably fills the 432pt floating window, with
+    // much lower scaling/retained-image cost than 800px frames.
+    const int width = 640;
     const int height = MAX(2, (int)lrint((double)frame->height * width / frame->width) & ~1);
     if (height > 1200) return nil;
     const int stride = width * 4;
@@ -173,10 +175,14 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                     sourceStream->codecpar) < 0) {
                 [self reset]; return nil;
             }
-            // Preview decoder is software and independent of AVFoundation's
-            // Dolby Vision output surfaces; keep it low priority.
+            // Cine-style lightweight, approximate seek previews: let the normal
+            // playback engine handle precise seeks, but use the nearby key
+            // picture for the independent thumbnail. Avoid 4K inter-frame
+            // software decode fighting the native DV video renderer.
             _decoder->thread_count = 2;
-            _decoder->skip_frame = AVDISCARD_NONREF;
+            _decoder->skip_frame = AVDISCARD_NONKEY;
+            _decoder->skip_loop_filter = AVDISCARD_ALL;
+            _decoder->flags2 |= AV_CODEC_FLAG2_FAST;
             if (avcodec_open2(_decoder, codec, NULL) < 0) {
                 [self reset]; return nil;
             }
@@ -208,9 +214,13 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
 
         UIImage *image = nil;
         int videoPackets = 0;
+        // Seek to the nearest key picture and render exactly one preview.
+        // Decoding forward to an exact timestamp caused multi-second CPU
+        // spikes on 4K HEVC remuxes and can starve the main playback process.
+        // Final seeking remains precise when the user commits the target.
         while (!token.cancelled &&
                CFAbsoluteTimeGetCurrent() < deadline.deadline &&
-               videoPackets < 110) {
+               videoPackets < 72) {
             if (av_read_frame(_format, _packet) < 0) break;
             if (_packet->stream_index != _streamIndex) {
                 av_packet_unref(_packet);
@@ -222,17 +232,9 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
             if (sent < 0) continue;
             while (!token.cancelled &&
                    avcodec_receive_frame(_decoder, _frame) == 0) {
-                int64_t ts = _frame->best_effort_timestamp;
-                if (!image) image = nuvioMakeImage(_frame);
-                int64_t tolerance = av_rescale_q(1, (AVRational){1, 1},
-                                                stream->time_base);
-                if (ts == AV_NOPTS_VALUE || ts >= target - tolerance) {
-                    UIImage *frame = nuvioMakeImage(_frame);
-                    if (frame) image = frame;
-                    av_frame_unref(_frame);
-                    goto finished;
-                }
+                image = nuvioMakeImage(_frame);
                 av_frame_unref(_frame);
+                if (image) goto finished;
             }
         }
 

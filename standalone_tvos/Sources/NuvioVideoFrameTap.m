@@ -29,6 +29,7 @@ static atomic_uint_fast64_t sEnqueueCount;
 static atomic_uint_fast64_t sMatchedCount;
 static atomic_uint_fast64_t sMissingPixelCount;
 static atomic_uint_fast64_t sImageCount;
+static atomic_uint_fast64_t sCallbackCount;
 static atomic_uint_fast64_t sConvertFailures;
 static atomic_bool sInFlight;
 static dispatch_queue_t sConvertQueue;
@@ -119,8 +120,11 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
             os_unfair_lock_unlock(&sCallbackLock);
             if (callback) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    if (generation == atomic_load(&sGeneration))
+                    if (generation == atomic_load(&sGeneration)) {
+                        atomic_fetch_add_explicit(&sCallbackCount, 1,
+                                                  memory_order_relaxed);
                         callback(result, slot);
+                    }
                 });
             }
         }
@@ -201,6 +205,7 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sMatchedCount, 0);
     atomic_store(&sMissingPixelCount, 0);
     atomic_store(&sImageCount, 0);
+    atomic_store(&sCallbackCount, 0);
     atomic_store(&sConvertFailures, 0);
     atomic_store(&sMediaSecond, -1);
     atomic_store(&sLastSlot, -1);
@@ -247,5 +252,6 @@ void NuvioFrameTapStop(void)
 uint64_t NuvioFrameTapEnqueueCount(void) { return atomic_load(&sEnqueueCount); }
 uint64_t NuvioFrameTapMatchedCount(void) { return atomic_load(&sMatchedCount); }
 uint64_t NuvioFrameTapImageCount(void) { return atomic_load(&sImageCount); }
+uint64_t NuvioFrameTapCallbackCount(void) { return atomic_load(&sCallbackCount); }
 uint64_t NuvioFrameTapMissingPixelCount(void) { return atomic_load(&sMissingPixelCount); }
 uint64_t NuvioFrameTapConvertFailureCount(void) { return atomic_load(&sConvertFailures); }

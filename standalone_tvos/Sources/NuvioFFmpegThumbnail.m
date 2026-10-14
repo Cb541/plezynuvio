@@ -27,6 +27,21 @@ static int nuvioInterrupt(void *opaque) {
     return state->token.cancelled || CFAbsoluteTimeGetCurrent() > state->deadline;
 }
 
+// Detect letterbox rows embedded into a decoded frame. scaleAspectFill
+// handles differing aspect ratios, but source-encoded black bars would
+// otherwise remain visible on a full-screen scrubbing preview. Crop only
+// a substantial, uniformly black top AND bottom band; don't crop a
+// genuinely dark scene merely because its outermost pixels are dim.
+static bool nuvioIsBlackBandRow(const uint8_t *pixels, int stride, int width, int row) {
+    const uint8_t *line = pixels + (size_t)row * stride;
+    for (int sample = 1; sample <= 24; ++sample) {
+        int x = (width * sample) / 25;
+        const uint8_t *pixel = line + (size_t)x * 4;
+        if (pixel[0] > 14 || pixel[1] > 14 || pixel[2] > 14) return false;
+    }
+    return true;
+}
+
 static UIImage *nuvioMakeImage(AVFrame *frame) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return nil;
 
@@ -50,6 +65,12 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
     sws_freeContext(scale);
     if (rows <= 0) { av_free(pixels); return nil; }
 
+    int top = 0;
+    while (top < height / 3 && nuvioIsBlackBandRow(pixels, stride, width, top)) ++top;
+    int bottom = height - 1;
+    while (bottom > height * 2 / 3 &&
+           nuvioIsBlackBandRow(pixels, stride, width, bottom)) --bottom;
+
     NSData *copy = [NSData dataWithBytes:pixels length:(NSUInteger)stride * height];
     av_free(pixels);
     if (!copy) return nil;
@@ -63,6 +84,14 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
     CGDataProviderRelease(provider);
     if (!cg) return nil;
     UIImage *image = [UIImage imageWithCGImage:cg];
+    if (top > height / 20 && bottom < height - height / 20) {
+        CGRect crop = CGRectMake(0, top, width, bottom - top + 1);
+        CGImageRef cropped = CGImageCreateWithImageInRect(cg, crop);
+        if (cropped) {
+            image = [UIImage imageWithCGImage:cropped];
+            CGImageRelease(cropped);
+        }
+    }
     CGImageRelease(cg);
     return image;
 }

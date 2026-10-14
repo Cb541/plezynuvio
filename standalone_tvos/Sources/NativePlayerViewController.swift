@@ -107,6 +107,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // unlike unrestricted per-pan decoding, it bounds decoder pressure.
     private var lastLiveTouchpadRequest = Date.distantPast
     private var lastBackgroundPreviewAttempt = Date.distantPast
+    private var lastConfirmedPauseAt: Date?
     // Locked transport is engaged by holding the left/right edge once.
     // Release keeps it running; further clicks cycle speed and direction.
     private var lockedSeekDirection = 0
@@ -266,6 +267,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         touchpadPreviewMode = false
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
+        lastConfirmedPauseAt = nil
         circularSeekActive = false
         panStartedWhilePlaying = false
         hasSelectedPreferredAudio = false
@@ -512,6 +514,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             case "pause":
                 if let n = value as? NSNumber { self.playing = !n.boolValue }
                 else if let s = value as? String { self.playing = s != "yes" }
+                // This is the observed mpv state, rather than the optimistic
+                // pause intent cached as soon as setProperty was issued.
+                if self.playing {
+                    self.lastConfirmedPauseAt = nil
+                } else {
+                    self.lastConfirmedPauseAt = Date()
+                }
             default: break
             }
         }
@@ -1709,7 +1718,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // must be requested during continuous circular motion.
             if let cached = thumbs.cachedImage(second: Int(seconds.rounded())) {
                 frameViews.first?.image = cached
-                lastPreviewImageSecond = (Int(seconds.rounded()) / 5) * 5
+                lastPreviewImageSecond = (Int(seconds.rounded()) / 2) * 2
             }
         }
 
@@ -1736,12 +1745,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func loadFrames(serial: Int) {
         guard previewIsVisible, let link, let targetSeconds,
               serial == currentPreviewSerial else { return }
-        guard core?.isPaused == true else {
-            // Only decode when the native player has ACKNOWLEDGED Pause.
-            // A touchpad circular gesture may have paused it milliseconds
-            // earlier; racing a second 4K decode can terminate tvOS playback.
+        guard core?.isPaused == true,
+              let observedPause = lastConfirmedPauseAt,
+              Date().timeIntervalSince(observedPause) >= 0.9 else {
+            // Optimistic core.isPaused can flip before the hardware video
+            // renderer actually stops. Give it time to release frames before
+            // starting a software FFmpeg decoder on the same 4K stream.
             guard thumbTimer == nil else { return }
-            thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.3,
+            thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.35,
                 repeats: false) { [weak self] _ in
                 guard let self else { return }
                 self.thumbTimer = nil
@@ -1750,7 +1761,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             return
         }
         let second = max(0, Int(targetSeconds.rounded()))
-        let bucket = (second / 5) * 5
+        let bucket = (second / 2) * 2
         guard lastPreviewRequestedBucket != bucket else { return }
         lastPreviewRequestedBucket = bucket
         if touchpadPreviewMode && isTouchScrubbing {

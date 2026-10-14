@@ -446,36 +446,14 @@ final class SeekFrameService {
 
     private func remember(_ image: UIImage, slot: Int,
                           directory: URL?, writeToDisk: Bool) {
-        let pixels = Int(image.size.width * image.size.height * 4)
-        hotImages.setObject(image, forKey: key(slot), cost: max(1, pixels))
-        guard writeToDisk,
-              let file = diskURL(for: slot, directory: directory) else { return }
-        // JPEG encode immediately on the serial decoder worker. An unlimited
-        // backlog of disk-writing closures retaining full UIImage buffers
-        // could otherwise trigger tvOS memory termination while scrubbing.
-        guard let bytes = image.jpegData(compressionQuality: 0.8) else { return }
-        diskWriter.async { [weak self] in
-            let fm = FileManager.default
-            guard !fm.fileExists(atPath: file.path) else { return }
-            try? fm.createDirectory(at: file.deletingLastPathComponent(),
-                                    withIntermediateDirectories: true)
-            do {
-                try bytes.write(to: file, options: .atomic)
-                guard let self else { return }
-                self.lock.lock()
-                if self.scopedDirectory == directory {
-                    self.cachedSlots.insert(slot)
-                    let now = Date()
-                    self.recentDiskWrites.append((date: now, bytes: bytes.count))
-                    let cutoff = now.addingTimeInterval(-8)
-                    self.recentDiskWrites.removeAll { $0.date < cutoff }
-                }
-                self.lock.unlock()
-            } catch {
-                // Out-of-space or tvOS permission issues must never stop video.
-                NSLog("[NuvioCache] Thumbnail could not be stored: %@",
-                      String(describing: error))
-            }
+        // Foreground-generated thumbnails use the exact same RAM/disk
+        // persistence path as native decoded-frame captures. The old direct
+        // disk writer would silently lose them when tvOS refused its folder.
+        if writeToDisk {
+            cachePlaybackFrame(image, second: slot)
+        } else {
+            hotImages.setObject(image, forKey: key(slot),
+                cost: max(1, Int(image.size.width * image.size.height * 4)))
         }
     }
 

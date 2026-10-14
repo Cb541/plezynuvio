@@ -796,11 +796,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             filmStrip.widthAnchor.constraint(equalToConstant: 432),
             filmStrip.heightAnchor.constraint(equalToConstant: 245),
             filmStrip.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            // Exactly one quarter down from the TOP of the video. Not
-            // one quarter above the bottom: comfortable when reclining.
+            // Top boundary of the FIRST (bottommost) quarter:
+            // place the thumbnail center at 75% down from the TOP,
+            // or 25% UP from the BOTTOM. Keep it clear of timeline.
             NSLayoutConstraint(item: filmStrip, attribute: .centerY,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
-                multiplier: 0.25, constant: 0),
+                multiplier: 0.75, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),

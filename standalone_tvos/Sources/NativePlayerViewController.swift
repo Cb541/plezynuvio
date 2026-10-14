@@ -272,6 +272,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let cachedTimeline = CachedTimelineOverlay()
     private let cacheRateLabel = UILabel()
     private var lastCacheUIUpdate = Date.distantPast
+    private var frameTapInstalled = false
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
     private let filmStrip = UIStackView()
@@ -366,6 +367,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             return
         }
         isPreparingPlayback = true
+        // Turn off the old renderer hook before its core is disposed.
+        NuvioFrameTapStop()
+        frameTapInstalled = false
         heldDirection = 0
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
@@ -512,6 +516,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         newCore.observeProperty("duration", format: "double")
         newCore.observeProperty("pause", format: "flag")
         core = newCore
+        // Observe the AVFoundation renderer's *input* samples, not its
+        // displayedPixelBuffer() output (nil on some tvOS hardware paths).
+        // This takes an occasional already-decoded SDR/HDR/DV frame without
+        // a second FFmpeg decoder or a second download.
+        if #available(tvOS 17.0, *),
+           let renderer = newCore.videoLayer?.sampleBufferRenderer {
+            frameTapInstalled = NuvioFrameTapStart(renderer) {
+                [weak self, weak newCore] image, second in
+                guard let self, let newCore,
+                      self.playbackGeneration == generation,
+                      self.core === newCore else { return }
+                self.thumbs.cachePlaybackFrame(image, second: Int(second))
+            }
+        }
+        if !frameTapInstalled {
+            NSLog("[NuvioCache] Cannot intercept AVFoundation video renderer")
+        }
         // mpv's default screenshot path expects a GPU VO; our tvOS video
         // renders through AVSampleBufferDisplayLayer. A software screenshot
         // fallback is required whenever no displayed CVPixelBuffer is
@@ -2689,6 +2710,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func leavePlayback() {
+        NuvioFrameTapStop()
+        frameTapInstalled = false
         playbackGeneration += 1
         isPreparingPlayback = false
         waitingForFirstFrame = false
@@ -2836,109 +2859,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
-        // Hardware renderer often provides no displayed pixel buffer during
-        // playback. Switch to mpv's own software screenshot of the ALREADY
-        // decoded frame rather than disable all thumbnail caching.
-        // Throttle software HDR/DV captures to avoid the previous 4K lag.
-        let confirmedSDR = sourceColorMetadataReady && !sourceIsHDR
-            && !requiresNativeDolbyVision
-        let cadenceBase: Double = backgroundNeedsSoftwareSnapshot
-            ? (sourceIsHDR || requiresNativeDolbyVision ? 8.0 : 5.0) : 2.0
-        let cacheCadence = max(cadenceBase, min(30.0, lastCaptureDuration * 6.0))
-        let safePlayback = playing && core?.isPaused == false
-            && !isPreparingPlayback && !waitingForFirstFrame
-            && !displayNegotiationPending && !previewIsVisible
-            && targetSeconds == nil && mainFramePreviewOrigin == nil
-            && currentSeconds.isFinite && link != nil
-        let snapshotSecond = max(0, Int(currentSeconds.rounded()))
-        let snapshotBucket = (snapshotSecond / 2) * 2
-        if safePlayback && !backgroundSnapshotsUnavailable
-            && !playbackSnapshotInFlight
-            && lastPlaybackCapturedBucket != snapshotBucket
-            && Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= cacheCadence {
-            lastBackgroundPreviewAttempt = Date()
-            playbackSnapshotInFlight = true
-            backgroundSnapshotRequestID += 1
-            let requestID = backgroundSnapshotRequestID
-            let generation = playbackGeneration
-            let started = Date()
-            let software = backgroundNeedsSoftwareSnapshot
-            let complete: (UIImage?) -> Void = { [weak self] image in
-                guard let self, self.playbackGeneration == generation,
-                      self.backgroundSnapshotRequestID == requestID else { return }
-                self.playbackSnapshotInFlight = false
-                self.lastCaptureDuration = Date().timeIntervalSince(started)
-                if let image {
-                    self.backgroundCaptureFailures = 0
-                    self.lastPlaybackCapturedBucket = snapshotBucket
-                    self.thumbs.cachePlaybackFrame(image, second: snapshotSecond)
-                    if software && self.lastCaptureDuration > 2.0 {
-                        self.backgroundSnapshotsUnavailable = true
-                        NSLog("[NuvioCache] Screenshot too slow; disabled to protect playback")
-                    }
-                } else if !software {
-                    self.backgroundNeedsSoftwareSnapshot = true
-                    self.backgroundCaptureFailures = 0
-                    NSLog("[NuvioCache] Hardware frame unavailable; using mpv fallback")
-                } else {
-                    self.backgroundCaptureFailures += 1
-                    if self.backgroundCaptureFailures >= 3 {
-                        self.backgroundSnapshotsUnavailable = true
-                        NSLog("[NuvioCache] No frames from mpv screenshot fallback")
-                    }
-                }
-            }
-            if software {
-                takeMpvSoftwareStill(complete)
-            } else {
-                takeMpvStill(allowSoftwareFallback: false, complete)
-            }
-            // MPV command callbacks might never arrive on unusual remuxes.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
-                guard let self, self.playbackGeneration == generation,
-                      self.backgroundSnapshotRequestID == requestID,
-                      self.playbackSnapshotInFlight else { return }
-                self.backgroundSnapshotRequestID += 1
-                self.playbackSnapshotInFlight = false
-                self.lastCaptureDuration = 4
-                if !software {
-                    self.backgroundNeedsSoftwareSnapshot = true
-                } else {
-                    self.backgroundCaptureFailures += 1
-                    if self.backgroundCaptureFailures >= 2 {
-                        self.backgroundSnapshotsUnavailable = true
-                    }
-                }
-                NSLog("[NuvioCache] Screenshot capture timed out")
-            }
-        }
-        // Native-container SDR only: opportunistically fill a coarse index
-        // across the entire movie, including yet-unwatched chapters. A single
-        // lower-priority AVFoundation request at a time, spaced at 12s, with
-        // automatic disable if this remote stream cannot generate images.
-        // MKV, HDR and Dolby Vision never use a competing background decoder.
-        if safePlayback, confirmedSDR, let media = link,
-           totalSeconds.isFinite, totalSeconds > 60,
-           !isTouchScrubbing && !playbackSnapshotInFlight,
-           Date().timeIntervalSince(lastSDRIndexAttempt) >= 12 {
-            lastSDRIndexAttempt = Date()
-            let stride = 45
-            let slots = max(1, Int(ceil(totalSeconds / Double(stride))))
-            let index = nextSDRIndexSlot % slots
-            nextSDRIndexSlot = (index + 1) % slots
-            let second = min(max(0, Int(totalSeconds) - 1), 15 + index * stride)
-            thumbs.prefetch(url: media.url, second: second)
-        }
+        // Feed the active media timestamp into the renderer's decoded-frame
+        // tap. Conversion runs on a private GPU queue and JPEGs write on the
+        // existing serial cache writer. Nothing seeks or opens another codec.
+        let playbackSecond = core?.timePos ?? -1
+        let captureAllowed = frameTapInstalled && playing
+            && core?.isPaused == false && !waitingForFirstFrame
+            && !isPreparingPlayback && !displayNegotiationPending
+            && targetSeconds == nil && !previewIsVisible
+            && mainFramePreviewOrigin == nil
+            && playbackSecond.isFinite && playbackSecond >= 0
+        NuvioFrameTapSetPlaybackSecond(captureAllowed
+            ? Int64(playbackSecond) : -1)
         refreshLabels()
         // Update the disk-write rate and covered sections once a second.
         // This measures saved JPEG bytes, not video download throughput.
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
             let stats = thumbs.cacheStats()
-            if backgroundSnapshotsUnavailable && stats.frameCount == 0 {
-                cacheRateLabel.text = "CACHE UNAVAILABLE · 0 frames"
+            if !frameTapInstalled && stats.frameCount == 0 {
+                cacheRateLabel.text = "CACHE TAP UNAVAILABLE"
+            } else if stats.frameCount == 0 && NuvioFrameTapEnqueueCount() == 0 {
+                cacheRateLabel.text = "CACHE AWAITING VIDEO"
+            } else if stats.frameCount == 0 && NuvioFrameTapImageCount() == 0 {
+                cacheRateLabel.text = "CACHE CONVERTING · 0 frames"
             } else {
-                // JPEG thumbnails are small: 0.00 MB/s can mask real writes.
                 cacheRateLabel.text = String(
                     format: "CACHE %.3f MB/s · %d frames",
                     stats.writeMBPerSecond, stats.frameCount)
@@ -3012,6 +2957,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekCommitTimer?.invalidate()
         previewHideTimer?.invalidate()
         hideTimer?.invalidate()
+        NuvioFrameTapStop()
         colorFilterTimer?.invalidate()
         core?.dispose()
     }

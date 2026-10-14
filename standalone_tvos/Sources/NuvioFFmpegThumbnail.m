@@ -30,7 +30,7 @@ static int nuvioInterrupt(void *opaque) {
 static UIImage *nuvioMakeImage(AVFrame *frame) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return nil;
 
-    const int width = 680;
+    const int width = 800;
     const int height = MAX(2, (int)lrint((double)frame->height * width / frame->width) & ~1);
     if (height > 1200) return nil;
     const int stride = width * 4;

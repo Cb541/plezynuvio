@@ -858,7 +858,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func beginDirectionalSeek(_ direction: Int) {
-        guard core != nil else { return }
+        guard core != nil, heldDirection == 0 else { return }
+        // Assign on press-began even in a locked transport. UIKit may
+        // resend began callbacks for a held button; don't accelerate
+        // multiple times from one physical press.
+        heldDirection = direction
         if lockedSeekDirection != 0 {
             if direction == lockedSeekDirection {
                 lockedSpeedIndex = min(4, lockedSpeedIndex + 1)
@@ -869,8 +873,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             refreshLabels()
             return
         }
-        guard heldDirection == 0 else { return }
-        heldDirection = direction
         holdActivationTimer?.invalidate()
         holdActivationTimer = Timer.scheduledTimer(withTimeInterval: 0.47, repeats: false) {
             [weak self] _ in

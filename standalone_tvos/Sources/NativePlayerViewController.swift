@@ -64,7 +64,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private let seekTimeLabel = UILabel()
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
-    override var prefersHomeIndicatorAutoHidden: Bool { true }
 
     override func viewDidLoad() {
         super.viewDidLoad()

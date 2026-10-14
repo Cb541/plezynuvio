@@ -37,8 +37,11 @@ jobs:
       - name: Test seek preview cache and Nuvio parsing
         run: flutter test --no-pub test/services/nuvio_seek_thumbnails_test.dart
 
+      - name: Test Siri Remote touch seeking
+        run: flutter test --no-pub test/services/nuvio_touch_seek_test.dart
+
       - name: Analyze changed Dart integration
-        run: dart analyze lib/services/nuvio_stream_link.dart lib/services/nuvio_seek_thumbnails.dart lib/screens/nuvio_stream_player_screen.dart lib/screens/nuvio_external_player_app.dart lib/main.dart
+        run: dart analyze lib/services/nuvio_stream_link.dart lib/services/nuvio_seek_thumbnails.dart lib/services/nuvio_touch_seek.dart lib/screens/nuvio_stream_player_screen.dart lib/screens/nuvio_external_player_app.dart lib/main.dart
 
       - name: Prepare verified tvOS Flutter engine
         run: bash tvos/scripts/fetch_engine.sh

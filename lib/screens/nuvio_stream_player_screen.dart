@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -152,7 +151,9 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
         final deltaX = x - startX;
         final deltaY = y - startY;
         if (!_touchScrubbing &&
-            (deltaX.abs() < 12 || deltaX.abs() < deltaY.abs() * 1.15)) return;
+            (deltaX.abs() < 12 || deltaX.abs() < deltaY.abs() * 1.15)) {
+          return;
+        }
         _touchScrubbing = true;
         _previewAt(NuvioTouchSeek.target(
           origin: _touchOrigin,
@@ -175,7 +176,7 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
 
   Future<void> _applyGeometry() async {
     try {
-      await _player.invoke('setVideoZoom', {
+      await const MethodChannel('com.plezy/mpv_player').invokeMethod<void>('setVideoZoom', {
         'scale': _zoom,
         'verticalScale': _verticalStretch,
       });
@@ -337,7 +338,7 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
     final h = value.inHours;
     final m = value.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = value.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return h == 0 ? value.inMinutes.toString() + ':' + s : h.toString() + ':' + m + ':' + s;
+    return h == 0 ? '${value.inMinutes}:$s' : '$h:$m:$s';
   }
 
   @override

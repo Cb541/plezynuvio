@@ -1,6 +1,6 @@
 /// Direct video stream passed from Nuvio's tvOS external-player chooser.
 ///
-/// Nuvio sends: plezy://stream?url=<percent-encoded-http-url>&title=...&sub=...
+/// Nuvio sends: nuvio-player://stream?url=ENCODED_HTTP_URL&title=...&sub=...
 /// This deliberately does not use Plezy's server-backed MediaItem: the
 /// expiring debrid URL is already resolved by the sending application.
 final class NuvioStreamLink {

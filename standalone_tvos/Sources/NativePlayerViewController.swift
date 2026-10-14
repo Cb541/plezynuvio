@@ -2834,7 +2834,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.isHidden = !showTimeline
         cacheRateLabel.isHidden = !showTimeline
         thumbnailCacheHealthLabel.isHidden = !showTimeline ||
-            thumbs.cacheStats().frameCount > 0
+            (thumbs.cacheStats().frameCount > 0 &&
+             thumbs.cacheStats().failedWrites == 0)
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
@@ -2966,7 +2967,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // R = images handed to cache, J = JPEG encodes, X = failures.
             // This avoids conflating a 2-GB compressed-video buffer with
             // zero generated seek previews.
-            if stats.frameCount == 0 {
+            if stats.failedWrites > 0 {
+                // A RAM JPEG cache is still a *real* seek cache. Do not
+                // describe it as saved to disk if tvOS rejects file writes.
+                // Keep the OS error code visible so storage exhaustion can
+                // be distinguished from sandbox or filename restrictions.
+                thumbnailCacheHealthLabel.isHidden = cacheRateLabel.isHidden
+                thumbnailCacheHealthLabel.text = String(
+                    format: "PREVIEWS: %d DISK + %d RAM · ERR %@",
+                    stats.diskFrames, stats.ramOnlyFrames,
+                    String(stats.storageError.prefix(30)))
+            } else if stats.frameCount == 0 {
                 thumbnailCacheHealthLabel.isHidden = cacheRateLabel.isHidden
                 if !frameTapInstalled {
                     thumbnailCacheHealthLabel.text = "Preview renderer unavailable"

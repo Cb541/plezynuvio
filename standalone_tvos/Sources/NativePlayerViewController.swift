@@ -31,6 +31,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var hasAppeared = false
     private var playbackGeneration = 0
     private var isPreparingPlayback = false
+    private var waitingForFirstFrame = false
+    private var firstFrameTimeout: DispatchWorkItem?
+    private var subtitleURLToLoad: URL?
+    private var subtitleAlreadyRequested = false
     private var link: NativeStreamLink?
     private var clock: Timer?
     private var repeatTimer: Timer?
@@ -119,6 +123,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             return
         }
         isPreparingPlayback = true
+        waitingForFirstFrame = true
+        subtitleAlreadyRequested = false
+        firstFrameTimeout?.cancel()
+        firstFrameTimeout = nil
         playbackGeneration += 1
         let generation = playbackGeneration
         PlayerStartupDiagnostics.mark("handoff-received")
@@ -175,29 +183,118 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         newCore.setVisible(true)
         newCore.updateFrame()
         applyPictureTransform()
-        playing = true
+        playing = false
         isPreparingPlayback = false
-        statusLabel.text = "Opening video…"
+        subtitleURLToLoad = media.subtitle
+        statusLabel.text = "Opening paused; waiting for the first frame…"
         showPanel()
 
-        // Delay `loadfile` to a later main-loop turn. This also ensures the
-        // scene/window/display layer are ready for decoder callbacks.
+        // The original Plezy tvOS flow opens paused, displays one decoded
+        // frame, allows AVDisplayManager's format/rate switch to settle, then
+        // resumes. Running audio/video through the HDMI blank at open was
+        // not safe; do not bypass that first-frame gate.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self, weak newCore] in
             guard let self,
                   self.playbackGeneration == generation,
                   self.core === newCore,
                   let newCore else { return }
-            PlayerStartupDiagnostics.mark("mpv-loadfile-request")
-            newCore.commandAsync(["loadfile", media.url.absoluteString, "replace"]) { [weak self] result in
+            PlayerStartupDiagnostics.mark("mpv-pause-before-load")
+            newCore.setPropertyAsync("pause", value: "yes") { [weak self, weak newCore] result in
+                guard let self,
+                      self.playbackGeneration == generation,
+                      self.core === newCore,
+                      let newCore else { return }
+                if case .failure(let error) = result {
+                    self.waitingForFirstFrame = false
+                    self.showHandoffError("Could not prepare paused playback: \(error.localizedDescription)")
+                    return
+                }
+                self.loadInitialMedia(media, core: newCore, generation: generation)
+            }
+        }
+    }
+
+
+    private func loadInitialMedia(_ media: NativeStreamLink, core: MpvPlayerCore, generation: Int) {
+        guard playbackGeneration == generation, self.core === core else { return }
+        PlayerStartupDiagnostics.mark("mpv-loadfile-request-paused")
+        let watchdog = DispatchWorkItem { [weak self, weak core] in
+            guard let self, let core,
+                  self.playbackGeneration == generation,
+                  self.core === core, self.waitingForFirstFrame else { return }
+            // A file that never publishes a first frame must not be held
+            // indefinitely. The viewer can attempt manual Play to test it.
+            self.statusLabel.text = "Waiting for video frame timed out. Press Play to try resuming."
+            PlayerStartupDiagnostics.mark("mpv-first-frame-timeout")
+            self.showPanel()
+        }
+        firstFrameTimeout?.cancel()
+        firstFrameTimeout = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: watchdog)
+        core.commandAsync(["loadfile", media.url.absoluteString, "replace"]) { [weak self] result in
+            guard let self, self.playbackGeneration == generation else { return }
+            switch result {
+            case .success:
+                // This confirms only that mpv accepted the file command.
+                // It is not proof the decoder has presented a frame.
+                if self.waitingForFirstFrame {
+                    PlayerStartupDiagnostics.mark("mpv-loadfile-accepted-paused")
+                }
+            case .failure(let error):
+                self.firstFrameTimeout?.cancel()
+                self.waitingForFirstFrame = false
+                PlayerStartupDiagnostics.clear()
+                self.showHandoffError("Unable to open the video: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func finishDisplayNegotiation() {
+        guard waitingForFirstFrame, let core else { return }
+        waitingForFirstFrame = false
+        firstFrameTimeout?.cancel()
+        firstFrameTimeout = nil
+        let generation = playbackGeneration
+        PlayerStartupDiagnostics.mark("mpv-waiting-for-hdmi-switch")
+        statusLabel.text = "Matching display and settling HDMI…"
+        showPanel()
+
+        // The native MPV core updates AVDisplayManager from the decoded
+        // frame in MPV_EVENT_PLAYBACK_RESTART. Let its display-mode switch
+        // finish before unpausing. This mirrors Plezy's Dart startup gate.
+        core.awaitDisplayModeSwitch(extraDelayMs: 250) { [weak self, weak core] in
+            guard let self, let core,
+                  self.playbackGeneration == generation, self.core === core else { return }
+            PlayerStartupDiagnostics.mark("mpv-display-matched")
+            self.statusLabel.text = "Starting playback…"
+            core.setPropertyAsync("pause", value: "no") { [weak self] result in
                 guard let self, self.playbackGeneration == generation else { return }
                 switch result {
                 case .success:
-                    // The file may still be demuxing; a video frame is signaled
-                    // by the playback-restart event, not by this command reply.
-                    PlayerStartupDiagnostics.mark("mpv-loadfile-accepted")
+                    self.playing = true
+                    PlayerStartupDiagnostics.mark("mpv-unpaused-after-display-switch")
+                    self.statusLabel.text = "Left/Right: seek  ·  Up: picture  ·  Menu: close"
+                    self.showPanel()
+                    // Defer subtitles until after the video is running.
+                    self.attachInitialSubtitleIfAvailable()
                 case .failure(let error):
-                    PlayerStartupDiagnostics.clear()
-                    self.showHandoffError("Unable to open this video: \(error.localizedDescription)")
+                    self.showHandoffError("Playback could not resume: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func attachInitialSubtitleIfAvailable() {
+        guard !subtitleAlreadyRequested, let subtitleURLToLoad, let core else { return }
+        subtitleAlreadyRequested = true
+        let generation = playbackGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak core] in
+            guard let self, let core,
+                  self.playbackGeneration == generation, self.core === core else { return }
+            core.commandAsync(["sub-add", subtitleURLToLoad.absoluteString, "select"]) { [weak self] result in
+                guard let self, self.playbackGeneration == generation else { return }
+                if case .failure = result {
+                    self.statusLabel.text = "Playing (external subtitles could not load)"
                 }
             }
         }
@@ -237,18 +334,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 PlayerStartupDiagnostics.mark("mpv-start-file")
                 self.statusLabel.text = "Opening media container…"
             case "file-loaded":
-                PlayerStartupDiagnostics.mark("mpv-file-loaded")
-                self.statusLabel.text = "Video loaded; starting playback…"
-                // Subtitles must be attached after the file is loaded, not
-                // concurrently with loadfile (they can race demuxer startup).
-                if let subtitle = self.link?.subtitle {
-                    self.core?.command(["sub-add", subtitle.absoluteString, "select"])
-                }
+                PlayerStartupDiagnostics.mark("mpv-file-loaded-paused")
+                self.statusLabel.text = "Video loaded; waiting for first frame…"
             case "playback-restart":
-                PlayerStartupDiagnostics.clear()
-                self.statusLabel.text = "Left/Right: seek  ·  Up: picture  ·  Menu: close"
-                self.applyPictureTransform()
+                if self.waitingForFirstFrame {
+                    PlayerStartupDiagnostics.mark("mpv-first-frame-ready")
+                    self.applyPictureTransform()
+                    self.finishDisplayNegotiation()
+                } else {
+                    // Subsequent playback-restart events also occur after
+                    // seeking. Do not restart the initial-display gate.
+                    self.applyPictureTransform()
+                }
             case "end-file":
+                if self.waitingForFirstFrame {
+                    self.waitingForFirstFrame = false
+                    self.firstFrameTimeout?.cancel()
+                }
                 if self.currentSeconds < 2 {
                     self.statusLabel.text = "The stream ended or could not load"
                     self.showPanel()
@@ -503,6 +605,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
     private func togglePlayback() {
         guard let core else { return }
+        if waitingForFirstFrame {
+            // Deliberate user override for sources that never report a frame.
+            waitingForFirstFrame = false
+            firstFrameTimeout?.cancel()
+            PlayerStartupDiagnostics.mark("mpv-manual-unpause")
+            core.setProperty("pause", value: "no")
+            playing = true
+            showPanel()
+            return
+        }
         playing.toggle()
         core.setProperty("pause", value: playing ? "no" : "yes")
         showPanel()
@@ -576,6 +688,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private func leavePlayback() {
         playbackGeneration += 1
         isPreparingPlayback = false
+        waitingForFirstFrame = false
+        firstFrameTimeout?.cancel()
+        firstFrameTimeout = nil
+        subtitleURLToLoad = nil
+        subtitleAlreadyRequested = false
         PlayerStartupDiagnostics.clear()
         thumbs.clear()
         thumbTimer?.invalidate()
@@ -633,6 +750,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
     deinit {
         clock?.invalidate()
+        firstFrameTimeout?.cancel()
         repeatTimer?.invalidate()
         thumbTimer?.invalidate()
         hideTimer?.invalidate()

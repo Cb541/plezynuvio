@@ -1017,21 +1017,30 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
         saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
+        hdrBoostLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")HDR/DV boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
-        let available = sourceColorMetadataReady && !sourceIsHDR
+        let available = sourceColorMetadataReady
+            && (!sourceIsHDR || experimentalHDRColorBoost)
+            && !colorFilterFailed
         saturationLabel.textColor = available
             ? (selectedPictureControl == 2 ? .white : .lightGray)
             : .gray
         contrastLabel.textColor = available
             ? (selectedPictureControl == 3 ? .white : .lightGray)
             : .gray
+        hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
+            ? (selectedPictureControl == 4 ? .white : .lightGray) : .gray
         if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
-        } else if sourceIsHDR {
-            colorStatusLabel.text = "HDR / Dolby Vision: native colors preserved.\nUse your TV’s picture settings."
         } else if colorFilterFailed {
-            colorStatusLabel.text = "This video cannot use SDR color adjustments.\nOriginal picture preserved."
+            colorStatusLabel.text = "Video filter failed or HDR mode changed.\nBoost disabled; reset to try again."
+        } else if sourceIsHDR && !experimentalHDRColorBoost {
+            colorStatusLabel.text = "Native \(sourceIsDolbyVision ? "Dolby Vision" : "HDR") protected.\nTurn boost ON to test color changes."
+        } else if sourceIsDolbyVision {
+            colorStatusLabel.text = "EXPERIMENTAL: Dolby Vision metadata may be lost.\nConfirm Dolby Vision on TV; turn OFF to restore."
+        } else if sourceIsHDR {
+            colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\nTurn OFF if playback or highlights change."
         } else {
             colorStatusLabel.text = "SDR enhancement • 100% is original\nLeft/Right adjusts • Select resets all"
         }
@@ -1054,15 +1063,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         case 1:
             verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
             applyPictureTransform()
-        case 2 where sourceColorMetadataReady && !sourceIsHDR && !colorFilterFailed:
+        case 2 where sourceColorMetadataReady
+            && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorSaturation = min(1.50, max(0.60,
                 (colorSaturation * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
             scheduleColorFilterUpdate()
-        case 3 where sourceColorMetadataReady && !sourceIsHDR && !colorFilterFailed:
+        case 3 where sourceColorMetadataReady
+            && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
                 (colorContrast * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
+            scheduleColorFilterUpdate()
+        case 4 where sourceColorMetadataReady && sourceIsHDR:
+            // Only explicit Siri Remote interaction enables the experimental
+            // HDR/DV path, per media item. Left = safe/off, right = test/on.
+            experimentalHDRColorBoost = direction > 0
+            if !experimentalHDRColorBoost { colorFilterFailed = false }
             scheduleColorFilterUpdate()
         default: break
         }
@@ -1075,6 +1092,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         verticalStretch = 1
         colorSaturation = 1.0
         colorContrast = 1.0
+        experimentalHDRColorBoost = false
         colorFilterFailed = false
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorSaturation")
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorContrast")
@@ -1094,15 +1112,25 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let gamma = (try? result.get())?.lowercased() ?? ""
             // The VideoToolbox/AVDisplayManager path preserves source HDR
             // metadata. Do not insert SDR lavfi processing into DV/PQ/HLG.
-            let hdr = playbackCore.doviProfile > 0
+            let dv = playbackCore.doviProfile > 0
+            let hdr = dv
                 || playbackCore.lastSigPeak > 1.05
                 || gamma.contains("smpte2084")
                 || gamma.contains("pq")
                 || gamma.contains("hlg")
                 || gamma.contains("arib")
-            if self.sourceColorMetadataReady && self.sourceIsHDR == hdr { return }
+            if self.sourceColorMetadataReady
+                && self.sourceIsHDR == hdr
+                && self.sourceIsDolbyVision == dv { return }
+            // If an active experimental filter caused an apparent loss of
+            // Dolby Vision, immediately disable and revert that filter.
+            if self.sourceIsDolbyVision && !dv && self.experimentalHDRColorBoost {
+                self.experimentalHDRColorBoost = false
+                self.colorFilterFailed = true
+            }
             self.sourceColorMetadataReady = true
             self.sourceIsHDR = hdr
+            self.sourceIsDolbyVision = dv
             self.updatePictureLabels()
             self.scheduleColorFilterUpdate()
         }

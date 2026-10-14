@@ -1039,6 +1039,7 @@ class MpvPlayerCoreBase: NSObject {
         // closes. A large time horizon allows download ahead at the
         // provider's supported speed; 256 MiB bounds packet metadata RAM
         // while the payload can grow with available device storage.
+        if Bundle.main.bundleIdentifier == "com.cb541.nuvionativeplayer" {
         let cacheDir = FileManager.default.urls(for: .cachesDirectory,
             in: .userDomainMask)[0].appendingPathComponent(
                 "NuvioMediaReadAhead", isDirectory: true)
@@ -1060,6 +1061,7 @@ class MpvPlayerCoreBase: NSObject {
           // Failure to provision the disk cache must never prevent playback.
           NSLog("[NuvioMediaCache] Cache directory unavailable: %@",
                 String(describing: error))
+        }
         }
       #else
         checkError(mpv_set_option_string(mpv, "avfoundation-composite-osd", "no"))

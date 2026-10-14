@@ -24,7 +24,7 @@ private final class RemoteSurface: UIView {
 /// hardware decoding, DV P7->P8.1 conversion and matching the HDMI output.
 /// UIView/CALayer transforms provide zoom + independent vertical stretch
 /// without forcing DV content down mpv's tone-mapped video-zoom path.
-final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
+final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIGestureRecognizerDelegate {
     private var core: MpvPlayerCore?
     private let thumbs = SeekFrameService()
     private var pendingLink: NativeStreamLink?
@@ -118,10 +118,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             idleLabel.text = "NUVIO PLAYER\n\nLast playback stopped during: \(unfinished)\n\nTry opening a stream again. If the app closes, reopen it from the Home Screen to see the last stage."
             statusLabel.text = "Diagnostics: \(unfinished)"
         }
-        // Touch surface scrubs the thumbnail timeline only while paused.
+        // Pan handles paused scrub; swipe gestures handle silent 15-second
+        // navigation while playing (and a larger thumbnail scrub if paused).
         let panGesture = UIPanGestureRecognizer(target: self, action: #selector(touchScrub(_:)))
         panGesture.cancelsTouchesInView = false
+        panGesture.delegate = self
         remote.addGestureRecognizer(panGesture)
+        for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
+            let swipe = UISwipeGestureRecognizer(target: self, action: #selector(remoteSwipe(_:)))
+            swipe.direction = direction
+            swipe.cancelsTouchesInView = false
+            swipe.delegate = self
+            remote.addGestureRecognizer(swipe)
+        }
         clock = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(refreshClock),
                                      userInfo: nil, repeats: true)
     }
@@ -161,6 +170,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         }
         isPreparingPlayback = true
         heldDirection = 0
+        lockedSeekDirection = 0
+        lockedSpeedIndex = 0
+        holdActivationTimer?.invalidate()
+        holdActivationTimer = nil
         holdTickCount = 0
         isTouchScrubbing = false
         repeatTimer?.invalidate()
@@ -763,6 +776,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 choiceIndex = max(0, choiceIndex - 1)
                 renderTrackPanel()
             } else if toolPanel == .none {
+                if lockedSeekDirection != 0 { finishLockedSeek(commit: true) }
                 toolbarFocused = false
                 updateToolbarFocus()
                 toolPanel = .picture
@@ -780,6 +794,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 choiceIndex = min(max(0, trackChoices.count - 1), choiceIndex + 1)
                 renderTrackPanel()
             } else if toolPanel == .none {
+                if lockedSeekDirection != 0 { finishLockedSeek(commit: true) }
                 toolbarFocused = true
                 updateToolbarFocus()
                 showPanel()
@@ -794,6 +809,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 closeToolPanel()
             } else if toolbarFocused {
                 openToolbarSelection()
+            } else if lockedSeekDirection != 0 {
+                finishLockedSeek(commit: true)
             } else if targetSeconds != nil {
                 commitSeek()
             } else {
@@ -801,12 +818,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             }
         case .playPause:
             if toolPanel == .none {
-                if targetSeconds != nil { commitSeek() }
+                if lockedSeekDirection != 0 {
+                    finishLockedSeek(commit: true)
+                } else if targetSeconds != nil {
+                    commitSeek()
+                }
                 togglePlayback()
             }
         case .menu:
             if toolPanel != .none {
                 closeToolPanel()
+            } else if lockedSeekDirection != 0 {
+                finishLockedSeek(commit: false)
+                hidePlaybackChrome()
             } else if targetSeconds != nil {
                 cancelUncommittedScrub()
                 hidePlaybackChrome()
@@ -823,30 +847,128 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         guard key == .leftArrow || key == .rightArrow else { return }
         let direction = key == .rightArrow ? 1 : -1
         guard heldDirection == direction else { return }
-        repeatTimer?.invalidate()
-        repeatTimer = nil
         heldDirection = 0
-        if holdTickCount == 0 {
-            stepSeek(direction, commitAfterIdle: true)
-        } else {
-            commitSeek()
+        holdActivationTimer?.invalidate()
+        holdActivationTimer = nil
+        // A real hold locks the transport even after release. The next
+        // left/right click changes speed without closing the thumbnail.
+        if lockedSeekDirection == 0 {
+            silentSkip(direction)
         }
-        holdTickCount = 0
     }
 
     private func beginDirectionalSeek(_ direction: Int) {
-        guard core != nil, heldDirection == 0 else { return }
+        guard core != nil else { return }
+        if lockedSeekDirection != 0 {
+            if direction == lockedSeekDirection {
+                lockedSpeedIndex = min(4, lockedSpeedIndex + 1)
+            } else {
+                lockedSeekDirection = direction
+                lockedSpeedIndex = 0
+            }
+            refreshLabels()
+            return
+        }
+        guard heldDirection == 0 else { return }
         heldDirection = direction
-        holdTickCount = 0
+        holdActivationTimer?.invalidate()
+        holdActivationTimer = Timer.scheduledTimer(withTimeInterval: 0.47, repeats: false) {
+            [weak self] _ in
+            guard let self, self.heldDirection == direction, self.core != nil else { return }
+            self.engageLockedSeek(direction)
+        }
+    }
+
+    private func engageLockedSeek(_ direction: Int) {
+        guard lockedSeekDirection == 0, heldDirection == direction, core != nil else { return }
+        lockedSeekDirection = direction
+        lockedSpeedIndex = 0
+        holdActivationTimer?.invalidate()
+        holdActivationTimer = nil
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
-        // A short press steps once on release. Holding enters continuous
-        // scrubbing after 380ms and shows a changing preview until release.
+        // The movie stays at its current playback position while the
+        // independent preview playhead advances. One seek commits on Select.
+        targetSeconds = committedSeekTarget ?? currentSeconds
+        advanceLockedSeek(elapsed: 0.4)
+        hideTimer?.invalidate()
         repeatTimer?.invalidate()
-        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.38, repeats: true) { [weak self] _ in
-            guard let self, self.heldDirection == direction else { return }
-            self.holdTickCount += 1
-            self.stepSeek(direction, commitAfterIdle: false)
+        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) {
+            [weak self] _ in self?.advanceLockedSeek(elapsed: 0.35)
+        }
+    }
+
+    private func advanceLockedSeek(elapsed: Double) {
+        guard let direction = lockedSeekDirection == 0 ? nil : lockedSeekDirection else { return }
+        let speeds: [Double] = [2, 4, 8, 16, 32]
+        let base = targetSeconds ?? currentSeconds
+        let bound = totalSeconds > 0 ? totalSeconds : 86_400
+        targetSeconds = max(0, min(bound,
+            base + Double(direction) * elapsed * speeds[lockedSpeedIndex]))
+        scheduleFrames()
+        refreshLabels()
+        showPanel()
+    }
+
+    private func finishLockedSeek(commit: Bool) {
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        holdActivationTimer?.invalidate()
+        holdActivationTimer = nil
+        heldDirection = 0
+        lockedSeekDirection = 0
+        lockedSpeedIndex = 0
+        if commit {
+            commitSeek()
+        } else {
+            cancelUncommittedScrub()
+        }
+        stopShowingThumbnail()
+        showPanel()
+    }
+
+    private func silentSkip(_ direction: Int) {
+        guard let core else { return }
+        // Crucially: NO progress bar and NO thumbnails for a quick click
+        // or swipe, whether the film is currently playing or paused.
+        let base = committedSeekTarget ?? max(0, core.timePos, currentSeconds)
+        let maxTime = totalSeconds > 0 ? totalSeconds : 86_400
+        let dest = max(0, min(maxTime, base + 15.0 * Double(direction)))
+        currentSeconds = dest
+        committedSeekTarget = dest
+        committedSeekDate = Date()
+        core.command(["seek", String(format: "%.3f", dest), "absolute"])
+        refreshLabels()
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard core != nil, toolPanel == .none, !toolbarFocused,
+              lockedSeekDirection == 0 else { return false }
+        if gestureRecognizer is UIPanGestureRecognizer { return !playing }
+        if gestureRecognizer is UISwipeGestureRecognizer { return true }
+        return true
+    }
+
+    @objc private func remoteSwipe(_ recognizer: UISwipeGestureRecognizer) {
+        guard recognizer.state == .ended, core != nil,
+              toolPanel == .none, !toolbarFocused,
+              lockedSeekDirection == 0 else { return }
+        let direction = recognizer.direction == .right ? 1 : -1
+        if playing {
+            silentSkip(direction)
+        } else if !isTouchScrubbing {
+            // A flick in pause mode moves a meaningful fraction of the movie.
+            // Show the independently decoded thumbnail at this target.
+            let base = targetSeconds ?? currentSeconds
+            let bound = totalSeconds > 0 ? totalSeconds : 86_400
+            targetSeconds = max(0, min(bound,
+                base + Double(direction) * max(30, min(240, bound / 30))))
+            scheduleFrames()
+            refreshLabels()
+            showPanel()
+            seekCommitTimer?.invalidate()
+            seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 1.1,
+                repeats: false) { [weak self] _ in self?.commitSeek() }
         }
     }
 
@@ -854,7 +976,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         guard core != nil, toolPanel == .none, !toolbarFocused else { return }
         switch gesture.state {
         case .began:
-            guard !playing, heldDirection == 0 else { return }
+            guard !playing, lockedSeekDirection == 0, heldDirection == 0 else { return }
             isTouchScrubbing = true
             seekCommitTimer?.invalidate()
             seekCommitTimer = nil
@@ -867,19 +989,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             guard isTouchScrubbing, !playing else { return }
             let dx = Double(gesture.translation(in: remote).x)
             let bound = totalSeconds > 0 ? totalSeconds : 86_400
-            // Softer than the old sensitivity and anchored to press origin.
-            targetSeconds = max(0, min(bound, panOriginSeconds + dx * 0.18))
+            let sensitivity = max(0.7, min(5.0, bound / 1800))
+            targetSeconds = max(0, min(bound, panOriginSeconds + dx * sensitivity))
             scheduleFrames()
             refreshLabels()
             showPanel()
         case .ended:
             guard isTouchScrubbing else { return }
             isTouchScrubbing = false
-            commitSeek() // Leave playback paused.
+            commitSeek() // Leave the video paused until Play is pressed.
         case .cancelled, .failed:
             guard isTouchScrubbing else { return }
             isTouchScrubbing = false
             cancelUncommittedScrub()
+            stopShowingThumbnail()
             showPanel()
         default: break
         }

@@ -388,6 +388,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         newCore.observeProperty("duration", format: "double")
         newCore.observeProperty("pause", format: "flag")
         core = newCore
+        // mpv's default screenshot path expects a GPU VO; our tvOS video
+        // renders through AVSampleBufferDisplayLayer. A software screenshot
+        // fallback is required whenever no displayed CVPixelBuffer is
+        // exposed (e.g. certain compressed/HDR presentation paths).
+        newCore.setProperty("screenshot-sw", value: "yes")
         newCore.setVisible(true)
         newCore.updateFrame()
         applyPictureTransform()
@@ -577,8 +582,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                         ?? self.core?.timePos ?? -1
                     if measured.isFinite && abs(measured - Double(target)) <= 5 {
                         self.mainFramePreviewAwaitingSeek = false
-                        self.captureNativePreviewTarget(target,
-                            generation: self.mainFramePreviewGeneration)
+                        // mpv's playback-restart can precede the actual
+                        // AVSampleBufferDisplayLayer presentation. Allow
+                        // the hardware renderer to publish the new frame,
+                        // otherwise a previous GOP image is captured.
+                        let generation = self.mainFramePreviewGeneration
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                            guard let self, generation == self.mainFramePreviewGeneration,
+                                  self.mainFramePreviewBusy,
+                                  self.mainFramePreviewTarget == target else { return }
+                            self.captureNativePreviewTarget(target, generation: generation)
+                        }
                     }
                 }
                 if let restore = self.mainFramePreviewRestoreTarget {
@@ -1907,7 +1921,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // vo=gpu-next. The normal mpv screenshot command often cannot read
         // that output. Apple's renderer provides the actual displayed
         // CVPixelBuffer; capture it without another demuxer or video decoder.
-        if #available(tvOS 17.0, *),
+        if #available(tvOS 17.4, *),
            let buffer = previewCore.videoLayer?.sampleBufferRenderer.displayedPixelBuffer() {
             let context = thumbnailImageContext
             DispatchQueue.global(qos: .utility).async {

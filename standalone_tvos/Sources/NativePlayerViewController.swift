@@ -1928,7 +1928,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 let frame = CIImage(cvPixelBuffer: buffer)
                 let longer = max(frame.extent.width, frame.extent.height)
                 guard longer > 0 else {
-                    DispatchQueue.main.async { completion(nil) }
+                    DispatchQueue.main.async { [weak self] in
+                        self?.takeMpvSoftwareStill(completion)
+                    }
                     return
                 }
                 let scale = min(1, 720.0 / longer)
@@ -1940,14 +1942,29 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 } else {
                     image = nil
                 }
-                DispatchQueue.main.async { completion(image) }
+                DispatchQueue.main.async { [weak self] in
+                    if let image {
+                        completion(image)
+                    } else {
+                        // Some 10-bit/DV pixel buffers cannot be converted by
+                        // CIImage on all tvOS models. Do not abandon a valid
+                        // movie: try mpv's software framebuffer conversion.
+                        self?.takeMpvSoftwareStill(completion)
+                    }
+                }
             }
             return
         }
 
-        // No displayed pixel buffer: retain the software screenshot fallback
-        // for format/output modes that allow it. It may fail gracefully.
         PlayerStartupDiagnostics.mark("displayed-pixel-buffer-unavailable")
+        takeMpvSoftwareStill(completion)
+    }
+
+    // A second capture route, NOT a second video decoder. mpv converts a
+    // frame from the same codec instance when a displayed pixel buffer is
+    // unavailable (for example, certain HDR hardware presentation modes).
+    private func takeMpvSoftwareStill(_ completion: @escaping (UIImage?) -> Void) {
+        guard let previewCore = core else { completion(nil); return }
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("nuvio-preview-\(UUID().uuidString).jpg")
         previewCore.commandAsync(["screenshot-to-file", file.path, "video"]) {

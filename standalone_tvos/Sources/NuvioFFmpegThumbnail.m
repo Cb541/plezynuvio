@@ -100,6 +100,34 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
     return image;
 }
 
+
+// Converts only useful frames. The previous code created a UIImage for
+// almost every 4K GOP frame; hundreds of temporary CoreGraphics buffers
+// could accumulate in an autorelease pool and trigger tvOS jetsam.
+static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBase,
+                               double *bestDistance, UIImage **bestImage) {
+    if (!frame) return false;
+    int64_t pts = frame->best_effort_timestamp;
+    double distance = pts == AV_NOPTS_VALUE ? DBL_MAX :
+        fabs(((double)pts - (double)target) * av_q2d(timeBase));
+    if (*bestImage != nil) {
+        if (distance == DBL_MAX ||
+            distance >= *bestDistance - 0.7 ||
+            distance > 2.0) return *bestDistance <= 0.65;
+    }
+    // Drain all autoreleased NSData/CGImage objects after each sampled
+    // candidate instead of retaining them for the full decode session.
+    UIImage *candidate = nil;
+    @autoreleasepool {
+        candidate = nuvioMakeImage(frame);
+    }
+    if (candidate) {
+        *bestImage = candidate;
+        *bestDistance = distance;
+    }
+    return *bestDistance <= 0.65;
+}
+
 // This object lives on the SeekFrameService's private serial worker.
 // Keeping the demuxer, codec and existing HTTP connection alive avoids
 // re-probing multi-gigabyte MKV files after every Siri Remote movement.
@@ -167,7 +195,10 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
             _streamIndex = av_find_best_stream(_format, AVMEDIA_TYPE_VIDEO,
                                                 -1, -1, NULL, 0);
             if (_streamIndex < 0 ||
-                _format->streams[_streamIndex]->codecpar->codec_id == AV_CODEC_ID_NONE) {
+                _format->streams[_streamIndex]->codecpar->codec_id == AV_CODEC_ID_NONE ||
+                (( _format->streams[_streamIndex]->codecpar->codec_id == AV_CODEC_ID_HEVC ||
+                    _format->streams[_streamIndex]->codecpar->codec_id == AV_CODEC_ID_H264) &&
+                 _format->streams[_streamIndex]->codecpar->extradata_size == 0)) {
                 if (avformat_find_stream_info(_format, NULL) < 0 || token.cancelled) {
                     if (!token.cancelled)
                         NSLog(@"[NuvioPreview] video probe failed");
@@ -245,7 +276,6 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         // For every codec, decode toward the requested PTS instead of
         // blindly presenting the first frame after a distant keyframe.
         // Keep the nearest valid frame as a fallback if the URL is slow.
-        const double tolerance = 0.65;
         for (int pass = 0; pass < 2 && !token.cancelled; ++pass) {
             if (pass == 1) {
                 if (CFAbsoluteTimeGetCurrent() >= deadline.deadline) break;
@@ -281,19 +311,10 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                 if (sent == AVERROR(EAGAIN)) {
                     while (!token.cancelled &&
                            avcodec_receive_frame(_decoder, _frame) == 0) {
-                        int64_t pts = _frame->best_effort_timestamp;
-                        double distance = pts == AV_NOPTS_VALUE ? DBL_MAX :
-                            fabs((double)(pts - target) *
-                                 av_q2d(stream->time_base));
-                        if (!image || distance < bestSeconds - 0.4) {
-                            UIImage *candidate = nuvioMakeImage(_frame);
-                            if (candidate) {
-                                image = candidate;
-                                bestSeconds = distance;
-                            }
-                        }
+                        bool closeEnough = nuvioConsiderFrame(_frame, target,
+                            stream->time_base, &bestSeconds, &image);
                         av_frame_unref(_frame);
-                        if (bestSeconds <= tolerance) break;
+                        if (closeEnough) break;
                     }
                     if (bestSeconds <= tolerance) {
                         av_packet_unref(_packet);
@@ -305,19 +326,10 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                 if (sent < 0) continue;
                 while (!token.cancelled &&
                        avcodec_receive_frame(_decoder, _frame) == 0) {
-                    int64_t pts = _frame->best_effort_timestamp;
-                    double distance = pts == AV_NOPTS_VALUE ? DBL_MAX :
-                        fabs((double)(pts - target) *
-                             av_q2d(stream->time_base));
-                    if (!image || distance < bestSeconds - 0.4) {
-                        UIImage *candidate = nuvioMakeImage(_frame);
-                        if (candidate) {
-                            image = candidate;
-                            bestSeconds = distance;
-                        }
-                    }
+                    bool closeEnough = nuvioConsiderFrame(_frame, target,
+                        stream->time_base, &bestSeconds, &image);
                     av_frame_unref(_frame);
-                    if (bestSeconds <= tolerance) goto finished;
+                    if (closeEnough) goto finished;
                 }
             }
         }

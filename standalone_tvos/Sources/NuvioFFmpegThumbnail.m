@@ -175,13 +175,14 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                     sourceStream->codecpar) < 0) {
                 [self reset]; return nil;
             }
-            // Cine-style lightweight, approximate seek previews: let the normal
-            // playback engine handle precise seeks, but use the nearby key
-            // picture for the independent thumbnail. Avoid 4K inter-frame
-            // software decode fighting the native DV video renderer.
-            _decoder->thread_count = 2;
-            _decoder->skip_frame = AVDISCARD_NONKEY;
-            _decoder->skip_loop_filter = AVDISCARD_ALL;
+            // AVDISCARD_NONKEY is too strict for many HEVC open GOP /
+            // Dolby Vision streams: the demuxer may return a reference
+            // frame but no separately decodable IDR within our budget.
+            // Start with reference frames, fall back to normal decode if
+            // needed, and use one worker thread to limit peak tvOS memory.
+            _decoder->thread_count = 1;
+            _decoder->skip_frame = AVDISCARD_NONREF;
+            _decoder->skip_loop_filter = AVDISCARD_NONREF;
             _decoder->flags2 |= AV_CODEC_FLAG2_FAST;
             if (avcodec_open2(_decoder, codec, NULL) < 0) {
                 [self reset]; return nil;
@@ -201,11 +202,14 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         AVStream *stream = _format->streams[_streamIndex];
         int64_t target = av_rescale_q(MAX(0, seconds), (AVRational){1, 1},
                                       stream->time_base);
-        int seekResult = avformat_seek_file(_format, _streamIndex, INT64_MIN,
-                         target, target, AVSEEK_FLAG_BACKWARD);
-        if (seekResult < 0)
-            seekResult = av_seek_frame(_format, _streamIndex, target,
+        // avformat_seek_file does not honor AVSEEK_FLAG_BACKWARD and the
+        // old min_ts=max_ts=target constraint can miss the preceding GOP.
+        // av_seek_frame is the API that explicitly seeks to a keyframe.
+        int seekResult = av_seek_frame(_format, _streamIndex, target,
                                        AVSEEK_FLAG_BACKWARD);
+        if (seekResult < 0)
+            seekResult = avformat_seek_file(_format, _streamIndex, INT64_MIN,
+                                           target, INT64_MAX, 0);
         if (seekResult < 0 || token.cancelled) {
             if (!token.cancelled) NSLog(@"[NuvioPreview] network seek failed: %d", seekResult);
             [self reset]; return nil;
@@ -213,32 +217,51 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         avcodec_flush_buffers(_decoder);
 
         UIImage *image = nil;
-        int videoPackets = 0;
-        // Seek to the nearest key picture and render exactly one preview.
-        // Decoding forward to an exact timestamp caused multi-second CPU
-        // spikes on 4K HEVC remuxes and can starve the main playback process.
-        // Final seeking remains precise when the user commits the target.
-        while (!token.cancelled &&
-               CFAbsoluteTimeGetCurrent() < deadline.deadline &&
-               videoPackets < 72) {
-            if (av_read_frame(_format, _packet) < 0) break;
-            if (_packet->stream_index != _streamIndex) {
-                av_packet_unref(_packet);
-                continue;
+        // First attempt: decode a reference picture near the target.
+        // On streams that cannot produce one, retry one GOP using normal
+        // decoding instead of leaving a permanent black preview.
+        for (int pass = 0; pass < 2 && !token.cancelled; ++pass) {
+            if (pass == 1) {
+                // AVDISCARD_NONKEY (the previous implementation) dropped
+                // many HEVC random-access pictures. A full decode is slower
+                // but recovers real pictures from open GOP material.
+                if (CFAbsoluteTimeGetCurrent() >= deadline.deadline) break;
+                _decoder->skip_frame = AVDISCARD_DEFAULT;
+                int retrySeek = av_seek_frame(_format, _streamIndex, target,
+                                              AVSEEK_FLAG_BACKWARD);
+                if (retrySeek < 0)
+                    retrySeek = avformat_seek_file(_format, _streamIndex,
+                                                  INT64_MIN, target, INT64_MAX, 0);
+                if (retrySeek < 0) break;
+                avcodec_flush_buffers(_decoder);
             }
-            ++videoPackets;
-            int sent = avcodec_send_packet(_decoder, _packet);
-            av_packet_unref(_packet);
-            if (sent < 0) continue;
+            int videoPackets = 0;
+            const int packetBudget = pass == 0 ? 80 : 110;
             while (!token.cancelled &&
-                   avcodec_receive_frame(_decoder, _frame) == 0) {
-                image = nuvioMakeImage(_frame);
-                av_frame_unref(_frame);
-                if (image) goto finished;
+                   CFAbsoluteTimeGetCurrent() < deadline.deadline &&
+                   videoPackets < packetBudget) {
+                int readResult = av_read_frame(_format, _packet);
+                if (readResult < 0) break;
+                if (_packet->stream_index != _streamIndex) {
+                    av_packet_unref(_packet);
+                    continue;
+                }
+                ++videoPackets;
+                int sent = avcodec_send_packet(_decoder, _packet);
+                av_packet_unref(_packet);
+                if (sent < 0) continue;
+                while (!token.cancelled &&
+                       avcodec_receive_frame(_decoder, _frame) == 0) {
+                    image = nuvioMakeImage(_frame);
+                    av_frame_unref(_frame);
+                    if (image) goto finished;
+                }
             }
         }
 
     finished:
+        // Avoid keeping the expensive full-GOP decoder policy across seeks.
+        if (_decoder) _decoder->skip_frame = AVDISCARD_NONREF;
         _format->interrupt_callback.opaque = NULL;
         if (token.cancelled) {
             [self reset];
@@ -247,7 +270,7 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         // Keep a fully initialized demuxer across seeks. A failed decode
         // resets the session so a later request can reconnect cleanly.
         if (!image) {
-            NSLog(@"[NuvioPreview] decoder produced no frame before deadline");
+            NSLog(@"[NuvioPreview] no frame after reference/GOP passes; HTTP range / HEVC decode may be unsupported");
             [self reset];
         }
         return image;

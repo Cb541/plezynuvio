@@ -1132,7 +1132,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // playback-restart notification. The user can open Picture later;
         // query the decoded stream's color metadata directly instead of
         // permanently refusing to initialize the controls.
-        guard let playbackCore = core, !waitingForFirstFrame else { return }
+        guard let playbackCore = core,
+              (playbackCore.videoSize != nil || !waitingForFirstFrame) else { return }
         let generation = playbackGeneration
         playbackCore.getPropertyAsync("video-params/gamma") {
             [weak self, weak playbackCore] result in

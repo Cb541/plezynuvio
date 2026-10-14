@@ -98,6 +98,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private let stretchLabel = UILabel()
     private let idleLabel = UILabel()
     private let seekTimeLabel = UILabel()
+    private let previewLoadingLabel = UILabel()
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
 
@@ -172,6 +173,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
         link = media
+        frameViews.first?.image = nil
+        previewLoadingLabel.text = "Loading preview…"
+        previewLoadingLabel.isHidden = false
         titleLabel.text = ""
         idleLabel.isHidden = true
         showSettings = false
@@ -474,24 +478,36 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         panel.addSubview(toolbar)
 
         filmStrip.translatesAutoresizingMaskIntoConstraints = false
+        // Infuse-style SINGLE thumbnail above the scrub bar, not a
+        // five-picture strip. Keep the previous decoded frame while seeking.
         filmStrip.axis = .horizontal
-        filmStrip.spacing = 9
-        filmStrip.distribution = .fillEqually
+        filmStrip.spacing = 0
+        filmStrip.distribution = .fill
         filmStrip.alignment = .fill
         filmStrip.isUserInteractionEnabled = false
         view.addSubview(filmStrip)
-        for i in 0..<5 {
-            let image = UIImageView()
-            image.contentMode = .scaleAspectFill
-            image.backgroundColor = UIColor(white: 0.15, alpha: 0.65)
-            image.layer.cornerRadius = 9
-            image.layer.borderColor = UIColor.white.withAlphaComponent(i == 2 ? 0.96 : 0.15).cgColor
-            image.layer.borderWidth = i == 2 ? 3 : 1
-            image.clipsToBounds = true
-            image.isUserInteractionEnabled = false
-            frameViews.append(image)
-            filmStrip.addArrangedSubview(image)
-        }
+        let preview = UIImageView()
+        preview.contentMode = .scaleAspectFill
+        preview.backgroundColor = UIColor(white: 0.12, alpha: 0.86)
+        preview.layer.cornerRadius = 13
+        preview.layer.borderColor = UIColor.white.withAlphaComponent(0.38).cgColor
+        preview.layer.borderWidth = 1
+        preview.clipsToBounds = true
+        preview.translatesAutoresizingMaskIntoConstraints = false
+        frameViews.append(preview)
+        filmStrip.addArrangedSubview(preview)
+
+        previewLoadingLabel.translatesAutoresizingMaskIntoConstraints = false
+        previewLoadingLabel.text = "Loading preview…"
+        previewLoadingLabel.font = .systemFont(ofSize: 18, weight: .medium)
+        previewLoadingLabel.textColor = .white.withAlphaComponent(0.78)
+        previewLoadingLabel.textAlignment = .center
+        preview.addSubview(previewLoadingLabel)
+        NSLayoutConstraint.activate([
+            previewLoadingLabel.leadingAnchor.constraint(equalTo: preview.leadingAnchor, constant: 6),
+            previewLoadingLabel.trailingAnchor.constraint(equalTo: preview.trailingAnchor, constant: -6),
+            previewLoadingLabel.centerYAnchor.constraint(equalTo: preview.centerYAnchor)
+        ])
         filmStrip.alpha = 0
         seekTimeLabel.translatesAutoresizingMaskIntoConstraints = false
         seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
@@ -562,10 +578,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             progress.heightAnchor.constraint(equalToConstant: 5),
             toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            filmStrip.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 140),
-            filmStrip.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -140),
-            filmStrip.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -22),
-            filmStrip.heightAnchor.constraint(equalToConstant: 115),
+            filmStrip.widthAnchor.constraint(equalToConstant: 360),
+            filmStrip.heightAnchor.constraint(equalToConstant: 204),
+            filmStrip.centerXAnchor.constraint(equalTo: progress.centerXAnchor),
+            filmStrip.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -18),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
@@ -1031,7 +1047,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         // Keep the preview on-screen long enough for remote MKV/4K decode.
         // Cancelling here used to discard every picture before it arrived.
         previewHideTimer?.invalidate()
-        previewHideTimer = Timer.scheduledTimer(withTimeInterval: 4.8, repeats: false) { [weak self] _ in
+        previewHideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
             guard let self, self.targetSeconds == nil else { return }
             self.filmStrip.alpha = 0
             self.seekTimeLabel.alpha = 0
@@ -1050,6 +1066,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()
         previewIsVisible = true
+        if frameViews.first?.image == nil {
+            previewLoadingLabel.text = "Loading preview…"
+            previewLoadingLabel.isHidden = false
+        }
         currentPreviewSerial += 1
         let serial = currentPreviewSerial
         // Leave cached images visible while another seek batch is queued.
@@ -1060,14 +1080,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
     private func loadFrames(serial: Int) {
         guard let link, let targetSeconds else { return }
-        let center = Int(targetSeconds)
+        // One high-priority decoder request for the CURRENT playhead only.
+        // Five competing MKV decoder contexts starved the center preview.
+        let second = max(0, Int(targetSeconds.rounded()))
         thumbs.cancel()
-        for index in [2, 1, 3, 0, 4] {
-            let second = max(0, center + (index - 2) * 15)
-            thumbs.request(url: link.url, second: second) { [weak self] image in
-                guard let self, self.currentPreviewSerial == serial,
-                      self.previewIsVisible else { return }
-                if let image { self.frameViews[index].image = image }
+        thumbs.request(url: link.url, second: second) { [weak self] image in
+            guard let self, self.currentPreviewSerial == serial,
+                  self.previewIsVisible else { return }
+            if let image {
+                self.frameViews.first?.image = image
+                self.previewLoadingLabel.isHidden = true
+            } else if self.frameViews.first?.image == nil {
+                self.previewLoadingLabel.text = "Preview unavailable"
+                self.previewLoadingLabel.isHidden = false
             }
         }
     }
@@ -1085,6 +1110,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()
         previewIsVisible = false
+        frameViews.first?.image = nil
+        previewLoadingLabel.text = "Loading preview…"
+        previewLoadingLabel.isHidden = false
         heldDirection = 0
         holdTickCount = 0
         isTouchScrubbing = false

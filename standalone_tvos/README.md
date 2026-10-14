@@ -10,7 +10,7 @@ It has a distinct bundle identifier and `nuvio-player://` deep-link scheme.
   FFmpeg/libmpv via `PLEZY_DV_CONVERSION_MODE=dv81`. This is independent of
   whether the HDMI chain can actually present Dolby Vision.
 - Native Siri Remote 15-second directional click/hold seeking and paused touch scrubbing.
-- Single local FFmpeg thumbnail above the timeline for HTTP(S) MKV and compatible formats, with coalesced requests and an LRU frame cache.
+- Full-screen target-position FFmpeg preview only during locked FF/RW and paused-touch scrubbing, with a reusable decoder and LRU frame cache.
 - Zoom and independent vertical stretch, applied to the video layer rather
   than mpv's video-zoom (which would break DV on tvOS).
 - No Plex/Jellyfin login. Nuvio passes a resolved stream URL.
@@ -22,47 +22,54 @@ It has a distinct bundle identifier and `nuvio-player://` deep-link scheme.
 Subtitle forwarding is optional; signed URLs can expire. Only authorized direct
 HTTP(S) streams without separate authentication headers are supported.
 
-## Remote and player overlay
+## Siri Remote and minimal controls — 1.1.2
 
-- **Quick Left/Right click:** a 15-second jump, based on MPV's real
-  `time-pos` and `duration` observations (not stale zero-value caches).
-  Rapid clicks accumulate before a single asynchronous seek commits.
-- **Hold Left/Right:** after 380ms, begin a continuous 15-second-per-tick
-  preview that changes as the button is held. Let go to seek once to the
-  final target, rather than issuing costly HTTP seeks every 380ms.
-- **While paused:** drag left/right on the touch surface to scrub the
-  preview playhead with reduced sensitivity. Releasing seeks to the chosen
-  position but keeps the film paused.
-- The preview uses a **single thumbnail** above the slim timeline. A
-  coalescing queue lets the current image complete its decode and skips
-  obsolete intermediate requests, so repeated hold events don't starve
-  the thumbnail decoder. It caches frames rounded to five-second intervals.
-- **Up:** opens Zoom and Vertical Stretch controls unchanged; Up/Down
-  selects a property, Left/Right adjusts it, Select restores defaults.
-- **Down:** focuses three clearly labeled bottom-right controls:
-  AUDIO, CC, and INFO. Left/Right selects, Select opens. Track menus use
-  Up/Down and Select to set MPV's actual track IDs.
-- **Back:** closes the open menu, hides the slim transport bar/preview
-  immediately, or (on the following Back with controls hidden) displays
-  a confirmation before stopping the current video.
-- The transport controls auto-hide after **three seconds** of inactivity.
-  The title card and opaque progress container are removed.
-- Apple TV/Infuse's public control guide is the behavior reference;
-  this implementation is native UIKit/libmpv, not Infuse code.
+- **Quick Left/Right click:** silently skip **15 seconds** in either
+  direction. No thumbnail, progress bar, or pop-up is shown. Quick
+  left/right touch-surface swipes do the same while video is playing.
+- **Hold Left/Right (about half a second):** enter **locked fast-forward /
+  rewind**. You can let go and the preview continues moving. Every
+  additional click in that direction raises the speed through
+  2× / 4× / 8× / 16× / 32×; clicking the opposite direction reverses
+  the preview. **Select** commits one seek to the displayed position.
+  **Back** cancels it. There is no three-second timeout in this mode.
+- **Paused touch scrubbing:** drag the Siri Remote's surface to browse
+  using a longer, duration-sensitive travel distance. Release commits
+  the selected position **without unpausing**. A flick in pause mode
+  advances a larger fraction of the movie and shows the preview.
+- **Single full-screen, separate preview:** when and only when locked
+  fast-forwarding/rewinding or paused-touch scrubbing, decode an
+  independent image at the *target* movie timestamp, cropped to fill
+  the full TV screen with `scaleAspectFill` rather than mirroring the
+  currently playing AVFoundation video surface. No video preview is
+  shown for ordinary 15-second skips.
+- **Playback chrome:** transparent bottom timeline with **elapsed time on
+  the left** and **total duration on the right**, alongside the
+  liquid-glass AUDIO, CC and INFO actions. Glass falls back to a blur
+  on older tvOS releases. The timeline only appears while paused or
+  in locked/scrub mode. Press Down to focus the playback tools.
+- **Timeout:** three seconds after the last inactive navigation
+  interaction; while locked or actively touch-scrubbing, timeout is
+  suspended. **Back** hides the controls immediately before
+  the exit confirmation is offered.
+- **Up:** zoom and vertical stretch, retained from the working release.
+  Dolby Vision P7 → P8.1 conversion and playback-mode matching are
+  unchanged.
 
-## Preview extraction
+## Preview decoder architecture
 
-The previous secondary mpv process used `vo=image`, which couldn't
-produce frames on the Apple TV. The new preview uses FFmpeg demuxing
-and on-device frame decoding from the same stream; no server/API-key,
-third-party requests, or uploads. A bounded in-memory cache and
-latest-target coalescing are used for random seek traffic.
+Uses a local FFmpeg decoder for remote HTTP(S) MKV/H.264/HEVC and
+compatible files. The thumbnail worker reuses the demuxer, codec and
+underlying HTTP session between requests for the **same file**,
+instead of re-opening and re-scanning the entire file for each remote
+movement. Only the newest pending target is retained; decoded frames
+are cached in memory in five-second buckets. On-device only: no image
+service, account, key, or upload.
 
-Remote MKV/DV preview speed depends on stream index/keyframe position,
-HTTP byte-range support, and codec decode cost. This native path builds
-in tvOS CI, but still requires on-device verification against actual 4K
-network files. It does not precompute every frame or promise the exact
-latency of Infuse's proprietary extraction.
+This code is compiled/tested by tvOS CI, but real speed depends on
+actual HTTP range support, remote remux/keyframe placement, network
+latency and the Apple TV's software HEVC performance. It is not the
+proprietary Infuse thumbnail engine.
 
 ## Build
 

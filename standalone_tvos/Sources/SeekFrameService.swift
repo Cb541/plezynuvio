@@ -12,14 +12,18 @@ final class SeekFrameService {
         let url: URL
         let second: Int
         let prefetch: Bool
+        let allowSystemDecode: Bool
         let callback: ((UIImage?) -> Void)?
     }
 
     private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .utility)
     private let diskWriter = DispatchQueue(label: "com.cb541.nuvio.seek-disk", qos: .utility)
+    private let diskReader = DispatchQueue(label: "com.cb541.nuvio.seek-read",
+                                            qos: .userInitiated)
     private let lock = NSLock()
     private let hotImages = NSCache<NSString, UIImage>()
     private var generation: UInt64 = 0
+    private var latestCacheLookup: UInt64 = 0
     private var isWorkerRunning = false
     private var pending: Request?
     private var pendingBackground: Request?
@@ -58,6 +62,7 @@ final class SeekFrameService {
                                                           isDirectory: true)
         lock.lock()
         generation &+= 1
+        latestCacheLookup &+= 1
         activeToken?.cancelled = true
         pending = nil
         pendingBackground = nil
@@ -79,10 +84,55 @@ final class SeekFrameService {
         }
     }
 
-    /// Main-thread-safe in-memory lookup for instantaneous swipe feedback.
-    /// Disk hits are fetched on the decoder queue, never on the UI thread.
+    /// In-memory lookup is instantaneous for SDR, HDR and DV.
     func cachedImage(second: Int) -> UIImage? {
         hotImages.object(forKey: key(second))
+    }
+
+    /// Cache-only lookups never wait for the media decoder or a pause.
+    /// Search the exact 2s bucket first, then nearby frames (at most 6s).
+    /// Cancel superseded scrubs before disk access to avoid I/O backlogs.
+    func lookupCached(second: Int,
+                      callback: @escaping (UIImage?, Int?, Bool) -> Void) {
+        let slot = bucket(second)
+        lock.lock()
+        latestCacheLookup &+= 1
+        let lookup = latestCacheLookup
+        let version = generation
+        let directory = scopedDirectory
+        let legacy = legacyScopedDirectory
+        lock.unlock()
+        diskReader.async { [weak self] in
+            guard let self else { return }
+            var found: UIImage?
+            var foundSlot: Int?
+            let candidates = [slot, slot - 2, slot + 2,
+                              slot - 4, slot + 4, slot - 6, slot + 6]
+            for candidate in candidates where candidate >= 0 {
+                self.lock.lock()
+                let stillCurrent = self.generation == version
+                    && self.latestCacheLookup == lookup
+                self.lock.unlock()
+                if !stillCurrent { return }
+                if let image = self.hotImages.object(forKey: self.key(candidate))
+                    ?? self.readDisk(slot: candidate, directory: directory)
+                    ?? self.readDisk(slot: candidate, directory: legacy) {
+                    found = image
+                    foundSlot = candidate
+                    self.hotImages.setObject(image, forKey: self.key(candidate),
+                        cost: max(1, Int(image.size.width * image.size.height * 4)))
+                    break
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let valid = self.generation == version
+                    && self.latestCacheLookup == lookup
+                self.lock.unlock()
+                if valid { callback(found, foundSlot, foundSlot == slot) }
+            }
+        }
     }
 
     /// Accept a frame supplied by the already-running mpv video decoder.
@@ -106,6 +156,7 @@ final class SeekFrameService {
     func cancel() {
         lock.lock()
         generation &+= 1
+        latestCacheLookup &+= 1
         activeToken?.cancelled = true
         pending = nil
         pendingBackground = nil
@@ -133,7 +184,8 @@ final class SeekFrameService {
         // Intentionally DO NOT delete stored previews.
     }
 
-    func request(url: URL, second: Int, callback: @escaping (UIImage?) -> Void) {
+    func request(url: URL, second: Int, allowSystemDecode: Bool = true,
+                 callback: @escaping (UIImage?) -> Void) {
         let slot = bucket(second)
         if let cached = hotImages.object(forKey: key(slot)) {
             DispatchQueue.main.async { callback(cached) }
@@ -141,7 +193,8 @@ final class SeekFrameService {
         }
         lock.lock()
         let request = Request(url: url, second: slot,
-                              prefetch: false, callback: callback)
+                              prefetch: false, allowSystemDecode: allowSystemDecode,
+                              callback: callback)
         pending = request
         // A foreground preview always supersedes any background decode.
         if activeWasBackground { activeToken?.cancelled = true }
@@ -159,7 +212,8 @@ final class SeekFrameService {
         lock.lock()
         if !backgroundPrefetchUnavailable, pending == nil, pendingBackground == nil {
             pendingBackground = Request(url: url, second: slot,
-                                        prefetch: true, callback: nil)
+                                        prefetch: true, allowSystemDecode: true,
+                                        callback: nil)
             scheduleWorkerLocked()
         }
         lock.unlock()
@@ -228,7 +282,9 @@ final class SeekFrameService {
             let decoded: UIImage?
             if let cached {
                 decoded = cached
-            } else if token.cancelled {
+            } else if token.cancelled || !job.allowSystemDecode {
+                // HDR/DV uncached targets use the existing mpv decoder,
+                // never a competing AVFoundation 4K generator.
                 decoded = nil
             } else {
                 // Do NOT invoke FFmpeg. It previously decoded 4K streams

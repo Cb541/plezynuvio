@@ -521,8 +521,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // This takes an occasional already-decoded SDR/HDR/DV frame without
         // a second FFmpeg decoder or a second download.
         if #available(tvOS 17.0, *),
-           let renderer = newCore.videoLayer?.sampleBufferRenderer {
-            frameTapInstalled = NuvioFrameTapStart(renderer) {
+           let layer = newCore.videoLayer {
+            let renderer = layer.sampleBufferRenderer
+            frameTapInstalled = NuvioFrameTapStart(layer, renderer) {
                 [weak self, weak newCore] image, second in
                 guard let self, let newCore,
                       self.playbackGeneration == generation,
@@ -1049,7 +1050,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             cachedTimeline.heightAnchor.constraint(equalTo: progress.heightAnchor),
             cacheRateLabel.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
             cacheRateLabel.bottomAnchor.constraint(equalTo: progress.topAnchor, constant: -5),
-            cacheRateLabel.widthAnchor.constraint(equalToConstant: 200),
+            cacheRateLabel.widthAnchor.constraint(equalToConstant: 390),
             cacheRateLabel.heightAnchor.constraint(equalToConstant: 18),
             endLabel.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -17),
             endLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
@@ -2863,9 +2864,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // tap. Conversion runs on a private GPU queue and JPEGs write on the
         // existing serial cache writer. Nothing seeks or opens another codec.
         let playbackSecond = core?.timePos ?? -1
+        // Refresh the active renderer identity after HDMI mode changes and
+        // AVSampleBufferDisplayLayer flushes.  The previous swizzle could
+        // monitor a stale renderer and silently receive zero samples.
+        if frameTapInstalled, let layer = core?.videoLayer {
+            NuvioFrameTapRefreshTargets(layer, layer.sampleBufferRenderer)
+        }
+        // The existing mpv pause-property cache can lag actual playback.
+        // When samples are being enqueued and the controller says playing,
+        // collecting an already-decoded still is safe independently of it.
         let captureAllowed = frameTapInstalled && playing
-            && core?.isPaused == false && !waitingForFirstFrame
-            && !isPreparingPlayback && !displayNegotiationPending
+            && !waitingForFirstFrame && !isPreparingPlayback
+            && !displayNegotiationPending
             && targetSeconds == nil && !previewIsVisible
             && mainFramePreviewOrigin == nil
             && playbackSecond.isFinite && playbackSecond >= 0
@@ -2877,16 +2887,24 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
             let stats = thumbs.cacheStats()
-            if !frameTapInstalled && stats.frameCount == 0 {
-                cacheRateLabel.text = "CACHE TAP UNAVAILABLE"
-            } else if stats.frameCount == 0 && NuvioFrameTapEnqueueCount() == 0 {
-                cacheRateLabel.text = "CACHE AWAITING VIDEO"
-            } else if stats.frameCount == 0 && NuvioFrameTapImageCount() == 0 {
-                cacheRateLabel.text = "CACHE CONVERTING · 0 frames"
-            } else {
+            let enqueues = NuvioFrameTapEnqueueCount()
+            let received = NuvioFrameTapMatchedCount()
+            let images = NuvioFrameTapImageCount()
+            let missing = NuvioFrameTapMissingPixelCount()
+            let failures = NuvioFrameTapConvertFailureCount()
+            if stats.frameCount > 0 {
                 cacheRateLabel.text = String(
                     format: "CACHE %.3f MB/s · %d frames",
                     stats.writeMBPerSecond, stats.frameCount)
+            } else if !frameTapInstalled {
+                cacheRateLabel.text = "CACHE HOOK UNAVAILABLE"
+            } else {
+                // E=intercepted enqueues, M=main-player sample matches,
+                // I=converted images, N=nil pixel buffers, F=conversion fails.
+                // A visible status is essential for hardware-only tvOS bugs.
+                cacheRateLabel.text = String(
+                    format: "TAP E:%llu M:%llu I:%llu N:%llu F:%llu",
+                    enqueues, received, images, missing, failures)
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

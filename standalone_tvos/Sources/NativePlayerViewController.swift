@@ -109,6 +109,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // unlike unrestricted per-pan decoding, it bounds decoder pressure.
     private var lastLiveTouchpadRequest = Date.distantPast
     private var lastBackgroundPreviewAttempt = Date.distantPast
+    private var lastCaptureDuration = 0.0
+    private var backgroundCaptureFailures = 0
+    private var lastPlaybackCapturedBucket: Int?
+    private var lastCacheLookupBucket: Int?
     private var lastSDRIndexAttempt = Date.distantPast
     private var nextSDRIndexSlot = 0
     private var backgroundSnapshotsUnavailable = false
@@ -334,6 +338,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         touchpadPreviewMode = false
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
+        lastCaptureDuration = 0
+        backgroundCaptureFailures = 0
+        lastPlaybackCapturedBucket = nil
+        lastCacheLookupBucket = nil
         lastSDRIndexAttempt = .distantPast
         nextSDRIndexSlot = 0
         backgroundSnapshotsUnavailable = false
@@ -1669,6 +1677,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             thumbs.cancel()
             currentPreviewSerial += 1
             lastPreviewRequestedBucket = nil
+            lastCacheLookupBucket = nil
             lastLiveTouchpadRequest = .distantPast
             panLastTranslation = .zero
             panLastHeading = nil
@@ -1857,6 +1866,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         frameViews.first?.image = nil
         lastPreviewRequestedBucket = nil
         lastPreviewImageSecond = nil
+        lastCacheLookupBucket = nil
         thumbs.cancel()
         currentPreviewSerial += 1
     }
@@ -2236,13 +2246,28 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             lastPreviewImageSecond = nil
         }
 
-        if touchpadPreviewMode && isTouchScrubbing {
-            // Cache gives immediate feedback on repeat visits to a time.
-            // Critically, it is not the *only* source: fresh thumbnails
-            // must be requested during continuous circular motion.
-            if let cached = thumbs.cachedImage(second: Int(seconds.rounded())) {
-                frameViews.first?.image = cached
-                lastPreviewImageSecond = (Int(seconds.rounded()) / 2) * 2
+        // Cache is consulted immediately, independently of hardware pause
+        // and video decoding. Approximate previews are at most 6s away;
+        // uncached targets still generate their own exact frame on demand.
+        let slot = max(0, (Int(seconds.rounded()) / 2) * 2)
+        if lastCacheLookupBucket != slot {
+            lastCacheLookupBucket = slot
+            if let hot = thumbs.cachedImage(second: slot) {
+                frameViews.first?.image = hot
+                lastPreviewImageSecond = slot
+            } else {
+                let serial = currentPreviewSerial
+                thumbs.lookupCached(second: slot) { [weak self] image, foundSlot, exact in
+                    guard let self, self.previewIsVisible,
+                          self.currentPreviewSerial == serial,
+                          let target = self.targetSeconds,
+                          max(0, (Int(target.rounded()) / 2) * 2) == slot,
+                          let image, let foundSlot else { return }
+                    if exact || self.lastPreviewImageSecond != slot {
+                        self.frameViews.first?.image = image
+                        self.lastPreviewImageSecond = foundSlot
+                    }
+                }
             }
         }
 
@@ -2254,9 +2279,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let interval: TimeInterval
         if touchpadPreviewMode && isTouchScrubbing {
             let sincePrevious = Date().timeIntervalSince(lastLiveTouchpadRequest)
-            // More live updates on SDR; HDR/DV keeps the proven 0.95s cap.
-            let cadence = sourceColorMetadataReady && !sourceIsHDR
-                && !requiresNativeDolbyVision ? 0.48 : 0.95
+            // Cached frames are equally quick for SDR, HDR and DV.
+            // Native uncached HDR/DV seeks remain conservative.
+            let selected = max(0, Int((targetSeconds ?? currentSeconds).rounded()))
+            let isCached = thumbs.cachedImage(second: selected) != nil
+            let cadence: TimeInterval = isCached ? 0.20 :
+                (sourceColorMetadataReady && !sourceIsHDR
+                 && !requiresNativeDolbyVision ? 0.48 : 0.95)
             interval = max(0.12, cadence - max(0, sincePrevious))
         } else {
             interval = touchpadPreviewMode ? 0.20 : 0.12
@@ -2272,6 +2301,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func loadFrames(serial: Int) {
         guard previewIsVisible, let link, let targetSeconds,
               serial == currentPreviewSerial else { return }
+        let second = max(0, Int(targetSeconds.rounded()))
+        let bucket = (second / 2) * 2
+        // Exact RAM hit: no pause wait and no video decoder request.
+        if let cached = thumbs.cachedImage(second: second) {
+            frameViews.first?.image = cached
+            lastPreviewImageSecond = bucket
+            lastPreviewRequestedBucket = bucket
+            return
+        }
         guard core?.isPaused == true,
               let observedPause = lastConfirmedPauseAt,
               Date().timeIntervalSince(observedPause) >= 0.9 else {
@@ -2287,8 +2325,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
             return
         }
-        let second = max(0, Int(targetSeconds.rounded()))
-        let bucket = (second / 2) * 2
         guard lastPreviewRequestedBucket != bucket else { return }
         lastPreviewRequestedBucket = bucket
         if touchpadPreviewMode && isTouchScrubbing {
@@ -2300,10 +2336,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // Always check the persistent disk cache FIRST, even for MKV.
         // For unsupported containers Apple's generator returns nil and the
         // existing mpv decoder takes over without starting a second FFmpeg.
-        thumbs.request(url: link.url, second: second) { [weak self] image in
+        // HDR/DV cache misses must never start a competing decoder.
+        let allowSystemDecode = sourceColorMetadataReady && !sourceIsHDR
+            && !requiresNativeDolbyVision
+        thumbs.request(url: link.url, second: second,
+                       allowSystemDecode: allowSystemDecode) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,
-                  self.link?.url == link.url else { return }
+                  self.link?.url == link.url,
+                  let current = self.targetSeconds,
+                  max(0, (Int(current.rounded()) / 2) * 2) == bucket else { return }
             if let image {
                 // One latest available preview, with no status message.
                 self.frameViews.first?.image = image
@@ -2691,33 +2733,43 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
-        // Dense disk indexing from the playback decoder (never re-seeks).
-        // SDR captures about every 3s; HDR/DV stays conservative at 12s.
-        // A displayed pixel buffer is required: background snapshots must
-        // NEVER fall back to a CPU screenshot on high-bitrate HDR/DV streams.
+        // Progressive unlimited thumbnail caching for SDR, HDR and DV:
+        // capture the already-decoded video during playback, never re-seek
+        // the movie or force an extra decoder/CPU-only HDR conversion.
+        // Aim for a frame every 2s; back off if conversion becomes expensive.
         let confirmedSDR = sourceColorMetadataReady && !sourceIsHDR
             && !requiresNativeDolbyVision
-        let cacheCadence: TimeInterval = confirmedSDR ? 3.0 : 12.0
+        let cacheCadence = max(2.0, min(8.0, lastCaptureDuration * 4.0))
         let safePlayback = playing && core?.isPaused == false
             && !isPreparingPlayback && !waitingForFirstFrame
             && !displayNegotiationPending && !previewIsVisible
             && targetSeconds == nil && mainFramePreviewOrigin == nil
             && currentSeconds.isFinite && link != nil
+        let snapshotSecond = max(0, Int(currentSeconds.rounded()))
+        let snapshotBucket = (snapshotSecond / 2) * 2
         if safePlayback, !backgroundSnapshotsUnavailable,
            !playbackSnapshotInFlight,
+           lastPlaybackCapturedBucket != snapshotBucket,
            Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= cacheCadence {
             lastBackgroundPreviewAttempt = Date()
             playbackSnapshotInFlight = true
             let generation = playbackGeneration
-            let second = Int(max(0, currentSeconds.rounded()))
+            let started = Date()
             takeMpvStill(allowSoftwareFallback: false) { [weak self] image in
                 guard let self, self.playbackGeneration == generation else { return }
                 self.playbackSnapshotInFlight = false
+                self.lastCaptureDuration = Date().timeIntervalSince(started)
                 if let image {
-                    self.thumbs.cachePlaybackFrame(image, second: second)
+                    self.backgroundCaptureFailures = 0
+                    self.lastPlaybackCapturedBucket = snapshotBucket
+                    self.thumbs.cachePlaybackFrame(image, second: snapshotSecond)
                 } else {
-                    // Do not blacklist normal paused seek previews on failure.
-                    self.backgroundSnapshotsUnavailable = true
+                    self.backgroundCaptureFailures += 1
+                    if self.backgroundCaptureFailures >= 3 {
+                        // This video layer exposes no readable frame.
+                        // Foreground native seeking stays functional.
+                        self.backgroundSnapshotsUnavailable = true
+                    }
                 }
             }
         }

@@ -1291,22 +1291,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     NSLog("[NuvioColor] vf graph %@; copy decoder requested",
                           self.colorFilterVerified ? "listed" : "unverified")
                     self.updatePictureLabels()
-                    playbackCore.getPropertyAsync("hwdec-current") {
-                        [weak self, weak playbackCore] decoderResult in
+                    // Allow mpv time to reinitialize the decoder after the
+                    // runtime hwdec switch. Querying immediately could read
+                    // the outgoing decoder and mistakenly disable the effect.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                        [weak self, weak playbackCore] in
                         guard let self, let playbackCore,
                               self.core === playbackCore,
-                              self.playbackGeneration == generation else { return }
-                        let actual = (try? decoderResult.get()) ?? "unknown"
-                        NSLog("[NuvioColor] actual hwdec=%@", actual)
-                        // Direct opaque hardware frames cannot be processed by
-                        // our CPU lavfi filter. Never present a false success
-                        // or keep a potentially nonfunctional graph installed.
-                        if actual == "videotoolbox" {
-                            self.colorFilterFailed = true
-                            self.experimentalHDRColorBoost = false
-                            self.colorEffectRequestedForVideo = false
-                            self.scheduleColorFilterUpdate()
-                            self.updatePictureLabels()
+                              self.playbackGeneration == generation,
+                              self.colorFilterActive,
+                              self.colorEffectRequestedForVideo else { return }
+                        playbackCore.getPropertyAsync("hwdec-current") {
+                            [weak self, weak playbackCore] decoderResult in
+                            guard let self, let playbackCore,
+                                  self.core === playbackCore,
+                                  self.playbackGeneration == generation,
+                                  self.colorFilterActive else { return }
+                            let actual = (try? decoderResult.get()) ?? "unknown"
+                            NSLog("[NuvioColor] actual hwdec after settle=%@", actual)
+                            if actual == "videotoolbox" {
+                                self.colorFilterFailed = true
+                                self.experimentalHDRColorBoost = false
+                                self.colorEffectRequestedForVideo = false
+                                self.scheduleColorFilterUpdate()
+                                self.updatePictureLabels()
+                            }
                         }
                     }
                 }

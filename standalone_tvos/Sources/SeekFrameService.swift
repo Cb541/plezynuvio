@@ -26,12 +26,15 @@ final class SeekFrameService {
     private var activeToken: NuvioThumbnailAbortToken?
     private var activeWasBackground = false
     private var scopedDirectory: URL?
+    // Keep older thumbnails readable while new frames live in Application Support.
+    private var legacyScopedDirectory: URL?
+    private var backgroundPrefetchUnavailable = false
     private var sourceKey: String?
 
     init() {
         // RAM is bounded to protect playback; the persistent disk cache
         // has no application-imposed frame-count or size limit.
-        hotImages.totalCostLimit = 24 * 1_024 * 1_024
+        hotImages.totalCostLimit = 48 * 1_024 * 1_024
     }
 
     private func bucket(_ second: Int) -> Int {
@@ -45,10 +48,14 @@ final class SeekFrameService {
     func prepare(url: URL) {
         let identity = SHA256.hash(data: Data(url.absoluteString.utf8))
             .map { String(format: "%02x", $0) }.joined()
-        let root = FileManager.default.urls(for: .cachesDirectory,
+        let fm = FileManager.default
+        let root = fm.urls(for: .applicationSupportDirectory,
             in: .userDomainMask)[0].appendingPathComponent("NuvioSeekFrames",
                                                           isDirectory: true)
         let dir = root.appendingPathComponent(identity, isDirectory: true)
+        let legacyRoot = fm.urls(for: .cachesDirectory,
+            in: .userDomainMask)[0].appendingPathComponent("NuvioSeekFrames",
+                                                          isDirectory: true)
         lock.lock()
         generation &+= 1
         activeToken?.cancelled = true
@@ -56,11 +63,19 @@ final class SeekFrameService {
         pendingBackground = nil
         sourceKey = identity
         scopedDirectory = dir
+        legacyScopedDirectory = legacyRoot.appendingPathComponent(identity,
+                                                                  isDirectory: true)
+        backgroundPrefetchUnavailable = false
         hotImages.removeAllObjects()
         lock.unlock()
         diskWriter.async {
             try? FileManager.default.createDirectory(at: dir,
                 withIntermediateDirectories: true)
+            // Regenerable thumbnails should never enter an iCloud backup.
+            var backupRoot = root
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try? backupRoot.setResourceValues(values)
         }
     }
 
@@ -111,6 +126,8 @@ final class SeekFrameService {
         lock.lock()
         sourceKey = nil
         scopedDirectory = nil
+        legacyScopedDirectory = nil
+        backgroundPrefetchUnavailable = false
         hotImages.removeAllObjects()
         lock.unlock()
         // Intentionally DO NOT delete stored previews.
@@ -135,10 +152,12 @@ final class SeekFrameService {
     /// Opportunistically generate one thumbnail near playback. Uses the
     /// same serial decoder and is always lower priority than user seeking.
     func prefetch(url: URL, second: Int) {
+        // No second decoder for MKV/HDR/DV; caller enables this only for SDR.
+        guard ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased()) else { return }
         let slot = bucket(second)
         if hotImages.object(forKey: key(slot)) != nil { return }
         lock.lock()
-        if pending == nil, pendingBackground == nil {
+        if !backgroundPrefetchUnavailable, pending == nil, pendingBackground == nil {
             pendingBackground = Request(url: url, second: slot,
                                         prefetch: true, callback: nil)
             scheduleWorkerLocked()
@@ -196,13 +215,16 @@ final class SeekFrameService {
             if pending != nil { pending = nil } else { pendingBackground = nil }
             let version = generation
             let directory = scopedDirectory
+            let legacyDirectory = legacyScopedDirectory
             let token = NuvioThumbnailAbortToken()
             activeToken = token
             activeWasBackground = job.prefetch
             lock.unlock()
 
+            let currentDiskImage = readDisk(slot: job.second, directory: directory)
             let cached = hotImages.object(forKey: key(job.second))
-                ?? readDisk(slot: job.second, directory: directory)
+                ?? currentDiskImage
+                ?? readDisk(slot: job.second, directory: legacyDirectory)
             let decoded: UIImage?
             if let cached {
                 decoded = cached
@@ -219,13 +241,17 @@ final class SeekFrameService {
             lock.lock()
             let valid = generation == version && !token.cancelled
             let foregroundWaiting = pending != nil
+            if valid, job.prefetch, decoded == nil {
+                // Avoid repeating costly generator probes on unsupported sources.
+                backgroundPrefetchUnavailable = true
+            }
             if activeToken === token { activeToken = nil }
             activeWasBackground = false
             lock.unlock()
 
             if valid, let image = decoded {
                 remember(image, slot: job.second, directory: directory,
-                         writeToDisk: cached == nil)
+                         writeToDisk: currentDiskImage == nil)
             }
             if valid, !job.prefetch, !foregroundWaiting,
                let callback = job.callback {

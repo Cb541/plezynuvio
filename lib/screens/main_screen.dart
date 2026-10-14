@@ -75,8 +75,6 @@ import 'downloads/downloads_screen.dart';
 import 'settings/settings_screen.dart';
 import 'profile/profile_switch_screen.dart';
 import 'video_player_screen.dart';
-import 'nuvio_stream_player_screen.dart';
-import '../services/nuvio_stream_link.dart';
 import 'profile/profile_teardown.dart';
 import '../services/system_shelf_service.dart';
 import '../watch_together/watch_together.dart';
@@ -572,10 +570,8 @@ class _MainScreenState extends State<MainScreen>
     // Set up Watch Together callbacks immediately (must be synchronous to catch early messages)
     if (!_isOffline) {
       _setupWatchTogetherCallback();
+      _setupSystemShelfDeepLink();
     }
-    // Nuvio sends already-resolved URLs, so its stream links work without
-    // Plezy having to connect to a Plex or Jellyfin server first.
-    _setupSystemShelfDeepLink();
 
     // Wire profile binder + tracker bootstrap (skip in offline mode)
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -909,11 +905,8 @@ class _MainScreenState extends State<MainScreen>
 
     // Listen for deep links when app is already running (warm start)
     systemShelf.onShelfItemTap = (contentId) {
-      // Never log an external stream's signed debrid URL or access token.
-      if (NuvioStreamLink.tryParse(contentId) == null) {
-        appLogger.d('System shelf tap received');
-      }
-      unawaited(_handleShelfContentId(contentId));
+      appLogger.d('System shelf tap: $contentId');
+      _handleShelfContentId(contentId);
     };
     _systemShelfTapCallback = systemShelf.onShelfItemTap;
 
@@ -921,8 +914,7 @@ class _MainScreenState extends State<MainScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       final contentId = await systemShelf.getInitialDeepLink();
       if (contentId != null && mounted) {
-        // External-stream links may contain credentials in the URL query.
-        appLogger.d('System shelf initial deep link received');
+        appLogger.d('System shelf initial deep link: $contentId');
         unawaited(_handleShelfContentId(contentId));
       }
     });
@@ -931,14 +923,6 @@ class _MainScreenState extends State<MainScreen>
   /// Handle a launcher shelf content ID by fetching metadata and starting playback.
   Future<void> _handleShelfContentId(String contentId) async {
     if (!mounted) return;
-
-    final nuvio = NuvioStreamLink.tryParse(contentId);
-    if (nuvio != null) {
-      await VideoPlayerRoute(
-        builder: (_) => NuvioStreamPlayerScreen(link: nuvio),
-      ).push(Navigator.of(context));
-      return;
-    }
 
     // `plezy://live?...` links arrive through the same channel as shelf IDs.
     final liveLink = LiveTvDeepLink.tryParse(contentId);

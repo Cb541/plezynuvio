@@ -106,6 +106,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // scrubbing. Unlike cache-only motion, this produces real live images;
     // unlike unrestricted per-pan decoding, it bounds decoder pressure.
     private var lastLiveTouchpadRequest = Date.distantPast
+    private var lastBackgroundPreviewAttempt = Date.distantPast
     // Locked transport is engaged by holding the left/right edge once.
     // Release keeps it running; further clicks cycle speed and direction.
     private var lockedSeekDirection = 0
@@ -264,6 +265,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         isTouchScrubbing = false
         touchpadPreviewMode = false
         lastLiveTouchpadRequest = .distantPast
+        lastBackgroundPreviewAttempt = .distantPast
         circularSeekActive = false
         panStartedWhilePlaying = false
         hasSelectedPreferredAudio = false
@@ -281,7 +283,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let generation = playbackGeneration
         PlayerStartupDiagnostics.mark("handoff-received")
 
-        thumbs.clear()
+        // New stream gets its own persistent disk-cache namespace.
+        // The previous file's thumbnails remain available on disk.
+        thumbs.prepare(url: media.url)
         previewHideTimer?.invalidate()
         previewIsVisible = false
         filmStrip.alpha = 0
@@ -791,8 +795,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             filmStrip.widthAnchor.constraint(equalToConstant: 432),
             filmStrip.heightAnchor.constraint(equalToConstant: 245),
-            filmStrip.centerXAnchor.constraint(equalTo: progress.centerXAnchor),
-            filmStrip.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -18),
+            filmStrip.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            // Exactly one quarter down from the TOP of the video. Not
+            // one quarter above the bottom: comfortable when reclining.
+            NSLayoutConstraint(item: filmStrip, attribute: .centerY,
+                relatedBy: .equal, toItem: view, attribute: .bottom,
+                multiplier: 0.25, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -1882,6 +1890,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             } else {
                 currentSeconds = actual
             }
+        }
+        // Progressively fill the on-device, uncapped disk cache while
+        // playback runs. One low-priority preview about every 18 seconds,
+        // slightly ahead of the playhead, not a parallel decoder flood.
+        // Foreground seeking cancels/deprioritizes these requests.
+        if playing, core?.isPaused == false, !isPreparingPlayback,
+           !waitingForFirstFrame, !displayNegotiationPending,
+           lockedSeekDirection == 0, !isTouchScrubbing,
+           !previewIsVisible, targetSeconds == nil,
+           let link, totalSeconds > 0, currentSeconds.isFinite,
+           Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= 18 {
+            lastBackgroundPreviewAttempt = Date()
+            let next = max(0, min(totalSeconds - 0.25, currentSeconds + 9))
+            thumbs.prefetch(url: link.url, second: Int(next))
         }
         refreshLabels()
     }

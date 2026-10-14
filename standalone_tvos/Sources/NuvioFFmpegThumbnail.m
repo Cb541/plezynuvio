@@ -136,8 +136,12 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         NSString *scheme = url.scheme.lowercaseString;
         if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return nil;
 
+        // Opening/probing signed HTTP sources can take longer than a single
+        // keyframe decode, even for a tiny file. The old shared 5s budget
+        // expired during probing, permanently leaving ordinary HEVC black.
+        // Use separate cancellable stages; never block the main/UI thread.
         NuvioReadDeadline deadline = {
-            .deadline = CFAbsoluteTimeGetCurrent() + MAX(0.5, timeoutSeconds),
+            .deadline = CFAbsoluteTimeGetCurrent() + MAX(8.0, timeoutSeconds + 3.0),
             .token = token
         };
         if (!_format || ![_sourceURL isEqualToString:url.absoluteString]) {
@@ -156,13 +160,21 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                 if (!token.cancelled) NSLog(@"[NuvioPreview] demux-open failed: %d", rc);
                 [self reset]; return nil;
             }
-            if (avformat_find_stream_info(_format, NULL) < 0 || token.cancelled) {
-                if (!token.cancelled) NSLog(@"[NuvioPreview] stream info unavailable");
-                [self reset]; return nil;
-            }
+            // MP4/MKV often expose their video codec parameters directly
+            // after opening. Avoid a lengthy full-stream probe unless needed.
             _streamIndex = av_find_best_stream(_format, AVMEDIA_TYPE_VIDEO,
                                                 -1, -1, NULL, 0);
-            if (_streamIndex < 0) {
+            if (_streamIndex < 0 ||
+                _format->streams[_streamIndex]->codecpar->codec_id == AV_CODEC_ID_NONE) {
+                if (avformat_find_stream_info(_format, NULL) < 0 || token.cancelled) {
+                    if (!token.cancelled)
+                        NSLog(@"[NuvioPreview] video probe failed");
+                    [self reset]; return nil;
+                }
+                _streamIndex = av_find_best_stream(_format, AVMEDIA_TYPE_VIDEO,
+                                                   -1, -1, NULL, 0);
+            }
+            if (_streamIndex < 0 || token.cancelled) {
                 [self reset]; return nil;
             }
             AVStream *sourceStream = _format->streams[_streamIndex];
@@ -175,14 +187,14 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                     sourceStream->codecpar) < 0) {
                 [self reset]; return nil;
             }
-            // AVDISCARD_NONKEY is too strict for many HEVC open GOP /
-            // Dolby Vision streams: the demuxer may return a reference
-            // frame but no separately decodable IDR within our budget.
-            // Start with reference frames, fall back to normal decode if
-            // needed, and use one worker thread to limit peak tvOS memory.
+            // HEVC Main/Main10 and open-GOP streams commonly need full
+            // reference decoding before ANY displayable frame is emitted.
+            // The previous NONREF mode often yielded zero frames, and the
+            // fallback ran only after the shared network deadline expired.
             _decoder->thread_count = 1;
-            _decoder->skip_frame = AVDISCARD_NONREF;
-            _decoder->skip_loop_filter = AVDISCARD_NONREF;
+            _decoder->skip_frame = sourceStream->codecpar->codec_id == AV_CODEC_ID_HEVC
+                ? AVDISCARD_DEFAULT : AVDISCARD_NONREF;
+            _decoder->skip_loop_filter = AVDISCARD_ALL;
             _decoder->flags2 |= AV_CODEC_FLAG2_FAST;
             if (avcodec_open2(_decoder, codec, NULL) < 0) {
                 [self reset]; return nil;
@@ -199,9 +211,18 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         // Rebind it for EVERY seek/read and clear before returning.
         _format->interrupt_callback.callback = nuvioInterrupt;
         _format->interrupt_callback.opaque = &deadline;
+        // Refresh the budget after open/probe, so fallback decoding is not
+        // starved by HTTP negotiation time on small remote files.
+        deadline.deadline = CFAbsoluteTimeGetCurrent() + MAX(5.0, timeoutSeconds);
         AVStream *stream = _format->streams[_streamIndex];
         int64_t target = av_rescale_q(MAX(0, seconds), (AVRational){1, 1},
                                       stream->time_base);
+        // Some TS/MKV tracks start at nonzero PTS. A timestamp of seconds
+        // from the start must include that origin to seek the correct GOP.
+        if (stream->start_time != AV_NOPTS_VALUE &&
+            stream->start_time > 0 && target <= INT64_MAX - stream->start_time) {
+            target += stream->start_time;
+        }
         // avformat_seek_file does not honor AVSEEK_FLAG_BACKWARD and the
         // old min_ts=max_ts=target constraint can miss the preceding GOP.
         // av_seek_frame is the API that explicitly seeks to a keyframe.
@@ -222,21 +243,26 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         // decoding instead of leaving a permanent black preview.
         for (int pass = 0; pass < 2 && !token.cancelled; ++pass) {
             if (pass == 1) {
-                // AVDISCARD_NONKEY (the previous implementation) dropped
-                // many HEVC random-access pictures. A full decode is slower
-                // but recovers real pictures from open GOP material.
+                // If a demuxer's indexed seek lands on an open-GOP picture,
+                // go several seconds earlier and decode full references.
+                // Some small HEVC encodes use few or irregular keyframes.
                 if (CFAbsoluteTimeGetCurrent() >= deadline.deadline) break;
                 _decoder->skip_frame = AVDISCARD_DEFAULT;
-                int retrySeek = av_seek_frame(_format, _streamIndex, target,
+                int64_t rewindTicks = av_rescale_q(5, (AVRational){1, 1},
+                                                    stream->time_base);
+                int64_t firstTimestamp = stream->start_time != AV_NOPTS_VALUE
+                    ? MAX(0, stream->start_time) : 0;
+                int64_t retryTarget = MAX(firstTimestamp, target - rewindTicks);
+                int retrySeek = av_seek_frame(_format, _streamIndex, retryTarget,
                                               AVSEEK_FLAG_BACKWARD);
                 if (retrySeek < 0)
                     retrySeek = avformat_seek_file(_format, _streamIndex,
-                                                  INT64_MIN, target, INT64_MAX, 0);
+                                                  INT64_MIN, retryTarget, INT64_MAX, 0);
                 if (retrySeek < 0) break;
                 avcodec_flush_buffers(_decoder);
             }
             int videoPackets = 0;
-            const int packetBudget = pass == 0 ? 80 : 110;
+            const int packetBudget = pass == 0 ? 140 : 180;
             while (!token.cancelled &&
                    CFAbsoluteTimeGetCurrent() < deadline.deadline &&
                    videoPackets < packetBudget) {
@@ -260,8 +286,10 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         }
 
     finished:
-        // Avoid keeping the expensive full-GOP decoder policy across seeks.
-        if (_decoder) _decoder->skip_frame = AVDISCARD_NONREF;
+        // Keep full reference decoding for HEVC; NONREF caused permanent
+        // black boxes on ordinary SDR HEVC files as well as Dolby Vision.
+        if (_decoder && stream->codecpar->codec_id != AV_CODEC_ID_HEVC)
+            _decoder->skip_frame = AVDISCARD_NONREF;
         _format->interrupt_callback.opaque = NULL;
         if (token.cancelled) {
             [self reset];
@@ -270,7 +298,8 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         // Keep a fully initialized demuxer across seeks. A failed decode
         // resets the session so a later request can reconnect cleanly.
         if (!image) {
-            NSLog(@"[NuvioPreview] no frame after reference/GOP passes; HTTP range / HEVC decode may be unsupported");
+            NSLog(@"[NuvioPreview] no frame: video=%d codec=%d index=%d range=%d; source URL redacted",
+                  _streamIndex, stream->codecpar->codec_id, _streamIndex, seekResult);
             [self reset];
         }
         return image;

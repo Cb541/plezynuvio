@@ -2998,9 +2998,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     String(stats.storageError.prefix(24)))
             } else if stats.autoCapturedSlots == 0 {
                 thumbnailCacheHealthLabel.text = String(
-                    format: "AUTO:0 SEEK:%d · TAP I:%llu C:%llu",
+                    format: "AUTO:0 SEEK:%d · VIDEO E:%llu M:%llu I:%llu",
                     stats.seekCapturedSlots,
-                    NuvioFrameTapImageCount(), NuvioFrameTapCallbackCount())
+                    NuvioFrameTapEnqueueCount(),
+                    NuvioFrameTapMatchedCount(),
+                    NuvioFrameTapImageCount())
             } else {
                 thumbnailCacheHealthLabel.text = String(
                     format: "AUTO:%d SEEK:%d · %d disk %d RAM",

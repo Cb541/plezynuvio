@@ -343,7 +343,22 @@ import TVServices
     }
 
     private static func contentId(from url: URL) -> String? {
-      guard url.scheme == "plezy", url.host == "play" else { return nil }
+      guard url.scheme?.lowercased() == "plezy" else { return nil }
+
+      // Nuvio passes a resolved remote media URL, not a Plex/Jellyfin media ID.
+      // Reuse the existing scene/cold-start delivery coordinator so both
+      // launches and deep links received while Plezy is running are supported.
+      if url.host?.lowercased() == "stream" {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          let media = components.queryItems?.first(where: { $0.name == "url" })?.value,
+          let remote = URL(string: media),
+          (remote.scheme == "https" || remote.scheme == "http"),
+          remote.host != nil
+        else { return nil }
+        return url.absoluteString
+      }
+
+      guard url.host?.lowercased() == "play" else { return nil }
       return URLComponents(url: url, resolvingAgainstBaseURL: false)?
         .queryItems?.first { $0.name == "content_id" }?.value
     }

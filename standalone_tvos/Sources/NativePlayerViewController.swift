@@ -272,6 +272,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let cachedTimeline = CachedTimelineOverlay()
     private let cacheRateLabel = UILabel()
     private var lastCacheUIUpdate = Date.distantPast
+    // Actual media-network rate, independent of JPEG thumbnail writes.
+    private var videoInputRateMbps: Double?
+    private var videoDiskCacheBytes: Double?
     private var frameTapInstalled = false
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
@@ -382,10 +385,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
         lastCacheUIUpdate = .distantPast
+        videoInputRateMbps = nil
+        videoDiskCacheBytes = nil
         cachedTimeline.frameSlots = []
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
-        cacheRateLabel.text = "CACHE 0.000 MB/s · 0 frames"
+        cacheRateLabel.text = "VIDEO — Mb/s · 0 previews"
         explicitChromeHidden = false
         lastCaptureDuration = 0
         backgroundCaptureFailures = 0
@@ -867,7 +872,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.clipsToBounds = true
         panel.addSubview(cachedTimeline)
         cacheRateLabel.translatesAutoresizingMaskIntoConstraints = false
-        cacheRateLabel.text = "CACHE 0.000 MB/s · 0 frames"
+        cacheRateLabel.text = "VIDEO — Mb/s · 0 previews"
         cacheRateLabel.textColor = UIColor.white.withAlphaComponent(0.88)
         cacheRateLabel.font = .monospacedDigitSystemFont(
             ofSize: 15, weight: .medium)
@@ -2886,26 +2891,48 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // This measures saved JPEG bytes, not video download throughput.
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
+            // This mpv property is the INPUT/network bytes per second,
+            // not the tiny thumbnail JPEG write rate.
+            if let playingCore = core {
+                let expectedGeneration = playbackGeneration
+                playingCore.getPropertyAsync("cache-speed") {
+                    [weak self, weak playingCore] result in
+                    guard let self, let playingCore,
+                          self.core === playingCore,
+                          self.playbackGeneration == expectedGeneration else { return }
+                    if case .success(let raw) = result,
+                       let raw, let bytesPerSecond = Double(raw) {
+                        self.videoInputRateMbps = max(0, bytesPerSecond * 8 / 1_000_000)
+                    }
+                }
+                // Temporary compressed media bytes saved in the same mpv
+                // disk cache; preview JPEGs remain separate and persistent.
+                playingCore.getPropertyAsync("demuxer-cache-state/file-cache-bytes") {
+                    [weak self, weak playingCore] result in
+                    guard let self, let playingCore,
+                          self.core === playingCore,
+                          self.playbackGeneration == expectedGeneration else { return }
+                    if case .success(let raw) = result,
+                       let raw, let bytes = Double(raw) {
+                        self.videoDiskCacheBytes = max(0, bytes)
+                    }
+                }
+            }
             let stats = thumbs.cacheStats()
-            let images = NuvioFrameTapImageCount()
-            let callbacks = NuvioFrameTapCallbackCount()
-            if stats.frameCount > 0 {
-                cacheRateLabel.text = String(
-                    format: "CACHE %.3f MB/s · %d frames",
-                    stats.writeMBPerSecond, stats.frameCount)
-            } else if !frameTapInstalled {
-                cacheRateLabel.text = "CACHE HOOK UNAVAILABLE"
+            if let rate = videoInputRateMbps {
+                if let total = videoDiskCacheBytes {
+                    cacheRateLabel.text = String(
+                        format: "VIDEO %.0f Mb/s · %.1f GB · %d previews",
+                        rate, total / 1_000_000_000, stats.frameCount)
+                } else {
+                    cacheRateLabel.text = String(
+                        format: "VIDEO %.0f Mb/s · %d previews",
+                        rate, stats.frameCount)
+                }
             } else {
-                // I = converted by GPU, C = callback delivered to Swift,
-                // R = frame received by cache, J = JPEG encoded,
-                // X = JPEG/disk errors, W = files successfully written.
-                // This isolates the exact stage failing on a real Apple TV.
                 cacheRateLabel.text = String(
-                    format: "I:%llu C:%llu R:%d J:%d W:%d X:%d",
-                    images, callbacks, stats.deliveredFrames,
-                    stats.jpegEncodedFrames, stats.frameCount,
-                    stats.failedEncodes + stats.failedWrites
-                        + stats.missingDirectories)
+                    format: "VIDEO — Mb/s · %d previews",
+                    stats.frameCount)
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

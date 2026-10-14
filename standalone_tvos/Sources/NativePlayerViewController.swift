@@ -117,6 +117,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var zoom: CGFloat = 1
     private var verticalStretch: CGFloat = 1
     private var panOriginSeconds: Double = 0
+    // Detect actual turning of the touchpad pan path. A regular left/right
+    // swipe has a steady heading; tracing a circle rotates that heading.
+    private var panLastTranslation: CGPoint = .zero
+    private var panLastHeading: Double?
+    private var panTravelPoints: Double = 0
+    private var panTurnRadians: Double = 0
+    private var circularSeekActive = false
+    private var circularSeekOrigin = 0.0
+    private var circularTurnOrigin = 0.0
+    private var hasSelectedPreferredAudio = false
     private var currentPreviewSerial = 0
     private var lastPreviewRequestedBucket: Int?
     private var lastPreviewImageSecond: Int?
@@ -244,6 +254,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         holdActivationTimer = nil
         holdTickCount = 0
         isTouchScrubbing = false
+        circularSeekActive = false
+        hasSelectedPreferredAudio = false
         seekCommitOperationID += 1
         displayNegotiationPending = false
         lastPreviewRequestedBucket = nil
@@ -437,6 +449,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.showPanel()
                     // Defer subtitles until after the video is running.
                     self.attachInitialSubtitleIfAvailable()
+                    self.schedulePreferredEnglishAudioSelection()
                     self.showPanel()
                 case .failure(let error):
                     self.displayNegotiationPending = false
@@ -1269,8 +1282,84 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         guard let core, trackChoices.indices.contains(choiceIndex) else { return }
         let choice = trackChoices[choiceIndex]
         let property = toolPanel == .audio ? "aid" : "sid"
+        if toolPanel == .audio { hasSelectedPreferredAudio = true }
         core.setProperty(property, value: choice.id)
         closeToolPanel()
+    }
+
+    // Select only once per opened file, after the HDMI startup gate finishes.
+    // Keep manual selection authoritative; don't override a later user choice.
+    private func schedulePreferredEnglishAudioSelection() {
+        guard !hasSelectedPreferredAudio, let audioCore = core else { return }
+        let generation = playbackGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak audioCore] in
+            guard let self, let audioCore, self.core === audioCore,
+                  self.playbackGeneration == generation,
+                  !self.hasSelectedPreferredAudio else { return }
+            audioCore.getPropertyAsync("track-list/count") { [weak self, weak audioCore] result in
+                guard let self, let audioCore, self.core === audioCore,
+                      self.playbackGeneration == generation,
+                      !self.hasSelectedPreferredAudio else { return }
+                let count = min(96, max(0, Int((try? result.get()) ?? "") ?? 0))
+                guard count > 0 else { return }
+                let keys = ["type", "id", "lang", "title", "codec", "audio-channels"]
+                var tracks = Array(repeating: [String: String](), count: count)
+                let group = DispatchGroup()
+                for index in 0..<count {
+                    for key in keys {
+                        group.enter()
+                        audioCore.getPropertyAsync("track-list/\(index)/\(key)") { result in
+                            if case .success(let value) = result, let value {
+                                tracks[index][key] = value
+                            }
+                            group.leave()
+                        }
+                    }
+                }
+                group.notify(queue: .main) { [weak self, weak audioCore] in
+                    guard let self, let audioCore, self.core === audioCore,
+                          self.playbackGeneration == generation,
+                          !self.hasSelectedPreferredAudio else { return }
+                    var bestID: String?
+                    var bestScore = Int.min
+                    for track in tracks where track["type"] == "audio" {
+                        guard let id = track["id"], !id.isEmpty else { continue }
+                        let language = (track["lang"] ?? "").trimmingCharacters(
+                            in: .whitespacesAndNewlines).lowercased()
+                        let title = (track["title"] ?? "").lowercased()
+                        let english = language == "en" || language == "eng" ||
+                            language == "english" || language.hasPrefix("en-") ||
+                            language.hasPrefix("en_") || title.contains("english")
+                        guard english else { continue }
+                        let codec = (track["codec"] ?? "").lowercased()
+                        let channelText = ((track["audio-channels"] ?? "") + " " + title).lowercased()
+                        let surround51 = channelText.contains("5.1") ||
+                            channelText.contains("6 channels") ||
+                            channelText.contains("6ch") ||
+                            channelText.contains("5.1(side)")
+                        let trueHD = codec.contains("truehd") || title.contains("truehd") ||
+                            title.contains("true hd")
+                        let commentary = title.contains("commentary") ||
+                            title.contains("audio description") ||
+                            title.contains("descriptive") || title.contains("director")
+                        // English 5.1 > English TrueHD > remaining English.
+                        // Among 5.1 tracks prefer lossless TrueHD; avoid commentary.
+                        let score = (surround51 ? 300 : (trueHD ? 200 : 100)) +
+                            (surround51 && trueHD ? 20 : 0) -
+                            (commentary ? 500 : 0)
+                        if score > bestScore {
+                            bestScore = score
+                            bestID = id
+                        }
+                    }
+                    self.hasSelectedPreferredAudio = true
+                    // With no English audio, preserve the source's existing default.
+                    if let bestID {
+                        audioCore.setProperty("aid", value: bestID)
+                    }
+                }
+            }
+        }
     }
 
     private func loadTracks(request: Int) {

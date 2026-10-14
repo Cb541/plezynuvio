@@ -22,6 +22,8 @@ void NuvioFrameTapRefreshTargets(AVSampleBufferDisplayLayer * _Nullable layer,
 /// Set to -1 when paused, seeking, or the HDMI display is switching.
 /// Target positions are sampled in two-second buckets.
 void NuvioFrameTapSetPlaybackSecond(int64_t mediaSecond);
+// Stop clock extrapolation while mpv is paused; reset timing on resume.
+void NuvioFrameTapSetPaused(BOOL paused);
 void NuvioFrameTapStop(void);
 
 /// Diagnostic counts: number of renderer enqueues seen / images converted.

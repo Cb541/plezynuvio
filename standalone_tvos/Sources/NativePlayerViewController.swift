@@ -133,6 +133,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var totalSeconds: Double = 0
     private var zoom: CGFloat = 1
     private var verticalStretch: CGFloat = 1
+    // Saturation/contrast are real SDR-only lavfi processing. Default
+    // neutral values leave the proven hardware/DV pipeline untouched.
+    private var colorSaturation = 1.0
+    private var colorContrast = 1.0
+    private var sourceColorMetadataReady = false
+    private var sourceIsHDR = true
+    private var colorFilterActive = false
+    private var colorFilterOperation = 0
+    private var colorFilterTimer: Timer?
+    private var colorFilterFailed = false
     private var panOriginSeconds: Double = 0
     // Detect actual turning of the touchpad pan path. A regular left/right
     // swipe has a steady heading; tracing a circle rotates that heading.
@@ -207,6 +217,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let picturePanel = UIView()
     private let zoomLabel = UILabel()
     private let stretchLabel = UILabel()
+    private let saturationLabel = UILabel()
+    private let contrastLabel = UILabel()
+    private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
     private let seekTimeLabel = UILabel()
     private let previewLoadingLabel = UILabel()
@@ -334,6 +347,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         picturePanel.isHidden = true
         zoom = 1
         verticalStretch = 1
+        // Restore previous adjustments without modifying media until
+        // SDR/HDR metadata has been checked for this new stream.
+        colorSaturation = (UserDefaults.standard.object(forKey: "Nuvio.ColorSaturation") as? Double)
+            .map { min(1.50, max(0.60, $0)) } ?? 1.0
+        colorContrast = (UserDefaults.standard.object(forKey: "Nuvio.ColorContrast") as? Double)
+            .map { min(1.40, max(0.70, $0)) } ?? 1.0
+        sourceColorMetadataReady = false
+        sourceIsHDR = true
+        colorFilterActive = false
+        colorFilterFailed = false
+        colorFilterOperation += 1
+        colorFilterTimer?.invalidate()
+        colorFilterTimer = nil
         toolPanel = .none
         toolbarFocused = false
         trackPanel.isHidden = true
@@ -573,6 +599,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             case "file-loaded":
                 PlayerStartupDiagnostics.mark("mpv-file-loaded-paused")
                 self.statusLabel.text = "Video loaded; waiting for first frame…"
+                self.checkColorSourceMetadata()
             case "playback-restart":
                 // Native single-decoder preview frame is now ready. Do not
                 // pull an image before mpv has actually decoded the target.
@@ -620,6 +647,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 if self.waitingForFirstFrame {
                     PlayerStartupDiagnostics.mark("mpv-first-frame-ready")
                     self.applyPictureTransform()
+                    self.checkColorSourceMetadata()
                     self.finishDisplayNegotiation()
                 } else {
                     // Subsequent playback-restart events also occur after
@@ -815,12 +843,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
         addGlassBackdrop(to: picturePanel, radius: 18)
-        for label in [zoomLabel, stretchLabel] {
+        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
             label.textColor = .white
             picturePanel.addSubview(label)
         }
+        colorStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        colorStatusLabel.font = .systemFont(ofSize: 17, weight: .medium)
+        colorStatusLabel.textColor = .white.withAlphaComponent(0.75)
+        colorStatusLabel.numberOfLines = 2
+        picturePanel.addSubview(colorStatusLabel)
         updatePictureLabels()
 
         // Audio/subtitle/info menu shares the zoom panel's simple vertical layout.
@@ -896,14 +929,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             previewStatusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.9),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
-            picturePanel.widthAnchor.constraint(equalToConstant: 440),
+            picturePanel.widthAnchor.constraint(equalToConstant: 535),
             zoomLabel.topAnchor.constraint(equalTo: picturePanel.topAnchor, constant: 23),
             zoomLabel.leadingAnchor.constraint(equalTo: picturePanel.leadingAnchor, constant: 22),
             zoomLabel.trailingAnchor.constraint(equalTo: picturePanel.trailingAnchor, constant: -22),
-            stretchLabel.topAnchor.constraint(equalTo: zoomLabel.bottomAnchor, constant: 18),
+            stretchLabel.topAnchor.constraint(equalTo: zoomLabel.bottomAnchor, constant: 15),
             stretchLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             stretchLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            stretchLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -24),
+            saturationLabel.topAnchor.constraint(equalTo: stretchLabel.bottomAnchor, constant: 15),
+            saturationLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            saturationLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            contrastLabel.topAnchor.constraint(equalTo: saturationLabel.bottomAnchor, constant: 15),
+            contrastLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            contrastLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            colorStatusLabel.topAnchor.constraint(equalTo: contrastLabel.bottomAnchor, constant: 18),
+            colorStatusLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            colorStatusLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            colorStatusLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -20),
             trackPanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -35),
             trackPanel.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -22),
             trackPanel.widthAnchor.constraint(equalToConstant: 550),

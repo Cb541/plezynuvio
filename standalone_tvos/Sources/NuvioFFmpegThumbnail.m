@@ -316,7 +316,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                         av_frame_unref(_frame);
                         if (closeEnough) break;
                     }
-                    if (bestSeconds <= tolerance) {
+                    if (bestSeconds <= 0.65) {
                         av_packet_unref(_packet);
                         goto finished;
                     }

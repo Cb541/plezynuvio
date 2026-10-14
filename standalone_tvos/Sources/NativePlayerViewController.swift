@@ -68,6 +68,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var trackRefreshID = 0
     private var infoRows: [String] = []
     private var seekCommitTimer: Timer?
+    // MPV takes time to acknowledge a remote keyframe seek. Pin the most
+    // recently committed target while it catches up so another swipe cannot
+    // accidentally start from the old playback position.
+    private var committedSeekTarget: Double?
+    private var committedSeekDate: Date?
     private var previewHideTimer: Timer?
     private var previewIsVisible = false
     private let toolbar = UIStackView()
@@ -174,6 +179,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         trackPanel.isHidden = true
         toolbarIndex = 0
         targetSeconds = nil
+        committedSeekTarget = nil
+        committedSeekDate = nil
         currentSeconds = 0
         totalSeconds = 0
         statusLabel.text = "Preparing video decoder…"
@@ -350,7 +357,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             case "duration":
                 if let n = value as? NSNumber { self.totalSeconds = max(0, n.doubleValue) }
             case "time-pos":
-                if self.targetSeconds == nil, let n = value as? NSNumber {
+                if self.targetSeconds == nil, self.committedSeekTarget == nil,
+                   let n = value as? NSNumber {
                     self.currentSeconds = max(0, n.doubleValue)
                 }
             case "pause":
@@ -922,6 +930,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         // The target remains pinned until the asynchronous seek has been sent.
         core?.command(["seek", String(format: "%.3f", seconds), "absolute"])
         currentSeconds = seconds
+        committedSeekTarget = seconds
+        committedSeekDate = Date()
         targetSeconds = nil
         // Keep the preview on-screen long enough for remote MKV/4K decode.
         // Cancelling here used to discard every picture before it arrived.
@@ -991,6 +1001,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         core = nil
         link = nil
         targetSeconds = nil
+        committedSeekTarget = nil
+        committedSeekDate = nil
         playing = false
         picturePanel.isHidden = true
         statusLabel.isHidden = false
@@ -1019,9 +1031,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     }
 
     @objc private func refreshClock() {
+        totalSeconds = max(0, core?.duration ?? totalSeconds)
         if targetSeconds == nil {
-            currentSeconds = max(0, core?.timePos ?? currentSeconds)
-            totalSeconds = max(0, core?.duration ?? totalSeconds)
+            let actual = max(0, core?.timePos ?? currentSeconds)
+            if let pin = committedSeekTarget {
+                let aged = Date().timeIntervalSince(committedSeekDate ?? .distantPast) > 3.0
+                if abs(actual - pin) <= 3.0 || aged {
+                    committedSeekTarget = nil
+                    committedSeekDate = nil
+                    currentSeconds = actual
+                } else {
+                    currentSeconds = pin
+                }
+            } else {
+                currentSeconds = actual
+            }
         }
         refreshLabels()
     }

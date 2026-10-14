@@ -30,9 +30,9 @@ static int nuvioInterrupt(void *opaque) {
 static UIImage *nuvioMakeImage(AVFrame *frame) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return nil;
 
-    const int width = 340;
+    const int width = 680;
     const int height = MAX(2, (int)lrint((double)frame->height * width / frame->width) & ~1);
-    if (height > 600) return nil;
+    if (height > 1200) return nil;
     const int stride = width * 4;
     uint8_t *pixels = av_malloc((size_t)stride * height);
     if (!pixels) return nil;
@@ -67,94 +67,153 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
     return image;
 }
 
-UIImage *NuvioDecodedThumbnail(NSURL *url, int64_t seconds, double timeoutSeconds,
-                                    NuvioThumbnailAbortToken *token) {
+// This object lives on the SeekFrameService's private serial worker.
+// Keeping the demuxer, codec and existing HTTP connection alive avoids
+// re-probing multi-gigabyte MKV files after every Siri Remote movement.
+@implementation NuvioThumbnailDecoder {
+    AVFormatContext *_format;
+    AVCodecContext *_decoder;
+    AVPacket *_packet;
+    AVFrame *_frame;
+    int _streamIndex;
+    NSString *_sourceURL;
+}
+
+- (void)reset {
+    av_frame_free(&_frame);
+    av_packet_free(&_packet);
+    avcodec_free_context(&_decoder);
+    if (_format) {
+        _format->interrupt_callback.opaque = NULL;
+        avformat_close_input(&_format);
+    }
+    _format = NULL;
+    _streamIndex = -1;
+    _sourceURL = nil;
+}
+
+- (void)dealloc {
+    [self reset];
+}
+
+- (nullable UIImage *)thumbnailForURL:(NSURL *)url
+                                second:(int64_t)seconds
+                        timeoutSeconds:(double)timeoutSeconds
+                                 token:(NuvioThumbnailAbortToken *)token {
     @autoreleasepool {
-        if (!url || ![@"http" isEqualToString:url.scheme.lowercaseString] &&
-                    ![@"https" isEqualToString:url.scheme.lowercaseString]) return nil;
-        if (token.cancelled) return nil;
+        if (token.cancelled || !url) return nil;
+        NSString *scheme = url.scheme.lowercaseString;
+        if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return nil;
+
         NuvioReadDeadline deadline = {
             .deadline = CFAbsoluteTimeGetCurrent() + MAX(0.5, timeoutSeconds),
             .token = token
         };
-        AVFormatContext *format = avformat_alloc_context();
-        if (!format) return nil;
-        format->interrupt_callback.callback = nuvioInterrupt;
-        format->interrupt_callback.opaque = &deadline;
+        if (!_format || ![_sourceURL isEqualToString:url.absoluteString]) {
+            [self reset];
+            _format = avformat_alloc_context();
+            if (!_format) return nil;
+            _format->interrupt_callback.callback = nuvioInterrupt;
+            _format->interrupt_callback.opaque = &deadline;
 
-        AVDictionary *options = NULL;
-        av_dict_set(&options, "rw_timeout", "3500000", 0);
-        int result = avformat_open_input(&format, url.absoluteString.UTF8String, NULL, &options);
-        av_dict_free(&options);
-        if (result < 0 || !format) {
-            if (format) avformat_close_input(&format);
-            return nil;
+            AVDictionary *options = NULL;
+            av_dict_set(&options, "rw_timeout", "3000000", 0);
+            int rc = avformat_open_input(&_format, url.absoluteString.UTF8String,
+                                         NULL, &options);
+            av_dict_free(&options);
+            if (rc < 0 || !_format || token.cancelled) {
+                [self reset]; return nil;
+            }
+            if (avformat_find_stream_info(_format, NULL) < 0 || token.cancelled) {
+                [self reset]; return nil;
+            }
+            _streamIndex = av_find_best_stream(_format, AVMEDIA_TYPE_VIDEO,
+                                                -1, -1, NULL, 0);
+            if (_streamIndex < 0) {
+                [self reset]; return nil;
+            }
+            AVStream *sourceStream = _format->streams[_streamIndex];
+            const AVCodec *codec = avcodec_find_decoder(sourceStream->codecpar->codec_id);
+            if (!codec) {
+                [self reset]; return nil;
+            }
+            _decoder = avcodec_alloc_context3(codec);
+            if (!_decoder || avcodec_parameters_to_context(_decoder,
+                    sourceStream->codecpar) < 0) {
+                [self reset]; return nil;
+            }
+            // Preview decoder is software and independent of AVFoundation's
+            // Dolby Vision output surfaces; keep it low priority.
+            _decoder->thread_count = 2;
+            _decoder->skip_frame = AVDISCARD_NONREF;
+            if (avcodec_open2(_decoder, codec, NULL) < 0) {
+                [self reset]; return nil;
+            }
+            _packet = av_packet_alloc();
+            _frame = av_frame_alloc();
+            if (!_packet || !_frame) {
+                [self reset]; return nil;
+            }
+            _sourceURL = [url.absoluteString copy];
         }
+
+        // Previous call's callback pointed at its stack-local deadline.
+        // Rebind it for EVERY seek/read and clear before returning.
+        _format->interrupt_callback.callback = nuvioInterrupt;
+        _format->interrupt_callback.opaque = &deadline;
+        AVStream *stream = _format->streams[_streamIndex];
+        int64_t target = av_rescale_q(MAX(0, seconds), (AVRational){1, 1},
+                                      stream->time_base);
+        int seekResult = avformat_seek_file(_format, _streamIndex, INT64_MIN,
+                         target, target, AVSEEK_FLAG_BACKWARD);
+        if (seekResult < 0)
+            seekResult = av_seek_frame(_format, _streamIndex, target,
+                                       AVSEEK_FLAG_BACKWARD);
+        if (seekResult < 0 || token.cancelled) {
+            [self reset]; return nil;
+        }
+        avcodec_flush_buffers(_decoder);
 
         UIImage *image = nil;
-        AVCodecContext *decoder = NULL;
-        AVPacket *packet = NULL;
-        AVFrame *frame = NULL;
-        if (avformat_find_stream_info(format, NULL) < 0) goto cleanup;
-        int streamIndex = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
-        if (streamIndex < 0) goto cleanup;
-        AVStream *stream = format->streams[streamIndex];
-        const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
-        if (!codec) goto cleanup;
-        decoder = avcodec_alloc_context3(codec);
-        if (!decoder) goto cleanup;
-        if (avcodec_parameters_to_context(decoder, stream->codecpar) < 0) goto cleanup;
-        decoder->thread_count = 2;
-        decoder->skip_frame = AVDISCARD_NONREF;
-        if (avcodec_open2(decoder, codec, NULL) < 0) goto cleanup;
-        packet = av_packet_alloc();
-        frame = av_frame_alloc();
-        if (!packet || !frame) goto cleanup;
-
-        // Fast keyframe seek on the original network stream. MKV, AV1,
-        // H.264 and HEVC are handled through FFmpeg, not AVAssetImageGenerator.
-        int64_t target = av_rescale_q(MAX(0, seconds), (AVRational){1, 1}, stream->time_base);
-        if (seconds > 0) {
-            if (avformat_seek_file(format, streamIndex, INT64_MIN, target, target,
-                                   AVSEEK_FLAG_BACKWARD) < 0) {
-                av_seek_frame(format, streamIndex, target, AVSEEK_FLAG_BACKWARD);
-            }
-            avcodec_flush_buffers(decoder);
-        }
-
         int videoPackets = 0;
-        while (!token.cancelled && CFAbsoluteTimeGetCurrent() < deadline.deadline &&
-               videoPackets < 60) {
-            if (av_read_frame(format, packet) < 0) break;
-            if (packet->stream_index != streamIndex) {
-                av_packet_unref(packet);
+        while (!token.cancelled &&
+               CFAbsoluteTimeGetCurrent() < deadline.deadline &&
+               videoPackets < 70) {
+            if (av_read_frame(_format, _packet) < 0) break;
+            if (_packet->stream_index != _streamIndex) {
+                av_packet_unref(_packet);
                 continue;
             }
-            videoPackets++;
-            int sent = avcodec_send_packet(decoder, packet);
-            av_packet_unref(packet);
+            ++videoPackets;
+            int sent = avcodec_send_packet(_decoder, _packet);
+            av_packet_unref(_packet);
             if (sent < 0) continue;
-            while (!token.cancelled && avcodec_receive_frame(decoder, frame) == 0) {
-                int64_t ts = frame->best_effort_timestamp;
-                // Keep the first decoded video frame as an emergency preview,
-                // then replace it if decoding approaches the requested time.
-                if (!image) image = nuvioMakeImage(frame);
-                int64_t tolerance = av_rescale_q(1, (AVRational){1, 1}, stream->time_base);
+            while (!token.cancelled &&
+                   avcodec_receive_frame(_decoder, _frame) == 0) {
+                int64_t ts = _frame->best_effort_timestamp;
+                if (!image) image = nuvioMakeImage(_frame);
+                int64_t tolerance = av_rescale_q(1, (AVRational){1, 1},
+                                                stream->time_base);
                 if (ts == AV_NOPTS_VALUE || ts >= target - tolerance) {
-                    UIImage *nearTarget = nuvioMakeImage(frame);
-                    if (nearTarget) image = nearTarget;
-                    av_frame_unref(frame);
-                    goto cleanup;
+                    UIImage *frame = nuvioMakeImage(_frame);
+                    if (frame) image = frame;
+                    av_frame_unref(_frame);
+                    goto finished;
                 }
-                av_frame_unref(frame);
+                av_frame_unref(_frame);
             }
         }
 
-    cleanup:
-        av_frame_free(&frame);
-        av_packet_free(&packet);
-        avcodec_free_context(&decoder);
-        avformat_close_input(&format);
+    finished:
+        _format->interrupt_callback.opaque = NULL;
+        if (token.cancelled) {
+            [self reset];
+            return nil;
+        }
+        // Keep a fully initialized demuxer across seeks. A failed decode
+        // resets the session so a later request can reconnect cleanly.
+        if (!image) [self reset];
         return image;
     }
 }
+@end

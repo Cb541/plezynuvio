@@ -10,7 +10,15 @@ NS_ASSUME_NONNULL_BEGIN
 @property (atomic, assign) BOOL cancelled;
 @end
 
-FOUNDATION_EXPORT UIImage * _Nullable NuvioDecodedThumbnail(NSURL *url,
-    int64_t seconds, double timeoutSeconds, NuvioThumbnailAbortToken *token);
+/// One FFmpeg demuxer/decoder reused across nearby seek preview positions,
+/// dramatically reducing repeated Matroska probing and HTTP handshakes.
+/// Always call on a single serial queue; reset only on that queue.
+@interface NuvioThumbnailDecoder : NSObject
+- (nullable UIImage *)thumbnailForURL:(NSURL *)url
+                                second:(int64_t)seconds
+                        timeoutSeconds:(double)timeoutSeconds
+                                 token:(NuvioThumbnailAbortToken *)token;
+- (void)reset;
+@end
 
 NS_ASSUME_NONNULL_END

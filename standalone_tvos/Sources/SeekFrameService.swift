@@ -70,6 +70,24 @@ final class SeekFrameService {
         hotImages.object(forKey: key(second))
     }
 
+    /// Accept a frame supplied by the already-running mpv video decoder.
+    /// No second media demuxer or codec is created for this fallback.
+    func cachePlaybackFrame(_ image: UIImage, second: Int) {
+        lock.lock()
+        let directory = scopedDirectory
+        let version = generation
+        lock.unlock()
+        worker.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let valid = self.generation == version
+            self.lock.unlock()
+            guard valid else { return }
+            self.remember(image, slot: self.bucket(second),
+                          directory: directory, writeToDisk: true)
+        }
+    }
+
     func cancel() {
         lock.lock()
         generation &+= 1

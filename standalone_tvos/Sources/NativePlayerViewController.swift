@@ -1286,6 +1286,24 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     NSLog("[NuvioColor] vf graph %@; copy decoder requested",
                           self.colorFilterVerified ? "listed" : "unverified")
                     self.updatePictureLabels()
+                    playbackCore.getPropertyAsync("hwdec-current") {
+                        [weak self, weak playbackCore] decoderResult in
+                        guard let self, let playbackCore,
+                              self.core === playbackCore,
+                              self.playbackGeneration == generation else { return }
+                        let actual = (try? decoderResult.get()) ?? "unknown"
+                        NSLog("[NuvioColor] actual hwdec=%@", actual)
+                        // Direct opaque hardware frames cannot be processed by
+                        // our CPU lavfi filter. Never present a false success
+                        // or keep a potentially nonfunctional graph installed.
+                        if actual == "videotoolbox" {
+                            self.colorFilterFailed = true
+                            self.experimentalHDRColorBoost = false
+                            self.colorEffectRequestedForVideo = false
+                            self.scheduleColorFilterUpdate()
+                            self.updatePictureLabels()
+                        }
+                    }
                 }
                 if self.sourceIsHDR {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {

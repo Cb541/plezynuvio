@@ -2812,6 +2812,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             progress.isHidden = true
             cachedTimeline.isHidden = true
             cacheRateLabel.isHidden = true
+            thumbnailCacheHealthLabel.isHidden = true
             currentLabel.isHidden = true
             endLabel.isHidden = true
             statusLabel.isHidden = true
@@ -2832,6 +2833,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         progress.isHidden = !showTimeline
         cachedTimeline.isHidden = !showTimeline
         cacheRateLabel.isHidden = !showTimeline
+        thumbnailCacheHealthLabel.isHidden = !showTimeline ||
+            thumbs.cacheStats().frameCount > 0
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
@@ -2964,7 +2967,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // This avoids conflating a 2-GB compressed-video buffer with
             // zero generated seek previews.
             if stats.frameCount == 0 {
-                thumbnailCacheHealthLabel.isHidden = false
+                thumbnailCacheHealthLabel.isHidden = cacheRateLabel.isHidden
                 if !frameTapInstalled {
                     thumbnailCacheHealthLabel.text = "Preview renderer unavailable"
                 } else {

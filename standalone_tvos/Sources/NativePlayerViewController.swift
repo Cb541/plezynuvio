@@ -140,6 +140,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var sourceColorMetadataReady = false
     private var sourceIsHDR = true
     private var sourceIsDolbyVision = false
+    // Sticky once seen for this movie. Video filters can temporarily change
+    // decoded color metadata, but the original DV file must NEVER be allowed
+    // to fall into an expensive 4K CPU-copy color adjustment path.
+    private var originalIsDolbyVision = false
+    private var requiresNativeDolbyVision: Bool {
+        originalIsDolbyVision || sourceIsDolbyVision || (core?.doviProfile ?? 0) > 0
+    }
     // Explicit per-video opt-in: never auto-apply an experimental filter to
     // Dolby Vision or HDR during startup or across separate movies.
     private var experimentalHDRColorBoost = false
@@ -367,6 +374,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         sourceColorMetadataReady = false
         sourceIsHDR = true
         sourceIsDolbyVision = false
+        originalIsDolbyVision = false
         experimentalHDRColorBoost = false
         colorFilterActive = false
         colorFilterInFlight = false
@@ -1025,10 +1033,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
         saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
-        hdrBoostLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")HDR/DV boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
+        hdrBoostLabel.text = requiresNativeDolbyVision
+            ? "   Dolby Vision: native (smooth)"
+            : "\(selectedPictureControl == 4 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
-        let available = sourceColorMetadataReady
+        let available = sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
         saturationLabel.textColor = available
@@ -1038,17 +1048,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             ? (selectedPictureControl == 3 ? .white : .lightGray)
             : .gray
         hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
+            && !requiresNativeDolbyVision
             ? (selectedPictureControl == 4 ? .white : .lightGray) : .gray
-        if !sourceColorMetadataReady {
+        if requiresNativeDolbyVision {
+            colorStatusLabel.text = "Dolby Vision uses native hardware playback.\nUse TV Color Depth / Contrast for DV."
+        } else if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
         } else if colorFilterInFlight {
             colorStatusLabel.text = "Configuring color processing…"
         } else if colorFilterFailed {
             colorStatusLabel.text = "Video filter failed or HDR mode changed.\nBoost disabled; reset to try again."
         } else if sourceIsHDR && !experimentalHDRColorBoost {
-            colorStatusLabel.text = "Native \(sourceIsDolbyVision ? "Dolby Vision" : "HDR") protected.\nTurn boost ON to test color changes."
-        } else if sourceIsDolbyVision {
-            colorStatusLabel.text = "EXPERIMENTAL: Dolby Vision metadata may be lost.\n\(colorFilterVerified ? "Filter loaded" : "Verify picture changes") • OFF restores original."
+            colorStatusLabel.text = "Native HDR protected.\nTurn boost ON to test color changes."
         } else if sourceIsHDR {
             colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\n\(colorFilterVerified ? "Filter loaded" : "Verify picture changes") • OFF restores original."
         } else {
@@ -1075,23 +1086,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         case 1:
             verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
             applyPictureTransform()
-        case 2 where sourceColorMetadataReady
+        case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorSaturation = min(1.50, max(0.60,
                 (colorSaturation * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 3 where sourceColorMetadataReady
+        case 3 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
                 (colorContrast * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 4 where sourceColorMetadataReady && sourceIsHDR:
-            // Only explicit Siri Remote interaction enables the experimental
-            // HDR/DV path, per media item. Left = safe/off, right = test/on.
+        case 4 where sourceColorMetadataReady && sourceIsHDR && !requiresNativeDolbyVision:
+            // HDR10 remains a per-movie experiment. Dolby Vision MUST NOT
+            // use this path; copying its 4K 10-bit frames caused extreme lag.
             experimentalHDRColorBoost = direction > 0
             colorEffectRequestedForVideo = experimentalHDRColorBoost
             if experimentalHDRColorBoost {
@@ -1150,9 +1161,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 || gamma.contains("pq")
                 || gamma.contains("hlg")
                 || gamma.contains("arib")
+            if dv {
+                self.originalIsDolbyVision = true
+                self.experimentalHDRColorBoost = false
+                self.colorEffectRequestedForVideo = false
+            }
             if self.sourceColorMetadataReady
                 && self.sourceIsHDR == hdr
-                && self.sourceIsDolbyVision == dv { return }
+                && self.sourceIsDolbyVision == dv {
+                if dv { self.scheduleColorFilterUpdate() }
+                return
+            }
             // If an active experimental filter caused an apparent loss of
             // Dolby Vision, immediately disable and revert that filter.
             if self.sourceIsDolbyVision && !dv && self.experimentalHDRColorBoost {
@@ -1186,6 +1205,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let nonneutral = abs(colorSaturation - 1.0) > 0.001
             || abs(colorContrast - 1.0) > 0.001
         let enabled = nonneutral && colorEffectRequestedForVideo
+            && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
 

@@ -1,12 +1,10 @@
 import AVFoundation
 import UIKit
 
-/// Truly standalone UIKit/tvOS application. No Flutter engine, Plex, or login.
+/// Application-level configuration only. A real UIWindowScene owns the video
+/// window, so scene-based tvOS URL callbacks work for cold and warm starts.
 @main
 final class NuvioAppDelegate: UIResponder, UIApplicationDelegate {
-    var window: UIWindow?
-    private var controller: NativePlayerViewController?
-
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -15,37 +13,58 @@ final class NuvioAppDelegate: UIResponder, UIApplicationDelegate {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
             try AVAudioSession.sharedInstance().setActive(true)
         } catch {
-            NSLog("NuvioPlayer: audio-session setup error: %@", String(describing: error))
+            NSLog("[NuvioNative] Audio session setup failed: %@", String(describing: error))
         }
-        let ui = NativePlayerViewController()
-        controller = ui
-        let window = UIWindow(frame: UIScreen.main.bounds)
-        window.rootViewController = ui
-        window.makeKeyAndVisible()
-        self.window = window
-        if let url = launchOptions?[.url] as? URL {
-            _ = handle(url)
-        }
-        return true
-    }
-
-    func application(
-        _ application: UIApplication,
-        open url: URL,
-        options: [UIApplication.OpenURLOptionsKey: Any] = [:]
-    ) -> Bool {
-        handle(url)
-    }
-
-    private func handle(_ url: URL) -> Bool {
-        guard let media = NativeStreamLink(link: url) else { return false }
-        controller?.open(media)
         return true
     }
 }
 
+/// On tvOS 17+, deep links delivered to a scene arrive here rather than at
+/// UIApplicationDelegate.application(_:open:options:).
+final class NuvioSceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+    private var controller: NativePlayerViewController?
+
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        let player = NativePlayerViewController()
+        controller = player
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = player
+        self.window = window
+        window.makeKeyAndVisible()
+        NSLog("[NuvioNative] Scene connected")
+
+        if let url = connectionOptions.urlContexts.first?.url {
+            receive(url)
+        }
+    }
+
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        for context in URLContexts {
+            receive(context.url)
+            break
+        }
+    }
+
+    private func receive(_ url: URL) {
+        // NEVER log the URL: debrid links can contain bearer-like query tokens.
+        NSLog("[NuvioNative] Received handoff scheme=%@ host=%@",
+              url.scheme ?? "(none)", url.host ?? "(none)")
+        guard let media = NativeStreamLink(link: url) else {
+            controller?.showHandoffError("Unsupported or invalid Nuvio stream link")
+            return
+        }
+        controller?.open(media)
+    }
+}
+
 /// Nuvio handoff: nuvio-player://stream?url=<encoded>&title=<encoded>&sub=<encoded>.
-/// Rejects local-file and arbitrary scheme URLs. Does not print signed URLs.
+/// Signed query items remain inside the 'url' value; nothing is uploaded/logged.
 struct NativeStreamLink {
     let url: URL
     let title: String

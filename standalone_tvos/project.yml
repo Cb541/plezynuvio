@@ -21,12 +21,19 @@ targets:
       properties:
         CFBundleDisplayName: Nuvio Player
         CFBundleName: Nuvio Player
-        CFBundleShortVersionString: "1.0.1"
-        CFBundleVersion: "2"
+        CFBundleShortVersionString: "1.0.2"
+        CFBundleVersion: "3"
         CFBundleURLTypes:
           - CFBundleURLName: com.cb541.nuvio.player
             CFBundleURLSchemes:
               - nuvio-player
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneClassName: UIWindowScene
+                UISceneDelegateClassName: "$(PRODUCT_MODULE_NAME).NuvioSceneDelegate"
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         ITSAppUsesNonExemptEncryption: false

@@ -1,0 +1,81 @@
+name: Build Plezy Nuvio tvOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - nuvio-direct-stream-tvos
+
+permissions:
+  contents: read
+
+jobs:
+  build-tvos:
+    name: Build unsigned Plezy tvOS IPA
+    runs-on: macos-26
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Flutter 3.47.1
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.47.1"
+          cache: true
+
+      - name: Resolve locked Dart dependencies
+        run: flutter pub get --enforce-lockfile --no-example
+
+      - name: Run Nuvio URL parser tests
+        run: flutter test --no-pub test/services/nuvio_stream_link_test.dart
+
+      - name: Analyze changed Dart integration
+        run: dart analyze lib/services/nuvio_stream_link.dart lib/screens/nuvio_stream_player_screen.dart lib/main.dart
+
+      - name: Prepare verified tvOS Flutter engine
+        run: bash tvos/scripts/fetch_engine.sh
+
+      - name: Install tvOS pods
+        run: bash tvos/scripts/pod_install.sh
+
+      - name: Verify tvOS native wiring
+        run: |
+          ruby tvos/scripts/test_wire_mpv.rb
+          ruby tvos/scripts/test_wire_top_shelf.rb
+
+      - name: Build unsigned tvOS archive
+        run: |
+          xcodebuild archive \
+            -workspace tvos/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -archivePath "$PWD/build/PlezyNuvio.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned Plezy IPA
+        run: |
+          APP="$(find "$PWD/build/PlezyNuvio.xcarchive/Products/Applications" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "$APP" ]; then
+            echo "No app found in tvOS archive" >&2
+            exit 1
+          fi
+          mkdir -p "$PWD/build/plezy-ipa/Payload"
+          cp -R "$APP" "$PWD/build/plezy-ipa/Payload/"
+          cd "$PWD/build/plezy-ipa"
+          zip -qry Plezy-Nuvio-tvOS-unsigned.ipa Payload
+          test -f Plezy-Nuvio-tvOS-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Plezy-Nuvio-tvOS-unsigned
+          path: build/plezy-ipa/Plezy-Nuvio-tvOS-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error

@@ -79,6 +79,9 @@ import 'database/app_database.dart';
 import 'database/download_operations.dart';
 import 'database/tvos_database_recovery_store.dart';
 import 'screens/video_player_screen.dart';
+import 'screens/nuvio_stream_player_screen.dart';
+import 'services/nuvio_stream_link.dart';
+import 'utils/video_player_navigation.dart';
 import 'utils/app_logger.dart';
 import 'utils/certificate_trust.dart';
 import 'utils/managed_http_client.dart';
@@ -1830,10 +1833,60 @@ class _MainAppState extends State<MainApp> with WidgetsBindingObserver {
 /// root MaterialApp. Profile-scoped providers/navigation live in
 /// [ProfileSessionScreen], not here, so root auth/PIN/global dialogs survive a
 /// profile switch.
-class _AppShell extends StatelessWidget {
+class _AppShell extends StatefulWidget {
   const _AppShell({required this.databaseRecoveryOutcome});
 
   final TvosDatabaseRecoveryOutcome databaseRecoveryOutcome;
+
+  @override
+  State<_AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<_AppShell> {
+  static const MethodChannel _nuvioChannel = MethodChannel('com.plezy/nuvio_stream');
+
+  @override
+  void initState() {
+    super.initState();
+    if (!PlatformDetector.isAppleTV()) return;
+
+    // Unlike Top Shelf's server-backed metadata lookup, a direct Nuvio
+    // stream can open before Plezy has authenticated with any media server.
+    _nuvioChannel.setMethodCallHandler((call) async {
+      if (call.method != 'onExternalStream') return false;
+      final args = call.arguments;
+      final link = args is Map ? args['deepLink'] : null;
+      return _showNuvioStream(link);
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        final pending = await _nuvioChannel.invokeMethod<String>('getInitialExternalStream');
+        if (pending != null) await _showNuvioStream(pending);
+      } catch (error) {
+        appLogger.w('Nuvio external-stream delivery unavailable', error: error);
+      }
+    });
+  }
+
+  Future<bool> _showNuvioStream(Object? rawLink) async {
+    final link = rawLink is String ? NuvioStreamLink.tryParse(rawLink) : null;
+    final navigator = rootNavigatorKey.currentState;
+    if (!mounted || link == null || navigator == null) return false;
+
+    // Never log the signed URL. The playback screen uses Plezy's native mpv
+    // backend, independent from login and media-server metadata.
+    unawaited(VideoPlayerRoute(
+      builder: (_) => NuvioStreamPlayerScreen(link: link),
+    ).push(navigator));
+    return true;
+  }
+
+  @override
+  void dispose() {
+    if (PlatformDetector.isAppleTV()) _nuvioChannel.setMethodCallHandler(null);
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1865,7 +1918,7 @@ class _AppShell extends StatelessWidget {
                     themeMode: themeProvider.materialThemeMode,
                     navigatorKey: rootNavigatorKey,
                     navigatorObservers: [BackKeySuppressorObserver()],
-                    home: SetupScreen(databaseRecoveryOutcome: databaseRecoveryOutcome),
+                    home: SetupScreen(databaseRecoveryOutcome: widget.databaseRecoveryOutcome),
                     // Siri Remote select + gamepad A report as
                     // LogicalKeyboardKey.{select,gameButtonA} which aren't
                     // in Flutter's default shortcut set — Material-level

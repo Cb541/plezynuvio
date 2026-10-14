@@ -281,7 +281,9 @@ import TVServices
     private static let staleArtworkGracePeriod: TimeInterval = 60
     private static let mutationQueue = DispatchQueue(label: "com.plezy.system-shelf", qos: .utility)
     private static let deepLinkDelivery = TvosDeepLinkDeliveryCoordinator()
+    private static let externalStreamDelivery = TvosDeepLinkDeliveryCoordinator()
     private static var methodChannel: FlutterMethodChannel?
+    private static var externalStreamChannel: FlutterMethodChannel?
     private static var mutationState = SystemShelfMutationState()
     private let engineEpoch: UInt64
 
@@ -297,14 +299,29 @@ import TVServices
       }
       methodChannel = channel
       deepLinkDelivery.bindEngine()
+      let streamChannel = FlutterMethodChannel(name: "com.plezy/nuvio_stream", binaryMessenger: registrar.messenger())
+      externalStreamChannel = streamChannel
+      externalStreamDelivery.bindEngine()
       let instance = SystemShelfPlugin(engineEpoch: engineEpoch)
       registrar.addMethodCallDelegate(instance, channel: channel)
+      registrar.addMethodCallDelegate(instance, channel: streamChannel)
       // Top Shelf links are delivered through UIScene once that lifecycle is enabled.
       registrar.addSceneDelegate(instance)
       mutationQueue.async { scrubLegacyPayload() }
     }
 
     static func handleOpenURL(_ url: URL) -> Bool {
+      // Direct streams are delivered independently from Top Shelf links.
+      // They must work before login, while browsing, and while already playing.
+      if let streamLink = externalStreamPayload(from: url) {
+        switch externalStreamDelivery.receive(contentId: streamLink) {
+        case let .deliver(event):
+          deliverExternalStream(event)
+        case .retained, .duplicate:
+          break
+        }
+        return true
+      }
       guard let contentId = contentId(from: url) else { return false }
       switch deepLinkDelivery.receive(contentId: contentId) {
       case let .deliver(event):
@@ -340,6 +357,17 @@ import TVServices
       openURLContexts URLContexts: Set<UIOpenURLContext>
     ) -> Bool {
       Self.handleSceneURLs(URLContexts.map(\.url))
+    }
+
+    private static func externalStreamPayload(from url: URL) -> String? {
+      guard url.scheme?.lowercased() == "plezy", url.host?.lowercased() == "stream",
+        let media = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+          .queryItems?.first(where: { $0.name == "url" })?.value,
+        let remote = URL(string: media),
+        remote.scheme == "https" || remote.scheme == "http",
+        remote.host != nil
+      else { return nil }
+      return url.absoluteString
     }
 
     private static func contentId(from url: URL) -> String? {
@@ -404,6 +432,12 @@ import TVServices
         if let event, let next = Self.deepLinkDelivery.complete(event, succeeded: true) {
           Self.deliverLive(next)
         }
+      case "getInitialExternalStream":
+        let event = Self.externalStreamDelivery.beginLiveDelivery()
+        result(event?.contentId)
+        if let event, let next = Self.externalStreamDelivery.complete(event, succeeded: true) {
+          Self.deliverExternalStream(next)
+        }
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -415,6 +449,16 @@ import TVServices
         let succeeded = flutterDeliverySucceeded(reply)
         if let next = deepLinkDelivery.complete(event, succeeded: succeeded) {
           deliverLive(next)
+        }
+      }
+    }
+
+    private static func deliverExternalStream(_ event: TvosDeepLinkDeliveryCoordinator.Event) {
+      guard let channel = externalStreamChannel else { return }
+      channel.invokeMethod("onExternalStream", arguments: ["deepLink": event.contentId]) { reply in
+        let succeeded = flutterDeliverySucceeded(reply)
+        if let next = externalStreamDelivery.complete(event, succeeded: succeeded) {
+          deliverExternalStream(next)
         }
       }
     }

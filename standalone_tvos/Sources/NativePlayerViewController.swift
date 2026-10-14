@@ -1363,18 +1363,26 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func showPanel() {
         hideTimer?.invalidate()
-        let wantsTimeline = core != nil && (
+        let hasPlayerControls = core != nil && (
             !playing || lockedSeekDirection != 0 ||
             isTouchScrubbing || targetSeconds != nil ||
             toolbarFocused || toolPanel != .none
         )
-        controlsVisible = wantsTimeline
-        panel.isHidden = !wantsTimeline
+        // During normal playback, Down may reveal Audio / CC / Info, but
+        // the timeline remains hidden. Progress is ONLY visible when paused
+        // or in a locked/paused-scrub state.
+        let showTimeline = core != nil && (!playing ||
+            lockedSeekDirection != 0 || isTouchScrubbing)
+        controlsVisible = hasPlayerControls
+        panel.isHidden = !hasPlayerControls
+        progress.isHidden = !showTimeline
+        currentLabel.isHidden = !showTimeline
+        endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
         updateToolbarFocus()
         // No timeout while the FF/RW lock is running or a finger is moving
         // across the touch surface. Only genuine inactivity can hide chrome.
-        if wantsTimeline && lockedSeekDirection == 0 &&
+        if hasPlayerControls && lockedSeekDirection == 0 &&
            !isTouchScrubbing && targetSeconds == nil &&
            toolPanel == .none {
             hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0,

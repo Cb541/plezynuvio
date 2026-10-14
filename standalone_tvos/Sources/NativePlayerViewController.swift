@@ -229,6 +229,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
     private let filmStrip = UIStackView()
+    // The floating preview tracks the played/scrubbed fraction of the
+    // *actual laid-out* progress bar, not the width of the full screen.
+    // Constrain the entire window inside the screen at timeline endpoints.
+    private let seekPreviewWidth: CGFloat = 522
+    private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
     private let picturePanel = UIView()
@@ -272,6 +277,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
         clock = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(refreshClock),
                                      userInfo: nil, repeats: true)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // Progress-bar geometry depends on Safe Area and the trailing tools.
+        // Read it after Auto Layout, including after display-mode changes.
+        updateThumbnailHorizontalPosition()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -909,6 +921,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             trackLabels.append(label)
             rows.addArrangedSubview(label)
         }
+        let movableThumbnailX = filmStrip.centerXAnchor.constraint(
+            equalTo: view.leadingAnchor, constant: view.bounds.midX)
+        thumbnailCenterXConstraint = movableThumbnailX
+
         NSLayoutConstraint.activate([
             remote.topAnchor.constraint(equalTo: view.topAnchor),
             remote.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -939,9 +955,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // 15% larger overall, plus another 5% horizontal extension.
             // Width: 432 × 1.15 × 1.05 ≈ 522; height: 245 × 1.15 ≈ 282.
             // Keep the bottom edge at 26% above screen bottom.
-            filmStrip.widthAnchor.constraint(equalToConstant: 522),
+            filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
             filmStrip.heightAnchor.constraint(equalToConstant: 282),
-            filmStrip.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            movableThumbnailX,
             // The BOTTOM EDGE of the thumbnail is 26% UP from screen
             // bottom (74% down from top). The picture extends ABOVE
             // this line; do NOT center the picture on the 25% boundary.
@@ -2685,9 +2701,43 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         refreshLabels()
     }
 
+    /// Keep the center of the thumbnail above the progress playhead.
+    /// The preview stays hidden during ordinary playback, as before, but
+    /// its position remains in sync so it appears correctly on pause or
+    /// locked/circular seeking without a jump from screen center.
+    private func updateThumbnailHorizontalPosition() {
+        guard let center = thumbnailCenterXConstraint,
+              progress.bounds.width > 1, view.bounds.width > 0 else { return }
+
+        let seconds = targetSeconds ?? currentSeconds
+        let fraction: CGFloat
+        if totalSeconds > 0, totalSeconds.isFinite, seconds.isFinite {
+            fraction = CGFloat(min(1, max(0, seconds / totalSeconds)))
+        } else {
+            fraction = 0
+        }
+        // Convert points from the actual progress track to controller space.
+        // A 0% seek sits at the track's start; 100% at its end.
+        let start = progress.convert(CGPoint(x: progress.bounds.minX,
+                                             y: progress.bounds.midY), to: view).x
+        let end = progress.convert(CGPoint(x: progress.bounds.maxX,
+                                           y: progress.bounds.midY), to: view).x
+        let timelineX = start + (end - start) * fraction
+        // At either extreme the large 522pt preview must not be cut off.
+        let margin: CGFloat = 16
+        let halfWidth = seekPreviewWidth / 2
+        let minimum = halfWidth + margin
+        let maximum = max(minimum, view.bounds.width - halfWidth - margin)
+        let centeredX = min(maximum, max(minimum, timelineX))
+        if abs(center.constant - centeredX) > 0.25 {
+            center.constant = centeredX
+        }
+    }
+
     private func refreshLabels() {
         let seconds = targetSeconds ?? currentSeconds
         progress.progress = Float(max(0, min(1, totalSeconds > 0 ? seconds / totalSeconds : 0)))
+        updateThumbnailHorizontalPosition()
         currentLabel.text = clockString(seconds)
         endLabel.text = totalSeconds > 0 ? clockString(totalSeconds) : "--:--"
         seekTimeLabel.text = lockedSeekDirection != 0

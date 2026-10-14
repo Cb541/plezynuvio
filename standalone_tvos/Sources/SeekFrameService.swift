@@ -82,7 +82,7 @@ final class SeekFrameService {
             lock.unlock()
 
             let decoded = decoder.thumbnail(for: request.url,
-                second: Int64(request.second), timeoutSeconds: 3.2, token: token)
+                second: Int64(request.second), timeoutSeconds: 5.5, token: token)
             let image = decoded ?? (token.cancelled ? nil
                 : appleFallback(url: request.url, second: request.second))
 

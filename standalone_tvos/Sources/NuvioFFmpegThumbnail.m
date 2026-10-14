@@ -146,14 +146,16 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
             _format->interrupt_callback.opaque = &deadline;
 
             AVDictionary *options = NULL;
-            av_dict_set(&options, "rw_timeout", "3000000", 0);
+            av_dict_set(&options, "rw_timeout", "5500000", 0);
             int rc = avformat_open_input(&_format, url.absoluteString.UTF8String,
                                          NULL, &options);
             av_dict_free(&options);
             if (rc < 0 || !_format || token.cancelled) {
+                if (!token.cancelled) NSLog(@"[NuvioPreview] demux-open failed: %d", rc);
                 [self reset]; return nil;
             }
             if (avformat_find_stream_info(_format, NULL) < 0 || token.cancelled) {
+                if (!token.cancelled) NSLog(@"[NuvioPreview] stream info unavailable");
                 [self reset]; return nil;
             }
             _streamIndex = av_find_best_stream(_format, AVMEDIA_TYPE_VIDEO,
@@ -199,6 +201,7 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
             seekResult = av_seek_frame(_format, _streamIndex, target,
                                        AVSEEK_FLAG_BACKWARD);
         if (seekResult < 0 || token.cancelled) {
+            if (!token.cancelled) NSLog(@"[NuvioPreview] network seek failed: %d", seekResult);
             [self reset]; return nil;
         }
         avcodec_flush_buffers(_decoder);
@@ -207,7 +210,7 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         int videoPackets = 0;
         while (!token.cancelled &&
                CFAbsoluteTimeGetCurrent() < deadline.deadline &&
-               videoPackets < 70) {
+               videoPackets < 110) {
             if (av_read_frame(_format, _packet) < 0) break;
             if (_packet->stream_index != _streamIndex) {
                 av_packet_unref(_packet);
@@ -241,7 +244,10 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         }
         // Keep a fully initialized demuxer across seeks. A failed decode
         // resets the session so a later request can reconnect cleanly.
-        if (!image) [self reset];
+        if (!image) {
+            NSLog(@"[NuvioPreview] decoder produced no frame before deadline");
+            [self reset];
+        }
         return image;
     }
 }

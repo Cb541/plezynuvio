@@ -2624,6 +2624,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
+        // DV profile information can arrive after the first frame, and an
+        // experimental filter could temporarily alter output tags. As soon
+        // as we ever detect DV in the source, latch it for the full movie
+        // and unwind the CPU-copy filter before it can cause sustained lag.
+        if !originalIsDolbyVision, (core?.doviProfile ?? 0) > 0 {
+            originalIsDolbyVision = true
+            sourceIsDolbyVision = true
+            sourceIsHDR = true
+            sourceColorMetadataReady = true
+            experimentalHDRColorBoost = false
+            colorEffectRequestedForVideo = false
+            scheduleColorFilterUpdate()
+            updatePictureLabels()
+            NSLog("[NuvioColor] Dolby Vision detected; native playback enforced")
+        }
         totalSeconds = max(0, core?.duration ?? totalSeconds)
         if targetSeconds == nil {
             let actual = max(0, core?.timePos ?? currentSeconds)

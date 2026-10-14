@@ -611,53 +611,268 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         switch key {
         case .leftArrow, .rightArrow:
             let direction = key == .rightArrow ? 1 : -1
-            if showSettings {
+            if toolPanel == .picture {
                 changePictureValue(direction)
-            } else {
-                heldDirection = direction
-                stepSeek(direction)
-                repeatTimer?.invalidate()
-                repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.23, repeats: true) { [weak self] _ in
-                    guard let self else { return }
-                    self.stepSeek(self.heldDirection)
+            } else if toolPanel == .none {
+                if toolbarFocused {
+                    toolbarIndex = (toolbarIndex + direction + toolbarButtons.count) % toolbarButtons.count
+                    updateToolbarFocus()
+                    showPanel()
+                } else {
+                    stepSeek(direction)
                 }
             }
         case .upArrow:
-            showSettings = true
-            picturePanel.isHidden = false
-            selectedPictureControl = 0
-            updatePictureLabels()
-            showPanel()
+            if toolPanel == .picture {
+                selectedPictureControl = 0
+                updatePictureLabels()
+            } else if toolPanel == .audio || toolPanel == .subtitles {
+                choiceIndex = max(0, choiceIndex - 1)
+                renderTrackPanel()
+            } else if toolPanel == .none {
+                toolbarFocused = false
+                updateToolbarFocus()
+                toolPanel = .picture
+                picturePanel.isHidden = false
+                selectedPictureControl = 0
+                updatePictureLabels()
+                showPanel()
+            }
         case .downArrow:
-            if showSettings {
+            if toolPanel == .picture {
                 selectedPictureControl = (selectedPictureControl + 1) % 2
                 updatePictureLabels()
                 showPanel()
-            } else { showPanel() }
-        case .playPause:
-            togglePlayback()
-        case .menu:
-            if showSettings {
-                showSettings = false
-                picturePanel.isHidden = true
-            } else {
-                leavePlayback()
+            } else if toolPanel == .audio || toolPanel == .subtitles {
+                choiceIndex = min(max(0, trackChoices.count - 1), choiceIndex + 1)
+                renderTrackPanel()
+            } else if toolPanel == .none {
+                toolbarFocused = true
+                updateToolbarFocus()
+                showPanel()
             }
         case .select:
-            if showSettings { resetPicture() }
-            else if targetSeconds == nil { togglePlayback() }
+            if toolPanel == .picture {
+                resetPicture()
+                showPanel()
+            } else if toolPanel == .audio || toolPanel == .subtitles {
+                chooseSelectedTrack()
+            } else if toolPanel == .info {
+                closeToolPanel()
+            } else if toolbarFocused {
+                openToolbarSelection()
+            } else if targetSeconds != nil {
+                commitSeek()
+            } else {
+                togglePlayback()
+            }
+        case .playPause:
+            if toolPanel == .none { togglePlayback() }
+        case .menu:
+            if toolPanel != .none {
+                closeToolPanel()
+            } else if toolbarFocused {
+                toolbarFocused = false
+                updateToolbarFocus()
+                showPanel()
+            } else {
+                confirmExit()
+            }
         default: break
         }
     }
 
     func remoteEnded(_ key: UIPress.PressType) {
-        if key == .leftArrow || key == .rightArrow {
-            repeatTimer?.invalidate()
-            repeatTimer = nil
-            heldDirection = 0
-            if !showSettings { commitSeek() }
+        // Directional click release does NOT commit a seek; repeated clicks
+        // add to the same target before the short idle debounce completes.
+    }
+
+    @objc private func remoteSwipe(_ recognizer: UISwipeGestureRecognizer) {
+        guard recognizer.state == .ended, core != nil, toolPanel == .none else { return }
+        toolbarFocused = false
+        updateToolbarFocus()
+        stepSeek(recognizer.direction == .right ? 1 : -1)
+    }
+
+    private func confirmExit() {
+        guard link != nil else { return }
+        let alert = UIAlertController(title: "Stop watching?",
+            message: "Exit the current video?", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Keep Watching", style: .cancel) { [weak self] _ in
+            self?.showPanel()
+        })
+        alert.addAction(UIAlertAction(title: "Exit Video", style: .destructive) { [weak self] _ in
+            self?.leavePlayback()
+        })
+        present(alert, animated: true)
+    }
+
+    private func closeToolPanel() {
+        toolPanel = .none
+        picturePanel.isHidden = true
+        trackPanel.isHidden = true
+        toolbarFocused = true
+        updateToolbarFocus()
+        showPanel()
+    }
+
+    private func openToolbarSelection() {
+        guard core != nil else { return }
+        trackRefreshID += 1
+        let request = trackRefreshID
+        if toolbarIndex == 2 {
+            toolPanel = .info
+            infoRows = ["Reading file properties…"]
+            renderTrackPanel()
+            loadMediaInfo(request: request)
+        } else {
+            toolPanel = toolbarIndex == 0 ? .audio : .subtitles
+            trackChoices = []
+            choiceIndex = 0
+            renderTrackPanel()
+            loadTracks(request: request)
+        }
+        toolbarFocused = false
+        updateToolbarFocus()
+        showPanel()
+    }
+
+    private func renderTrackPanel() {
+        picturePanel.isHidden = true
+        trackPanel.isHidden = false
+        if toolPanel == .info {
+            trackTitle.text = "FILE INFORMATION"
+            for i in trackLabels.indices {
+                trackLabels[i].text = i < infoRows.count ? infoRows[i] : ""
+                trackLabels[i].textColor = .white.withAlphaComponent(0.86)
+            }
+        } else {
+            trackTitle.text = toolPanel == .audio ? "AUDIO TRACKS" : "SUBTITLES"
+            if trackChoices.isEmpty {
+                trackLabels[0].text = "No tracks found (or still loading)…"
+                for i in 1..<trackLabels.count { trackLabels[i].text = "" }
+            } else {
+                let top = max(0, min(choiceIndex - 3, max(0, trackChoices.count - trackLabels.count)))
+                for row in trackLabels.indices {
+                    let index = top + row
+                    if index < trackChoices.count {
+                        let track = trackChoices[index]
+                        let prefix = choiceIndex == index ? "▶  " : "    "
+                        let suffix = track.selected ? "  ✓" : ""
+                        trackLabels[row].text = prefix + track.caption + suffix
+                        trackLabels[row].textColor = choiceIndex == index ? .white : .lightGray
+                    } else { trackLabels[row].text = "" }
+                }
+            }
         }
     }
+
+    private func chooseSelectedTrack() {
+        guard let core, trackChoices.indices.contains(choiceIndex) else { return }
+        let choice = trackChoices[choiceIndex]
+        let property = toolPanel == .audio ? "aid" : "sid"
+        core.setProperty(property, value: choice.id)
+        closeToolPanel()
+    }
+
+    private func loadTracks(request: Int) {
+        guard let core else { return }
+        let wanted: TrackKind = toolPanel == .audio ? .audio : .sub
+        core.getPropertyAsync("track-list/count") { [weak self, weak core] result in
+            guard let self, let core, self.core === core, self.trackRefreshID == request else { return }
+            let count = min(96, max(0, Int((try? result.get()) ?? "") ?? 0))
+            guard count > 0 else {
+                self.trackChoices = wanted == .sub
+                    ? [TrackChoice(id: "no", caption: "Off", selected: false)] : []
+                self.renderTrackPanel()
+                return
+            }
+            let keys = ["type", "id", "lang", "title", "codec", "selected", "audio-channels"]
+            var values = Array(repeating: [String: String](), count: count)
+            let group = DispatchGroup()
+            for index in 0..<count {
+                for key in keys {
+                    group.enter()
+                    core.getPropertyAsync("track-list/\(index)/\(key)") { result in
+                        if case .success(let value) = result, let value {
+                            values[index][key] = value
+                        }
+                        group.leave()
+                    }
+                }
+            }
+            group.notify(queue: .main) { [weak self, weak core] in
+                guard let self, let core, self.core === core,
+                      self.trackRefreshID == request else { return }
+                var choices: [TrackChoice] = []
+                if wanted == .sub {
+                    choices.append(TrackChoice(id: "no", caption: "Off", selected: false))
+                }
+                var ordinal = 0
+                for value in values where value["type"] == wanted.rawValue {
+                    ordinal += 1
+                    guard let id = value["id"], !id.isEmpty else { continue }
+                    let lang = value["lang"]?.isEmpty == false ? value["lang"]! : "Unknown"
+                    let title = value["title"] ?? ""
+                    let codec = (value["codec"] ?? "").uppercased()
+                    let channels = value["audio-channels"] ?? ""
+                    let details = [lang, title, codec, channels].filter { !$0.isEmpty }
+                        .joined(separator: " · ")
+                    choices.append(TrackChoice(id: id, caption: "\(ordinal). \(details)",
+                                               selected: value["selected"] == "yes"))
+                }
+                self.trackChoices = choices
+                self.choiceIndex = max(0, choices.firstIndex(where: { $0.selected }) ?? 0)
+                self.renderTrackPanel()
+            }
+        }
+    }
+
+    private func loadMediaInfo(request: Int) {
+        guard let core else { return }
+        let keys: [(String, String)] = [
+            ("Video codec", "video-codec"),
+            ("Video format", "video-format"),
+            ("Width", "video-params/w"),
+            ("Height", "video-params/h"),
+            ("Frame rate", "container-fps"),
+            ("Audio codec", "audio-codec-name"),
+            ("Dolby Vision", "current-tracks/video/dolby-vision-profile"),
+            ("Video bitrate", "video-bitrate")
+        ]
+        var values = [String: String]()
+        let group = DispatchGroup()
+        for (label, property) in keys {
+            group.enter()
+            core.getPropertyAsync(property) { result in
+                if case .success(let value) = result, let value {
+                    values[label] = value
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self, weak core] in
+            guard let self, let core, self.core === core,
+                  self.trackRefreshID == request, self.toolPanel == .info else { return }
+            let width = values["Width"] ?? "?"
+            let height = values["Height"] ?? "?"
+            let fps = Double(values["Frame rate"] ?? "").map { String(format: "%.3f fps", $0) } ?? "Unknown"
+            let dv = Int(values["Dolby Vision"] ?? "").map {
+                $0 == 7 ? "Profile 7 → 8.1" : ($0 > 0 ? "Profile \($0)" : "No")
+            } ?? "Unknown"
+            self.infoRows = [
+                "Video   " + (values["Video codec"] ?? "Unknown"),
+                "Size    " + width + " × " + height,
+                "Rate    " + fps,
+                "DV      " + dv,
+                "Format  " + (values["Video format"] ?? "Unknown"),
+                "Audio   " + (values["Audio codec"] ?? "Unknown"),
+                "Bitrate " + (values["Video bitrate"] ?? "Unknown") + " bps"
+            ]
+            self.renderTrackPanel()
+        }
+    }
+
 
     private func togglePlayback() {
         guard let core else { return }

@@ -3,10 +3,10 @@ import CryptoKit
 import Foundation
 import UIKit
 
-/// Independent, serial thumbnail decoder with a persistent, disk-backed
-/// per-stream cache. No fixed cap is placed on stored thumbnails. The small
-/// NSCache is only a RAM hot set; tvOS controls available disk space and may
-/// evict files from its system Caches directory.
+/// Crash-safe previews use Apple's AVAssetImageGenerator rather than a
+/// second unmanaged FFmpeg decoder. The old FFmpeg path terminated tvOS on
+/// unrelated codecs and is intentionally NEVER invoked by this service.
+/// Unsupported formats fail gracefully; disk-cached previews remain intact.
 final class SeekFrameService {
     private struct Request {
         let url: URL
@@ -17,7 +17,6 @@ final class SeekFrameService {
 
     private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .utility)
     private let diskWriter = DispatchQueue(label: "com.cb541.nuvio.seek-disk", qos: .utility)
-    private let decoder = NuvioThumbnailDecoder()
     private let lock = NSLock()
     private let hotImages = NSCache<NSString, UIImage>()
     private var generation: UInt64 = 0
@@ -63,7 +62,6 @@ final class SeekFrameService {
             try? FileManager.default.createDirectory(at: dir,
                 withIntermediateDirectories: true)
         }
-        worker.async { [weak self] in self?.decoder.reset() }
     }
 
     /// Main-thread-safe in-memory lookup for instantaneous swipe feedback.
@@ -81,11 +79,11 @@ final class SeekFrameService {
         lock.unlock()
     }
 
-    /// Finish all queued FFmpeg work before mpv seeks the main movie.
+    /// Wait until the serial system frame generator is no longer active
+    /// before allowing the main playback engine to seek.
     func cancelAndDrain(_ completion: @escaping () -> Void) {
         cancel()
-        worker.async { [weak self] in
-            self?.decoder.reset()
+        worker.async {
             DispatchQueue.main.async(execute: completion)
         }
     }
@@ -97,7 +95,6 @@ final class SeekFrameService {
         scopedDirectory = nil
         hotImages.removeAllObjects()
         lock.unlock()
-        worker.async { [weak self] in self?.decoder.reset() }
         // Intentionally DO NOT delete stored previews.
     }
 
@@ -194,12 +191,11 @@ final class SeekFrameService {
             } else if token.cancelled {
                 decoded = nil
             } else {
-                decoded = decoder.thumbnail(for: job.url,
-                    second: Int64(job.second),
-                    timeoutSeconds: job.prefetch ? 3.0 : 6.0,
-                    token: token)
-                    ?? (token.cancelled || job.prefetch ? nil
-                        : appleFallback(url: job.url, second: job.second))
+                // Do NOT invoke FFmpeg. It previously decoded 4K streams
+                // independently of the main renderer and repeatedly caused
+                // app termination. System-backed decoding is limited to
+                // formats supported natively by AVFoundation.
+                decoded = appleFallback(url: job.url, second: job.second)
             }
 
             lock.lock()
@@ -238,7 +234,7 @@ final class SeekFrameService {
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 640, height: 360)
+        generator.maximumSize = CGSize(width: 512, height: 288)
         generator.requestedTimeToleranceBefore = CMTime(seconds: 3, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 3, preferredTimescale: 600)
         guard let frame = try? generator.copyCGImage(

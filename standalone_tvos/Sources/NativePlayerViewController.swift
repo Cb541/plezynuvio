@@ -1233,7 +1233,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             return
         }
 
-        // An FFmpeg eq graph cannot process opaque hardware video surfaces.
+        // The enabled FFmpeg lutyuv graph cannot process opaque hardware video surfaces.
         // videotoolbox-copy supplies ordinary image frames to libavfilter.
         if !colorCopyMode {
             colorFilterInFlight = true
@@ -1260,9 +1260,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             return
         }
 
+        // MPVKit's pinned FFmpeg is built with --disable-filters and a
+        // selective allowlist. It DOES NOT include the video 'eq' filter
+        // used by previous builds. The supported 'lutyuv' filter is enabled
+        // by --enable-filter=lut*. Apply contrast to the Y plane and
+        // saturation to U/V around the bit-depth-correct neutral midpoint.
+        // This expression works on both 8-bit (128) and 10-bit (512) YUV;
+        // no hardcoded pixel depth or conversion to 8-bit is required.
+        // IMPORTANT: HDR/Dolby Vision may still lose dynamic metadata when
+        // video pixels are filtered. HDR stays explicit opt-in.
         let spec = String(format:
-            "@nuvio-color:lavfi=[eq=contrast=%.2f:saturation=%.2f]",
-            colorContrast, colorSaturation)
+            "@nuvio-color:lavfi=[lutyuv=y=(val-(maxval+1)/2)*%.2f+(maxval+1)/2:u=(val-(maxval+1)/2)*%.2f+(maxval+1)/2:v=(val-(maxval+1)/2)*%.2f+(maxval+1)/2]",
+            colorContrast, colorSaturation, colorSaturation)
         colorFilterInFlight = true
         colorFilterVerified = false
         updatePictureLabels()
@@ -1275,7 +1284,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 self.colorFilterActive = false
                 self.colorFilterFailed = true
                 self.experimentalHDRColorBoost = false
-                NSLog("[NuvioColor] FFmpeg eq filter rejected: %@",
+                NSLog("[NuvioColor] FFmpeg lutyuv filter rejected: %@",
                       error.localizedDescription)
                 self.scheduleColorFilterUpdate()
             } else {

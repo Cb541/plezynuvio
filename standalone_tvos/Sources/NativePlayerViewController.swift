@@ -1002,8 +1002,26 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func updatePictureLabels() {
         zoomLabel.text = "\(selectedPictureControl == 0 ? "▶ " : "   ")Zoom: \(Int(zoom * 100))%"
         stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
+        saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
+        contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
+        let available = sourceColorMetadataReady && !sourceIsHDR
+        saturationLabel.textColor = available
+            ? (selectedPictureControl == 2 ? .white : .lightGray)
+            : .gray
+        contrastLabel.textColor = available
+            ? (selectedPictureControl == 3 ? .white : .lightGray)
+            : .gray
+        if !sourceColorMetadataReady {
+            colorStatusLabel.text = "Checking source color format…"
+        } else if sourceIsHDR {
+            colorStatusLabel.text = "HDR / Dolby Vision: native colors preserved.\nUse your TV’s picture settings."
+        } else if colorFilterFailed {
+            colorStatusLabel.text = "This video cannot use SDR color adjustments.\nOriginal picture preserved."
+        } else {
+            colorStatusLabel.text = "SDR enhancement • 100% is original\nLeft/Right adjusts • Select resets all"
+        }
     }
 
 
@@ -1016,12 +1034,25 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func changePictureValue(_ direction: Int) {
-        if selectedPictureControl == 0 {
+        switch selectedPictureControl {
+        case 0:
             zoom = max(1, min(2.5, zoom + CGFloat(direction) * 0.05))
-        } else {
+            applyPictureTransform()
+        case 1:
             verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
+            applyPictureTransform()
+        case 2 where sourceColorMetadataReady && !sourceIsHDR && !colorFilterFailed:
+            colorSaturation = min(1.50, max(0.60,
+                (colorSaturation * 100 + Double(direction) * 5).rounded() / 100))
+            UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
+            scheduleColorFilterUpdate()
+        case 3 where sourceColorMetadataReady && !sourceIsHDR && !colorFilterFailed:
+            colorContrast = min(1.40, max(0.70,
+                (colorContrast * 100 + Double(direction) * 5).rounded() / 100))
+            UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
+            scheduleColorFilterUpdate()
+        default: break
         }
-        applyPictureTransform()
         updatePictureLabels()
         showPanel()
     }
@@ -1029,8 +1060,103 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func resetPicture() {
         zoom = 1
         verticalStretch = 1
+        colorSaturation = 1.0
+        colorContrast = 1.0
+        colorFilterFailed = false
+        UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorSaturation")
+        UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorContrast")
         applyPictureTransform()
+        scheduleColorFilterUpdate()
         updatePictureLabels()
+    }
+
+    private func checkColorSourceMetadata() {
+        guard let playbackCore = core, playbackCore.videoSize != nil else { return }
+        let generation = playbackGeneration
+        playbackCore.getPropertyAsync("video-params/gamma") {
+            [weak self, weak playbackCore] result in
+            guard let self, let playbackCore,
+                  self.playbackGeneration == generation,
+                  self.core === playbackCore else { return }
+            let gamma = (try? result.get())?.lowercased() ?? ""
+            // The VideoToolbox/AVDisplayManager path preserves source HDR
+            // metadata. Do not insert SDR lavfi processing into DV/PQ/HLG.
+            let hdr = playbackCore.doviProfile > 0
+                || playbackCore.lastSigPeak > 1.05
+                || gamma.contains("smpte2084")
+                || gamma.contains("pq")
+                || gamma.contains("hlg")
+                || gamma.contains("arib")
+            if self.sourceColorMetadataReady && self.sourceIsHDR == hdr { return }
+            self.sourceColorMetadataReady = true
+            self.sourceIsHDR = hdr
+            self.updatePictureLabels()
+            self.scheduleColorFilterUpdate()
+        }
+    }
+
+    private func scheduleColorFilterUpdate() {
+        colorFilterOperation += 1
+        let operation = colorFilterOperation
+        colorFilterTimer?.invalidate()
+        colorFilterTimer = Timer.scheduledTimer(withTimeInterval: 0.23,
+            repeats: false) { [weak self] _ in
+            guard let self, self.colorFilterOperation == operation else { return }
+            self.colorFilterTimer = nil
+            self.applyColorFilterNow(operation: operation)
+        }
+    }
+
+    private func applyColorFilterNow(operation: Int) {
+        guard let playbackCore = core,
+              operation == colorFilterOperation,
+              sourceColorMetadataReady else { return }
+        let generation = playbackGeneration
+        let enabled = !sourceIsHDR && !colorFilterFailed
+            && (abs(colorSaturation - 1.0) > 0.001
+                || abs(colorContrast - 1.0) > 0.001)
+        if !enabled {
+            // Remove on neutral values or HDR, even after an earlier
+            // asynchronous add, so source passthrough stays unfiltered.
+            playbackCore.commandAsync(["vf", "remove", "@nuvio-color"]) {
+                [weak self, weak playbackCore] _ in
+                guard let self, let playbackCore,
+                      self.core === playbackCore,
+                      self.playbackGeneration == generation else { return }
+                if self.colorFilterOperation != operation {
+                    self.scheduleColorFilterUpdate()
+                } else {
+                    self.colorFilterActive = false
+                }
+            }
+            return
+        }
+
+        // The stock avfoundation VO has no VOCTRL_SET_EQUALIZER handler:
+        // mpv's 'saturation' and 'contrast' properties would silently do
+        // nothing. A labeled lavfi eq filter ACTUALLY transforms SDR video.
+        // Never enable this automatically at 100%, or on HDR/DV sources.
+        let spec = String(format:
+            "@nuvio-color:lavfi=[eq=contrast=%.2f:saturation=%.2f]",
+            colorContrast, colorSaturation)
+        playbackCore.commandAsync(["vf", "add", spec]) {
+            [weak self, weak playbackCore] result in
+            guard let self, let playbackCore,
+                  self.core === playbackCore,
+                  self.playbackGeneration == generation else { return }
+            if case .failure(let error) = result {
+                self.colorFilterActive = false
+                self.colorFilterFailed = true
+                NSLog("[NuvioNative] SDR color filter unavailable: %@", error.localizedDescription)
+                playbackCore.command(["vf", "remove", "@nuvio-color"])
+            } else {
+                self.colorFilterActive = true
+            }
+            self.updatePictureLabels()
+            if self.colorFilterOperation != operation {
+                self.scheduleColorFilterUpdate()
+            }
+        }
     }
 
     func remoteBegan(_ key: UIPress.PressType) {
@@ -1068,7 +1194,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .downArrow:
             if toolPanel == .picture {
-                selectedPictureControl = (selectedPictureControl + 1) % 2
+                selectedPictureControl = (selectedPictureControl + 1) % 4
                 updatePictureLabels()
                 showPanel()
             } else if toolPanel == .audio || toolPanel == .subtitles {

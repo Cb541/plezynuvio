@@ -108,6 +108,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // unlike unrestricted per-pan decoding, it bounds decoder pressure.
     private var lastLiveTouchpadRequest = Date.distantPast
     private var lastBackgroundPreviewAttempt = Date.distantPast
+    private var playbackSnapshotInFlight = false
     private var lastConfirmedPauseAt: Date?
     // Locked transport is engaged by holding the left/right edge once.
     // Release keeps it running; further clicks cycle speed and direction.
@@ -281,6 +282,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         touchpadPreviewMode = false
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
+        playbackSnapshotInFlight = false
         lastConfirmedPauseAt = nil
         mainFramePreviewOrigin = nil
         mainFramePreviewBusy = false
@@ -2177,11 +2179,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
-        // SAFETY: Background *software decoding* during playback caused
-        // competing video decoders and likely tvOS memory termination.
-        // Keep the uncapped on-disk cache of previews already generated,
-        // but never launch a second FFmpeg decoder during active playback.
-        // Playback frame capture requires a separate renderer-based path.
+        // Capture an already-decoded frame from the PRIMARY renderer every
+        // ~20 seconds. This progressively warms the disk cache without any
+        // second FFmpeg codec or seeking while watching. If the native VO
+        // doesn't provide screenshots, stop trying on this media.
+        if playing, core?.isPaused == false, !isPreparingPlayback,
+           !waitingForFirstFrame, !displayNegotiationPending,
+           !mainFramePreviewUnsupported, !playbackSnapshotInFlight,
+           !previewIsVisible, targetSeconds == nil, link != nil,
+           currentSeconds.isFinite,
+           Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= 20 {
+            lastBackgroundPreviewAttempt = Date()
+            playbackSnapshotInFlight = true
+            let generation = playbackGeneration
+            let second = Int(max(0, currentSeconds.rounded()))
+            takeMpvStill { [weak self] image in
+                guard let self, self.playbackGeneration == generation else { return }
+                self.playbackSnapshotInFlight = false
+                if let image {
+                    self.thumbs.cachePlaybackFrame(image, second: second)
+                } else {
+                    self.mainFramePreviewUnsupported = true
+                    PlayerStartupDiagnostics.mark("native-screenshot-not-supported")
+                }
+            }
+        }
         refreshLabels()
     }
 

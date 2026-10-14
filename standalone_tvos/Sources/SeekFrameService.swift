@@ -247,8 +247,11 @@ final class SeekFrameService {
 
     private func appleFallback(url: URL, second: Int) -> UIImage? {
         let suffix = url.pathExtension.lowercased()
-        guard !["mkv", "webm", "avi", "ts", "m2ts", "vob"].contains(suffix)
-            else { return nil }
+        // AVAssetImageGenerator supports native containers, not arbitrary
+        // signed URL streams, MKV, WebM or unknown formats. Trying all of
+        // them could block this serial queue for seconds before falling back.
+        // Unknown types go directly to the already-open mpv decoder.
+        guard ["mp4", "mov", "m4v", "m3u8"].contains(suffix) else { return nil }
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true

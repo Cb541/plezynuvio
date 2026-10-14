@@ -712,8 +712,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 // events; the hook extrapolates between events using monotonic
                 // host time if the tvOS UI timer becomes delayed.
                 if self.frameTapInstalled,
-                   self.targetSeconds == nil && !self.previewIsVisible,
-                   self.mainFramePreviewOrigin == nil && !self.isPreparingPlayback,
                    let n = value as? NSNumber,
                    n.doubleValue.isFinite && n.doubleValue >= 0 {
                     NuvioFrameTapSetPlaybackSecond(Int64(n.doubleValue))
@@ -2915,17 +2913,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if frameTapInstalled, let layer = core?.videoLayer {
             NuvioFrameTapRefreshTargets(layer, layer.sampleBufferRenderer)
         }
-        // The existing mpv pause-property cache can lag actual playback.
-        // When samples are being enqueued and the controller says playing,
-        // collecting an already-decoded still is safe independently of it.
-        // Decode-time capture must not depend on the view controller's
-        // manually maintained 'playing' flag. Disk-backed media read-ahead
-        // changes buffering/startup timing, but mpv can still enqueue real
-        // decoded video frames when that flag is stale.
-        let captureAllowed = frameTapInstalled
-            && core != nil && !isPreparingPlayback
-            && targetSeconds == nil && !previewIsVisible
-            && mainFramePreviewOrigin == nil
+        // Capture is tied to the stream's decoded video samples, NEVER to
+        // the seek controls, overlay visibility, loading flags or a manually
+        // maintained playback flag. Any of those UI flags can remain active
+        // while tvOS continues presenting a normally advancing movie.
+        // A paused player emits no continuous samples, so this does not
+        // spin a decoder, poll a stream or create thumbnails while idle.
+        let captureAllowed = frameTapInstalled && core != nil
             && playbackSecond.isFinite && playbackSecond >= 0
         NuvioFrameTapSetPlaybackSecond(captureAllowed
             ? Int64(playbackSecond) : -1)

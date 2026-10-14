@@ -68,6 +68,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var trackRefreshID = 0
     private var infoRows: [String] = []
     private var seekCommitTimer: Timer?
+    private var previewHideTimer: Timer?
+    private var previewIsVisible = false
     private let toolbar = UIStackView()
     private var toolbarButtons: [UIButton] = []
     private let trackPanel = UIView()
@@ -156,6 +158,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         PlayerStartupDiagnostics.mark("handoff-received")
 
         thumbs.clear()
+        previewHideTimer?.invalidate()
+        previewIsVisible = false
+        filmStrip.alpha = 0
+        seekTimeLabel.alpha = 0
         link = media
         titleLabel.text = ""
         idleLabel.isHidden = true
@@ -917,10 +923,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         core?.command(["seek", String(format: "%.3f", seconds), "absolute"])
         currentSeconds = seconds
         targetSeconds = nil
-        filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
-        thumbs.cancel()
-        currentPreviewSerial += 1
+        // Keep the preview on-screen long enough for remote MKV/4K decode.
+        // Cancelling here used to discard every picture before it arrived.
+        previewHideTimer?.invalidate()
+        previewHideTimer = Timer.scheduledTimer(withTimeInterval: 4.8, repeats: false) { [weak self] _ in
+            guard let self, self.targetSeconds == nil else { return }
+            self.filmStrip.alpha = 0
+            self.seekTimeLabel.alpha = 0
+            self.previewIsVisible = false
+            self.thumbs.cancel()
+            self.currentPreviewSerial += 1
+            self.showPanel()
+        }
         showPanel()
     }
 
@@ -929,6 +943,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         filmStrip.alpha = 1
         seekTimeLabel.alpha = 1
         thumbTimer?.invalidate()
+        previewHideTimer?.invalidate()
+        previewIsVisible = true
         currentPreviewSerial += 1
         let serial = currentPreviewSerial
         // Leave cached images visible while another seek batch is queued.
@@ -945,7 +961,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             let second = max(0, center + (index - 2) * 15)
             thumbs.request(url: link.url, second: second) { [weak self] image in
                 guard let self, self.currentPreviewSerial == serial,
-                      self.targetSeconds != nil else { return }
+                      self.previewIsVisible else { return }
                 if let image { self.frameViews[index].image = image }
             }
         }
@@ -962,6 +978,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         PlayerStartupDiagnostics.clear()
         thumbs.clear()
         thumbTimer?.invalidate()
+        previewHideTimer?.invalidate()
+        previewIsVisible = false
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         toolPanel = .none
@@ -1029,6 +1047,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         repeatTimer?.invalidate()
         thumbTimer?.invalidate()
         seekCommitTimer?.invalidate()
+        previewHideTimer?.invalidate()
         hideTimer?.invalidate()
         core?.dispose()
     }

@@ -1,9 +1,14 @@
 #import "FFmpegThumbnailBridge.h"
 
-@import Libavformat;
-@import Libavcodec;
-@import Libavutil;
-@import Libswscale;
+// Import only the FFmpeg declarations used here. Importing the generated
+// Libavutil umbrella module also imports desktop-only AMF headers, which
+// are not shipped for tvOS in this pinned FFmpeg binary distribution.
+#include <Libavformat/avformat.h>
+#include <Libavcodec/avcodec.h>
+#include <Libavcodec/codec_par.h>
+#include <Libavutil/avutil.h>
+#include <Libavutil/imgutils.h>
+#include <Libswscale/swscale.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <limits.h>

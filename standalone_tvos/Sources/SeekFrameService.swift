@@ -3,19 +3,15 @@ import CryptoKit
 import Foundation
 import UIKit
 
-/// Foreground previews use disk or AVFoundation and then the player's decoder.
-/// The sole low-priority FFmpeg worker is reserved for bounded background
-/// indexing of remote MKV/HDR/DV streams unsupported by AVFoundation.
-/// Any interactive seek preempts background work; decoded frames are JPEG cached.
+/// Crash-safe previews use Apple's AVAssetImageGenerator rather than a
+/// second unmanaged FFmpeg decoder. The old FFmpeg path terminated tvOS on
+/// unrelated codecs and is intentionally NEVER invoked by this service.
+/// Unsupported formats fail gracefully; disk-cached previews remain intact.
 final class SeekFrameService {
     struct CacheStats {
         let slots: [Int]
         let writeMBPerSecond: Double
         let frameCount: Int
-        let backgroundAttempts: Int
-        let backgroundFailures: Int
-        let backgroundUnavailable: Bool
-        let lastBackgroundSeconds: Double
     }
 
     private struct Request {
@@ -23,7 +19,6 @@ final class SeekFrameService {
         let second: Int
         let prefetch: Bool
         let allowSystemDecode: Bool
-        let allowBackgroundFFmpeg: Bool
         let callback: ((UIImage?) -> Void)?
     }
 
@@ -44,10 +39,6 @@ final class SeekFrameService {
     // Keep older thumbnails readable while new frames live in Application Support.
     private var legacyScopedDirectory: URL?
     private var backgroundPrefetchUnavailable = false
-    private var backgroundFailures = 0
-    private var backgroundAttempts = 0
-    private var lastBackgroundSeconds = 0.0
-    private var backgroundFFmpeg: NuvioThumbnailDecoder?
     private var sourceKey: String?
     // Only the compressed JPEGs consume persistent disk; memory remains
     // bounded. These slot indices are loaded once and amended after writes.
@@ -90,18 +81,12 @@ final class SeekFrameService {
         legacyScopedDirectory = legacyRoot.appendingPathComponent(identity,
                                                                   isDirectory: true)
         backgroundPrefetchUnavailable = false
-        backgroundFailures = 0
-        backgroundAttempts = 0
-        lastBackgroundSeconds = 0
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         hotImages.removeAllObjects()
         let version = generation
         let oldDirectory = legacyScopedDirectory
         lock.unlock()
-        worker.async { [weak self] in
-            self?.backgroundFFmpeg?.reset()
-        }
         // Populate timeline coverage from this movie's previous sessions.
         // One directory scan, never one filesystem lookup per UI frame.
         diskReader.async { [weak self] in
@@ -141,11 +126,7 @@ final class SeekFrameService {
         let bytes = recentDiskWrites.reduce(0) { $0 + $1.bytes }
         let result = CacheStats(slots: Array(cachedSlots),
             writeMBPerSecond: Double(bytes) / 8_000_000.0,
-            frameCount: cachedSlots.count,
-            backgroundAttempts: backgroundAttempts,
-            backgroundFailures: backgroundFailures,
-            backgroundUnavailable: backgroundPrefetchUnavailable,
-            lastBackgroundSeconds: lastBackgroundSeconds)
+            frameCount: cachedSlots.count)
         lock.unlock()
         return result
     }
@@ -245,9 +226,6 @@ final class SeekFrameService {
         scopedDirectory = nil
         legacyScopedDirectory = nil
         backgroundPrefetchUnavailable = false
-        backgroundFailures = 0
-        backgroundAttempts = 0
-        lastBackgroundSeconds = 0
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         hotImages.removeAllObjects()
@@ -265,7 +243,7 @@ final class SeekFrameService {
         lock.lock()
         let request = Request(url: url, second: slot,
                               prefetch: false, allowSystemDecode: allowSystemDecode,
-                              allowBackgroundFFmpeg: false, callback: callback)
+                              callback: callback)
         pending = request
         // A foreground preview always supersedes any background decode.
         if activeWasBackground { activeToken?.cancelled = true }
@@ -273,17 +251,18 @@ final class SeekFrameService {
         lock.unlock()
     }
 
-    /// Generate one background slot for SDR, HDR, DV, MKV or MP4.
-    /// The serial worker never queues multiple background requests.
-    func prefetch(url: URL, second: Int, allowBackgroundFFmpeg: Bool = false) {
+    /// Opportunistically generate one thumbnail near playback. Uses the
+    /// same serial decoder and is always lower priority than user seeking.
+    func prefetch(url: URL, second: Int) {
+        // No second decoder for MKV/HDR/DV; caller enables this only for SDR.
+        guard ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased()) else { return }
         let slot = bucket(second)
         if hotImages.object(forKey: key(slot)) != nil { return }
         lock.lock()
-        if !backgroundPrefetchUnavailable, pending == nil,
-           pendingBackground == nil, !activeWasBackground {
+        if !backgroundPrefetchUnavailable, pending == nil, pendingBackground == nil {
             pendingBackground = Request(url: url, second: slot,
-                prefetch: true, allowSystemDecode: true,
-                allowBackgroundFFmpeg: allowBackgroundFFmpeg, callback: nil)
+                                        prefetch: true, allowSystemDecode: true,
+                                        callback: nil)
             scheduleWorkerLocked()
         }
         lock.unlock()
@@ -365,7 +344,6 @@ final class SeekFrameService {
             let cached = hotImages.object(forKey: key(job.second))
                 ?? currentDiskImage
                 ?? readDisk(slot: job.second, directory: legacyDirectory)
-            let started = Date()
             let decoded: UIImage?
             if let cached {
                 decoded = cached
@@ -374,37 +352,19 @@ final class SeekFrameService {
                 // never a competing AVFoundation 4K generator.
                 decoded = nil
             } else {
-                // Prefer Apple's decoder for MP4/MOV/HLS. The FFmpeg fallback
-                // is an explicitly enabled background-only worker for MKV
-                // and other supported formats. Never used during user seeking.
-                let native = appleFallback(url: job.url, second: job.second)
-                if native == nil, job.prefetch,
-                   job.allowBackgroundFFmpeg, !token.cancelled {
-                    if backgroundFFmpeg == nil {
-                        backgroundFFmpeg = NuvioThumbnailDecoder()
-                    }
-                    decoded = backgroundFFmpeg?.thumbnail(
-                        for: job.url, second: Int64(job.second),
-                        timeoutSeconds: 2.5, token: token)
-                } else {
-                    decoded = native
-                }
+                // Do NOT invoke FFmpeg. It previously decoded 4K streams
+                // independently of the main renderer and repeatedly caused
+                // app termination. System-backed decoding is limited to
+                // formats supported natively by AVFoundation.
+                decoded = appleFallback(url: job.url, second: job.second)
             }
 
             lock.lock()
             let valid = generation == version && !token.cancelled
             let foregroundWaiting = pending != nil
-            if valid, job.prefetch, cached == nil {
-                backgroundAttempts += 1
-                lastBackgroundSeconds = Date().timeIntervalSince(started)
-                if decoded == nil {
-                    backgroundFailures += 1
-                    // A transient HTTP failure is expected. Only stop
-                    // background indexing after three consecutive failures.
-                    if backgroundFailures >= 3 { backgroundPrefetchUnavailable = true }
-                } else {
-                    backgroundFailures = 0
-                }
+            if valid, job.prefetch, decoded == nil {
+                // Avoid repeating costly generator probes on unsupported sources.
+                backgroundPrefetchUnavailable = true
             }
             if activeToken === token { activeToken = nil }
             activeWasBackground = false

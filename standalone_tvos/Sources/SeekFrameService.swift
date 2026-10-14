@@ -18,6 +18,9 @@ final class SeekFrameService {
         let failedWrites: Int
         let missingDirectories: Int
         let diskBytes: Int64
+        let diskFrames: Int
+        let ramOnlyFrames: Int
+        let storageError: String
     }
 
     private struct Request {
@@ -60,6 +63,14 @@ final class SeekFrameService {
     private var failedWrites = 0
     private var missingDirectories = 0
     private var diskBytes: Int64 = 0
+    // JPEG-compressed RAM fallbacks stay seekable when tvOS rejects file IO.
+    // Unlike NSCache<UIImage>, this store has a strict 24 MiB byte budget
+    // and removes evicted slots from the reported coverage accurately.
+    private var compressedFrames: [Int: Data] = [:]
+    private var compressedOrder: [Int] = []
+    private var compressedBytes = 0
+    private let compressedLimit = 24 * 1_024 * 1_024
+    private var lastStorageError = ""
 
     init() {
         // RAM is bounded to protect playback; the persistent disk cache
@@ -106,6 +117,10 @@ final class SeekFrameService {
         failedWrites = 0
         missingDirectories = 0
         diskBytes = 0
+        compressedFrames.removeAll()
+        compressedOrder.removeAll()
+        compressedBytes = 0
+        lastStorageError = ""
         hotImages.removeAllObjects()
         let version = generation
         let oldDirectory = legacyScopedDirectory
@@ -147,22 +162,32 @@ final class SeekFrameService {
         let cutoff = Date().addingTimeInterval(-8)
         recentDiskWrites.removeAll { $0.date < cutoff }
         let bytes = recentDiskWrites.reduce(0) { $0 + $1.bytes }
-        let result = CacheStats(slots: Array(cachedSlots),
+        let coverage = cachedSlots.union(compressedFrames.keys)
+        let result = CacheStats(slots: Array(coverage),
             writeMBPerSecond: Double(bytes) / 8_000_000.0,
-            frameCount: cachedSlots.count,
+            frameCount: coverage.count,
             deliveredFrames: deliveredFrames,
             jpegEncodedFrames: jpegEncodedFrames,
             failedEncodes: failedEncodes,
             failedWrites: failedWrites,
             missingDirectories: missingDirectories,
-            diskBytes: diskBytes)
+            diskBytes: diskBytes,
+            diskFrames: cachedSlots.count,
+            ramOnlyFrames: coverage.count - cachedSlots.count,
+            storageError: lastStorageError)
         lock.unlock()
         return result
     }
 
     /// In-memory lookup is instantaneous for SDR, HDR and DV.
     func cachedImage(second: Int) -> UIImage? {
-        hotImages.object(forKey: key(second))
+        if let image = hotImages.object(forKey: key(second)) {
+            return image
+        }
+        lock.lock()
+        let compressed = compressedFrames[bucket(second)]
+        lock.unlock()
+        return compressed.flatMap(UIImage.init(data:))
     }
 
     /// Cache-only lookups never wait for the media decoder or a pause.
@@ -190,7 +215,7 @@ final class SeekFrameService {
                     && self.latestCacheLookup == lookup
                 self.lock.unlock()
                 if !stillCurrent { return }
-                if let image = self.hotImages.object(forKey: self.key(candidate))
+                if let image = self.cachedImage(second: candidate)
                     ?? self.readDisk(slot: candidate, directory: directory)
                     ?? self.readDisk(slot: candidate, directory: legacy) {
                     found = image
@@ -219,12 +244,13 @@ final class SeekFrameService {
     func cachePlaybackFrame(_ image: UIImage, second: Int) {
         let slot = bucket(second)
         lock.lock()
-        let directory = scopedDirectory
+        let primary = scopedDirectory
+        let fallback = legacyScopedDirectory
         let epoch = cacheEpoch
         deliveredFrames += 1
         lock.unlock()
 
-        // Immediate RAM availability for scrubbing, independent of disk IO.
+        // Make the decoded image usable immediately, even if disk is full.
         hotImages.setObject(image, forKey: key(slot),
             cost: max(1, Int(image.size.width * image.size.height * 4)))
 
@@ -232,60 +258,92 @@ final class SeekFrameService {
             guard let self else { return }
             self.lock.lock()
             let valid = self.cacheEpoch == epoch &&
-                self.scopedDirectory == directory
+                self.scopedDirectory == primary
             self.lock.unlock()
             guard valid else { return }
 
-            guard let directory else {
-                self.lock.lock()
-                self.missingDirectories += 1
-                self.lock.unlock()
-                NSLog("[NuvioCache] No active thumbnail directory")
-                return
-            }
-            let file = directory.appendingPathComponent("frame-\(slot).jpg")
-            let fm = FileManager.default
-            if fm.fileExists(atPath: file.path) {
-                // A thumbnail from an earlier session is already persistent.
-                self.lock.lock()
-                self.cachedSlots.insert(slot)
-                self.lock.unlock()
-                return
-            }
-
-            // Images from the frame tap are already small RGB CGImages.
-            // JPEG and disk writes occur outside the mpv render callback.
+            // One 720px frame every ~2sec. Keeping a 24MiB compressed RAM
+            // ring permits real cached thumbnails even if disk IO fails.
             guard let bytes = image.jpegData(compressionQuality: 0.78) else {
                 self.lock.lock()
                 self.failedEncodes += 1
                 self.lock.unlock()
-                NSLog("[NuvioCache] JPEG encoding failed for frame %d", slot)
+                NSLog("[NuvioCache] JPEG encoder rejected slot %d", slot)
                 return
             }
             self.lock.lock()
             self.jpegEncodedFrames += 1
-            self.lock.unlock()
-            do {
-                try fm.createDirectory(at: directory,
-                                       withIntermediateDirectories: true)
-                try bytes.write(to: file, options: .atomic)
-                self.lock.lock()
-                self.cachedSlots.insert(slot)
-                self.diskBytes += Int64(bytes.count)
-                let now = Date()
-                self.recentDiskWrites.append((date: now, bytes: bytes.count))
-                let cutoff = now.addingTimeInterval(-8)
-                self.recentDiskWrites.removeAll { $0.date < cutoff }
-                self.lock.unlock()
-                NSLog("[NuvioCache] Saved thumbnail frame %d (%d bytes)",
-                      slot, bytes.count)
-            } catch {
-                self.lock.lock()
-                self.failedWrites += 1
-                self.lock.unlock()
-                NSLog("[NuvioCache] Thumbnail disk write failed: %@",
-                      String(describing: error))
+            if self.compressedFrames[slot] == nil {
+                self.compressedFrames[slot] = bytes
+                self.compressedOrder.append(slot)
+                self.compressedBytes += bytes.count
+                while self.compressedBytes > self.compressedLimit,
+                      !self.compressedOrder.isEmpty {
+                    let oldest = self.compressedOrder.removeFirst()
+                    if let old = self.compressedFrames.removeValue(forKey: oldest) {
+                        self.compressedBytes -= old.count
+                    }
+                }
             }
+            self.lock.unlock()
+
+            let fm = FileManager.default
+            let locations = [primary, fallback].compactMap { $0 }
+            var storageError: NSError?
+            var stored = false
+
+            // Application Support is preferred for persistence. tvOS can
+            // refuse that path on a particular build; retry in Library/Caches
+            // which remains discoverable by our seeking and resume logic.
+            for directory in locations {
+                let file = directory.appendingPathComponent("frame-\(slot).jpg")
+                if fm.fileExists(atPath: file.path) {
+                    stored = true
+                    break
+                }
+                do {
+                    try fm.createDirectory(at: directory,
+                                           withIntermediateDirectories: true)
+                    do {
+                        try bytes.write(to: file, options: .atomic)
+                    } catch {
+                        // Some tvOS file providers reject temp-file rename
+                        // used by .atomic. Direct JPEG writes are tiny and
+                        // still preferable to discarding good preview data.
+                        try bytes.write(to: file, options: [])
+                    }
+                    stored = true
+                    break
+                } catch {
+                    storageError = error as NSError
+                    NSLog("[NuvioCache] JPEG write failed at %@: %@ (%d) %@",
+                          directory.lastPathComponent,
+                          storageError?.domain ?? "unknown",
+                          storageError?.code ?? -1,
+                          storageError?.localizedDescription ?? "unknown")
+                }
+            }
+            self.lock.lock()
+            if self.cacheEpoch == epoch {
+                if stored {
+                    let wasNew = self.cachedSlots.insert(slot).inserted
+                    if wasNew {
+                        self.diskBytes += Int64(bytes.count)
+                        let now = Date()
+                        self.recentDiskWrites.append((date: now, bytes: bytes.count))
+                        self.recentDiskWrites.removeAll {
+                            $0.date < now.addingTimeInterval(-8)
+                        }
+                    }
+                    self.lastStorageError = ""
+                } else {
+                    self.failedWrites += 1
+                    self.lastStorageError = storageError.map {
+                        "\($0.domain):\($0.code) \($0.localizedDescription)"
+                    } ?? "No writable preview cache directory"
+                }
+            }
+            self.lock.unlock()
         }
     }
 
@@ -324,6 +382,10 @@ final class SeekFrameService {
         failedWrites = 0
         missingDirectories = 0
         diskBytes = 0
+        compressedFrames.removeAll()
+        compressedOrder.removeAll()
+        compressedBytes = 0
+        lastStorageError = ""
         hotImages.removeAllObjects()
         lock.unlock()
         // Intentionally DO NOT delete stored previews.
@@ -332,7 +394,7 @@ final class SeekFrameService {
     func request(url: URL, second: Int, allowSystemDecode: Bool = true,
                  callback: @escaping (UIImage?) -> Void) {
         let slot = bucket(second)
-        if let cached = hotImages.object(forKey: key(slot)) {
+        if let cached = cachedImage(second: slot) {
             DispatchQueue.main.async { callback(cached) }
             return
         }
@@ -437,7 +499,7 @@ final class SeekFrameService {
             lock.unlock()
 
             let currentDiskImage = readDisk(slot: job.second, directory: directory)
-            let cached = hotImages.object(forKey: key(job.second))
+            let cached = cachedImage(second: job.second)
                 ?? currentDiskImage
                 ?? readDisk(slot: job.second, directory: legacyDirectory)
             let decoded: UIImage?

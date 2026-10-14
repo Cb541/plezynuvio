@@ -139,6 +139,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var colorContrast = 1.0
     private var sourceColorMetadataReady = false
     private var sourceIsHDR = true
+    private var sourceIsDolbyVision = false
+    // Explicit per-video opt-in: never auto-apply an experimental filter to
+    // Dolby Vision or HDR during startup or across separate movies.
+    private var experimentalHDRColorBoost = false
+    private var colorFilterInFlight = false
     private var colorFilterActive = false
     private var colorFilterOperation = 0
     private var colorFilterTimer: Timer?
@@ -219,6 +224,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let stretchLabel = UILabel()
     private let saturationLabel = UILabel()
     private let contrastLabel = UILabel()
+    private let hdrBoostLabel = UILabel()
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
     private let seekTimeLabel = UILabel()
@@ -355,7 +361,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             .map { min(1.40, max(0.70, $0)) } ?? 1.0
         sourceColorMetadataReady = false
         sourceIsHDR = true
+        sourceIsDolbyVision = false
+        experimentalHDRColorBoost = false
         colorFilterActive = false
+        colorFilterInFlight = false
         colorFilterFailed = false
         colorFilterOperation += 1
         colorFilterTimer?.invalidate()
@@ -844,7 +853,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
         addGlassBackdrop(to: picturePanel, radius: 18)
-        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel] {
+        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, hdrBoostLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
             label.textColor = .white
@@ -943,7 +952,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             contrastLabel.topAnchor.constraint(equalTo: saturationLabel.bottomAnchor, constant: 15),
             contrastLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             contrastLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            colorStatusLabel.topAnchor.constraint(equalTo: contrastLabel.bottomAnchor, constant: 18),
+            hdrBoostLabel.topAnchor.constraint(equalTo: contrastLabel.bottomAnchor, constant: 15),
+            hdrBoostLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            hdrBoostLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            colorStatusLabel.topAnchor.constraint(equalTo: hdrBoostLabel.bottomAnchor, constant: 15),
             colorStatusLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             colorStatusLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
             colorStatusLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -20),
@@ -1197,7 +1209,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .downArrow:
             if toolPanel == .picture {
-                selectedPictureControl = (selectedPictureControl + 1) % 4
+                selectedPictureControl = (selectedPictureControl + 1) % 5
                 updatePictureLabels()
                 showPanel()
             } else if toolPanel == .audio || toolPanel == .subtitles {

@@ -7,7 +7,9 @@ import UIKit
 /// visible image when a held Siri Remote button advances faster than a
 /// network GOP can be decoded.
 ///
-/// Never uploads video data or the signed media URL.
+/// Inspired by Cine's quick-keyframe seeking: decode the nearest usable
+/// random-access picture rather than making the preview renderer chase
+/// every intermediate frame. Video data and signed URLs remain on-device.
 final class SeekFrameService {
     private struct Request {
         let url: URL
@@ -82,7 +84,7 @@ final class SeekFrameService {
             lock.unlock()
 
             let decoded = decoder.thumbnail(for: request.url,
-                second: Int64(request.second), timeoutSeconds: 5.5, token: token)
+                second: Int64(request.second), timeoutSeconds: 4.0, token: token)
             let image = decoded ?? (token.cancelled ? nil
                 : appleFallback(url: request.url, second: request.second))
 
@@ -93,7 +95,7 @@ final class SeekFrameService {
                 cache[request.second] = image
                 cacheOrder.removeAll { $0 == request.second }
                 cacheOrder.append(request.second)
-                while cacheOrder.count > 64 {
+                while cacheOrder.count > 36 {
                     let oldest = cacheOrder.removeFirst()
                     cache.removeValue(forKey: oldest)
                 }
@@ -130,7 +132,7 @@ final class SeekFrameService {
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 360, height: 204)
+        generator.maximumSize = CGSize(width: 640, height: 360)
         generator.requestedTimeToleranceBefore = CMTime(seconds: 4, preferredTimescale: 600)
         generator.requestedTimeToleranceAfter = CMTime(seconds: 4, preferredTimescale: 600)
         guard let frame = try? generator.copyCGImage(

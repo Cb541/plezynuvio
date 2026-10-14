@@ -645,6 +645,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.playing = true
                     // Arm decoded-frame capture immediately when mpv begins
                     // playback. Do not wait for a UI chrome/clock refresh.
+                    NuvioFrameTapSetPaused(false)
                     NuvioFrameTapSetPlaybackSecond(Int64(max(0, core.timePos)))
                     PlayerStartupDiagnostics.mark("mpv-unpaused-after-display-switch")
                     // This is a startup breadcrumb, not a permanent error.
@@ -719,6 +720,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             case "pause":
                 if let n = value as? NSNumber { self.playing = !n.boolValue }
                 else if let s = value as? String { self.playing = s != "yes" }
+                // A paused renderer has no advancing movie clock. Stop
+                // extrapolating until mpv confirms normal playback again.
+                // UI timer ticks cannot inadvertently reactivate it.
+                NuvioFrameTapSetPaused(!self.playing)
+                if self.playing, let playingCore = self.core {
+                    NuvioFrameTapSetPlaybackSecond(
+                        Int64(max(0, playingCore.timePos)))
+                }
                 // This is the observed mpv state, rather than the optimistic
                 // pause intent cached as soon as setProperty was issued.
                 if self.playing {

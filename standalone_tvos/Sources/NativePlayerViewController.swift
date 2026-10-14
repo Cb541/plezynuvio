@@ -77,6 +77,39 @@ private final class PlayerToolGlyph: UIView {
     }
 }
 
+/// A thin white indicator of frames actually written to thumbnail disk cache.
+/// Keep this independent from the current-time progress fill: cached regions
+/// may be before or after the playhead.
+private final class CachedTimelineOverlay: UIView {
+    var durationSeconds = 0.0
+    var frameSlots: [Int] = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        isUserInteractionEnabled = false
+        contentMode = .redraw
+    }
+    required init?(coder: NSCoder) { return nil }
+
+    override func draw(_ rect: CGRect) {
+        guard durationSeconds > 0, rect.width > 0, !frameSlots.isEmpty else { return }
+        UIColor.white.withAlphaComponent(0.98).setFill()
+        let widthPerBucket = CGFloat(2.0 / durationSeconds) * rect.width
+        let tickWidth = max(1.3, widthPerBucket)
+        let coverage = UIBezierPath()
+        for second in frameSlots {
+            let start = CGFloat(Double(second) / durationSeconds) * rect.width
+            guard start >= 0, start < rect.width else { continue }
+            coverage.append(UIBezierPath(rect: CGRect(x: start, y: 0,
+                width: min(tickWidth, rect.width - start),
+                height: rect.height)))
+        }
+        coverage.fill()
+    }
+}
+
 /// Native TV player. The existing AVSampleBufferDisplayLayer/libmpv core owns
 /// hardware decoding, DV P7->P8.1 conversion and matching the HDMI output.
 /// UIView/CALayer transforms provide zoom + independent vertical stretch
@@ -233,6 +266,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let titleLabel = UILabel()
     private let statusLabel = UILabel()
     private let progress = UIProgressView(progressViewStyle: .default)
+    private let cachedTimeline = CachedTimelineOverlay()
+    private let cacheRateLabel = UILabel()
+    private var lastCacheUIUpdate = Date.distantPast
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
     private let filmStrip = UIStackView()
@@ -338,6 +374,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         touchpadPreviewMode = false
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
+        lastCacheUIUpdate = .distantPast
+        cachedTimeline.frameSlots = []
+        cachedTimeline.durationSeconds = 0
+        cachedTimeline.setNeedsDisplay()
+        cacheRateLabel.text = "CACHE 0.00 MB/s"
+        explicitChromeHidden = false
         lastCaptureDuration = 0
         backgroundCaptureFailures = 0
         lastPlaybackCapturedBucket = nil
@@ -786,11 +828,25 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         endLabel.textAlignment = .right
         panel.addSubview(currentLabel)
         panel.addSubview(endLabel)
-        progress.progressTintColor = .white
-        progress.trackTintColor = UIColor.white.withAlphaComponent(0.35)
+        // Blue = played portion, white = actual saved thumbnail frames.
+        progress.progressTintColor = UIColor(red: 0.36, green: 0.72,
+                                             blue: 1.0, alpha: 1)
+        progress.trackTintColor = UIColor.white.withAlphaComponent(0.25)
         progress.layer.cornerRadius = 2
         progress.clipsToBounds = true
         panel.addSubview(progress)
+        cachedTimeline.translatesAutoresizingMaskIntoConstraints = false
+        cachedTimeline.layer.cornerRadius = 2
+        cachedTimeline.clipsToBounds = true
+        panel.addSubview(cachedTimeline)
+        cacheRateLabel.translatesAutoresizingMaskIntoConstraints = false
+        cacheRateLabel.text = "CACHE 0.00 MB/s"
+        cacheRateLabel.textColor = UIColor.white.withAlphaComponent(0.88)
+        cacheRateLabel.font = .monospacedDigitSystemFont(
+            ofSize: 15, weight: .medium)
+        cacheRateLabel.textAlignment = .right
+        cacheRateLabel.isUserInteractionEnabled = false
+        panel.addSubview(cacheRateLabel)
 
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.axis = .horizontal
@@ -961,6 +1017,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             progress.trailingAnchor.constraint(equalTo: endLabel.leadingAnchor, constant: -12),
             progress.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             progress.heightAnchor.constraint(equalToConstant: 5),
+            cachedTimeline.leadingAnchor.constraint(equalTo: progress.leadingAnchor),
+            cachedTimeline.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
+            cachedTimeline.centerYAnchor.constraint(equalTo: progress.centerYAnchor),
+            cachedTimeline.heightAnchor.constraint(equalTo: progress.heightAnchor),
+            cacheRateLabel.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
+            cacheRateLabel.bottomAnchor.constraint(equalTo: progress.topAnchor, constant: -5),
+            cacheRateLabel.widthAnchor.constraint(equalToConstant: 200),
+            cacheRateLabel.heightAnchor.constraint(equalToConstant: 18),
             endLabel.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -17),
             endLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             endLabel.widthAnchor.constraint(equalToConstant: 105),
@@ -1410,6 +1474,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     func remoteBegan(_ key: UIPress.PressType) {
+        // User navigation explicitly reopens chrome after a committed seek.
+        // The select that confirms a preview sets this back to true below.
+        if key == .upArrow || key == .downArrow || key == .playPause {
+            explicitChromeHidden = false
+        }
         switch key {
         case .leftArrow, .rightArrow:
             let direction = key == .rightArrow ? 1 : -1
@@ -1466,16 +1535,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 chooseSelectedTrack()
             } else if toolPanel == .info {
                 closeToolPanel()
-            } else if toolbarFocused {
-                openToolbarSelection()
             } else if lockedSeekDirection != 0 {
+                // Seek confirmation outranks toolbar focus on the same click.
                 finishLockedSeek(commit: true)
             } else if targetSeconds != nil {
-                // Preserve whichever playback state existed before seeking.
                 let shouldResume = resumeAfterLockedSeek
                 resumeAfterLockedSeek = false
-                commitSeek(resumeAfter: shouldResume)
+                commitSeek(resumeAfter: shouldResume, closeChrome: true)
+            } else if toolbarFocused {
+                explicitChromeHidden = false
+                openToolbarSelection()
             } else {
+                explicitChromeHidden = false
                 togglePlayback()
             }
         case .playPause:
@@ -1605,14 +1676,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let restorePlayback = resumeAfterLockedSeek
         if commit {
             resumeAfterLockedSeek = false
-            commitSeek(resumeAfter: resumeWhenCommitted ?? restorePlayback)
+            commitSeek(resumeAfter: resumeWhenCommitted ?? restorePlayback,
+                       closeChrome: true)
         } else {
-            // cancelUncommittedScrub restores the original mpv position
-            // BEFORE resuming, instead of briefly playing the preview frame.
+            // Canceling restores the original position; hide after cancelling.
             resumeAfterLockedSeek = restorePlayback
             cancelUncommittedScrub()
+            showPanel()
         }
-        showPanel()
     }
 
     private func silentSkip(_ direction: Int) {
@@ -1798,6 +1869,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func hidePlaybackChrome() {
+        explicitChromeHidden = true
         hideTimer?.invalidate()
         toolbarFocused = false
         controlsVisible = false
@@ -2129,6 +2201,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func togglePlayback() {
         guard let core else { return }
+        explicitChromeHidden = false
         if waitingForFirstFrame {
             // Deliberate user override for sources that never report a frame.
             waitingForFirstFrame = false
@@ -2161,7 +2234,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
-    private func commitSeek(resumeAfter: Bool = false, retainPreview: Bool = false) {
+    private func commitSeek(resumeAfter: Bool = false,
+                            retainPreview: Bool = false,
+                            closeChrome: Bool = false) {
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         guard let seconds = targetSeconds, let seekCore = core else { return }
@@ -2203,6 +2278,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if retainPreview {
             PlayerStartupDiagnostics.mark("touchpad-seek-commit")
         }
+        if closeChrome {
+            // Hide before async seek callbacks: they must not reopen controls.
+            explicitChromeHidden = true
+            toolbarFocused = false
+            toolPanel = .none
+            picturePanel.isHidden = true
+            trackPanel.isHidden = true
+            hideTimer?.invalidate()
+        }
         showPanel()
 
         // Never overlap an FFmpeg thumbnail decode with the main mpv seek.
@@ -2233,6 +2317,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func scheduleFrames() {
         guard let seconds = targetSeconds else { return }
+        explicitChromeHidden = false
         previewIsVisible = true
         filmStrip.alpha = 1
         previewLoadingLabel.isHidden = true
@@ -2666,6 +2751,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func showPanel() {
         hideTimer?.invalidate()
+        if explicitChromeHidden, core != nil {
+            controlsVisible = false
+            panel.isHidden = true
+            progress.isHidden = true
+            cachedTimeline.isHidden = true
+            cacheRateLabel.isHidden = true
+            currentLabel.isHidden = true
+            endLabel.isHidden = true
+            statusLabel.isHidden = true
+            return
+        }
         let hasPlayerControls = core != nil && (
             !playing || lockedSeekDirection != 0 ||
             isTouchScrubbing || targetSeconds != nil ||
@@ -2679,6 +2775,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         controlsVisible = hasPlayerControls
         panel.isHidden = !hasPlayerControls
         progress.isHidden = !showTimeline
+        cachedTimeline.isHidden = !showTimeline
+        cacheRateLabel.isHidden = !showTimeline
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
@@ -2791,6 +2889,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             thumbs.prefetch(url: media.url, second: second)
         }
         refreshLabels()
+        // Update the disk-write rate and covered sections once a second.
+        // This measures saved JPEG bytes, not video download throughput.
+        if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
+            lastCacheUIUpdate = Date()
+            let stats = thumbs.cacheStats()
+            cacheRateLabel.text = String(format: "CACHE %.2f MB/s",
+                                          stats.writeMBPerSecond)
+            cachedTimeline.durationSeconds = totalSeconds
+            cachedTimeline.frameSlots = stats.slots
+            cachedTimeline.setNeedsDisplay()
+        }
     }
 
     /// Keep the center of the thumbnail above the progress playhead.

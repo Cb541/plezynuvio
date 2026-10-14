@@ -954,16 +954,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             // 15% larger overall, plus another 5% horizontal extension.
             // Width: 432 × 1.15 × 1.05 ≈ 522; height: 245 × 1.15 ≈ 282.
-            // Keep the bottom edge at 26% above screen bottom.
+            // Keep the bottom edge at 30% above screen bottom.
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
             filmStrip.heightAnchor.constraint(equalToConstant: 282),
             movableThumbnailX,
-            // The BOTTOM EDGE of the thumbnail is 26% UP from screen
-            // bottom (74% down from top). The picture extends ABOVE
-            // this line; do NOT center the picture on the 25% boundary.
+            // The BOTTOM EDGE of the thumbnail is 30% UP from screen
+            // bottom (70% down from top). The picture extends ABOVE
+            // this line while following the playback progress horizontally.
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
-                multiplier: 0.74, constant: 0),
+                multiplier: 0.70, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),

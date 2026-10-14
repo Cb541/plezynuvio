@@ -939,12 +939,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .playPause:
             if toolPanel == .none {
-                if lockedSeekDirection != 0 {
-                    // Play commits this thumbnail target and resumes. Do not
-                    // immediately toggle back to Pause after seeking.
-                    finishLockedSeek(commit: true, resumeWhenCommitted: true)
-                } else if targetSeconds != nil {
-                    // Explicit preview confirmation is reserved for Select.
+                if previewIsVisible || targetSeconds != nil || lockedSeekDirection != 0 {
+                    // Only the center Select button confirms preview seeking.
+                    // Play/Pause must not silently commit or dismiss it.
                     showPanel()
                 } else {
                     togglePlayback()

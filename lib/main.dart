@@ -80,6 +80,7 @@ import 'database/download_operations.dart';
 import 'database/tvos_database_recovery_store.dart';
 import 'screens/video_player_screen.dart';
 import 'screens/nuvio_stream_player_screen.dart';
+import 'screens/nuvio_external_player_app.dart';
 import 'services/nuvio_stream_link.dart';
 import 'utils/video_player_navigation.dart';
 import 'utils/app_logger.dart';
@@ -158,6 +159,10 @@ void main() {
   // target in Flutter's tool), so register platform stores manually for
   // the plugins we use.
   _registerTvosPlatformPlugins();
+  if (PlatformDetector.isAppleTV()) {
+    runApp(const NuvioExternalPlayerApp());
+    return;
+  }
   _bootstrapApp();
 }
 

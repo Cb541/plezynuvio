@@ -1,4 +1,4 @@
-name: Build Plezy Nuvio tvOS IPA
+name: Build Nuvio External Player tvOS IPA
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
     branches:
       - nuvio-direct-stream-tvos
       - nuvio-on-demand-thumbnails-tvos
+      - nuvio-external-player-tv
 
 permissions:
   contents: read
@@ -37,7 +38,7 @@ jobs:
         run: flutter test --no-pub test/services/nuvio_seek_thumbnails_test.dart
 
       - name: Analyze changed Dart integration
-        run: dart analyze lib/services/nuvio_stream_link.dart lib/services/nuvio_seek_thumbnails.dart lib/screens/nuvio_stream_player_screen.dart lib/main.dart
+        run: dart analyze lib/services/nuvio_stream_link.dart lib/services/nuvio_seek_thumbnails.dart lib/screens/nuvio_stream_player_screen.dart lib/screens/nuvio_external_player_app.dart lib/main.dart
 
       - name: Prepare verified tvOS Flutter engine
         run: bash tvos/scripts/fetch_engine.sh
@@ -59,14 +60,14 @@ jobs:
             -configuration Release \
             -sdk appletvos \
             -destination 'generic/platform=tvOS' \
-            -archivePath "$PWD/build/PlezyNuvio.xcarchive" \
+            -archivePath "$PWD/build/NuvioPlayer.xcarchive" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
 
       - name: Package unsigned Plezy IPA
         run: |
-          APP="$(find "$PWD/build/PlezyNuvio.xcarchive/Products/Applications" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          APP="$(find "$PWD/build/NuvioPlayer.xcarchive/Products/Applications" -maxdepth 1 -type d -name '*.app' | head -n 1)"
           if [ -z "$APP" ]; then
             echo "No app found in tvOS archive" >&2
             exit 1
@@ -74,13 +75,13 @@ jobs:
           mkdir -p "$PWD/build/plezy-ipa/Payload"
           cp -R "$APP" "$PWD/build/plezy-ipa/Payload/"
           cd "$PWD/build/plezy-ipa"
-          zip -qry Plezy-Nuvio-tvOS-unsigned.ipa Payload
-          test -f Plezy-Nuvio-tvOS-unsigned.ipa
+          zip -qry NuvioPlayer-tvOS-unsigned.ipa Payload
+          test -f NuvioPlayer-tvOS-unsigned.ipa
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Plezy-Nuvio-tvOS-unsigned
-          path: build/plezy-ipa/Plezy-Nuvio-tvOS-unsigned.ipa
+          name: NuvioPlayer-tvOS-unsigned
+          path: build/plezy-ipa/NuvioPlayer-tvOS-unsigned.ipa
           retention-days: 30
           if-no-files-found: error

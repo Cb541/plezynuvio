@@ -25,7 +25,7 @@ final class NuvioStreamLink {
 
   static NuvioStreamLink? tryParse(String text) {
     final uri = Uri.tryParse(text);
-    if (uri == null || uri.scheme != 'plezy' || uri.host != 'stream') return null;
+    if (uri == null || !{'plezy', 'nuvio-player'}.contains(uri.scheme) || uri.host != 'stream') return null;
 
     final stream = uri.queryParameters['url'];
     if (!_isHttpUrl(stream)) return null;

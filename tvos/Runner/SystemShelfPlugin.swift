@@ -360,7 +360,8 @@ import TVServices
     }
 
     private static func externalStreamPayload(from url: URL) -> String? {
-      guard url.scheme?.lowercased() == "plezy", url.host?.lowercased() == "stream",
+      guard ["plezy", "nuvio-player"].contains(url.scheme?.lowercased() ?? ""),
+        url.host?.lowercased() == "stream",
         let media = URLComponents(url: url, resolvingAgainstBaseURL: false)?
           .queryItems?.first(where: { $0.name == "url" })?.value,
         let remote = URL(string: media),

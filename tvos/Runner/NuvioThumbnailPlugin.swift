@@ -75,7 +75,7 @@ final class NuvioThumbnailPlugin: NSObject, FlutterPlugin {
       ("sid", "no"),
       ("hwdec", "no"),
       ("vo", "image"),
-      ("vo-image-format", "jpg"),
+      ("vo-image-format", "jpeg"),
       ("vo-image-jpeg-quality", "68"),
       ("vo-image-outdir", folder.path),
       ("frames", "1"),
@@ -111,7 +111,7 @@ final class NuvioThumbnailPlugin: NSObject, FlutterPlugin {
       let event = mpv_wait_event(context, 0.15)
       if let file = try? FileManager.default.contentsOfDirectory(
         at: folder, includingPropertiesForKeys: nil
-      ).first(where: { $0.pathExtension.lowercased() == "jpg" }),
+      ).first(where: { $0.pathExtension.lowercased() == "jpeg" || $0.pathExtension.lowercased() == "jpg" }),
          let image = reducedJPEG(at: file) {
         return image
       }

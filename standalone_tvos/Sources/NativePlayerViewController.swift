@@ -1,4 +1,5 @@
 import AVFoundation
+import ImageIO
 import QuartzCore
 import UIKit
 
@@ -167,6 +168,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var committedSeekDate: Date?
     private var previewHideTimer: Timer?
     private var previewIsVisible = false
+    // Reuse the single native mpv decoder for non-AVFoundation formats.
+    // A screenshot of the original position stays over the movie while
+    // the main decoder briefly visits the independently selected target.
+    private let frozenVideo = UIImageView()
+    private var mainFramePreviewOrigin: Double?
+    private var mainFramePreviewBusy = false
+    private var mainFramePreviewAwaitingSeek = false
+    private var mainFramePreviewTarget: Int?
+    private var mainFramePreviewPending: Int?
+    private var mainFramePreviewGeneration = 0
+    private var mainFramePreviewUnsupported = false
+    private var mainFramePreviewRestoreTarget: Double?
+    private var mainFramePreviewResumeAfterRestore = false
     private let toolbar = UIStackView()
     private var toolbarButtons: [PlayerToolGlyph] = []
     private let trackPanel = UIView()
@@ -268,6 +282,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lastLiveTouchpadRequest = .distantPast
         lastBackgroundPreviewAttempt = .distantPast
         lastConfirmedPauseAt = nil
+        mainFramePreviewOrigin = nil
+        mainFramePreviewBusy = false
+        mainFramePreviewAwaitingSeek = false
+        mainFramePreviewTarget = nil
+        mainFramePreviewPending = nil
+        mainFramePreviewGeneration += 1
+        mainFramePreviewUnsupported = false
+        mainFramePreviewRestoreTarget = nil
+        frozenVideo.isHidden = true
+        frozenVideo.image = nil
         circularSeekActive = false
         panStartedWhilePlaying = false
         hasSelectedPreferredAudio = false
@@ -537,6 +561,25 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 PlayerStartupDiagnostics.mark("mpv-file-loaded-paused")
                 self.statusLabel.text = "Video loaded; waiting for first frame…"
             case "playback-restart":
+                // Native single-decoder preview frame is now ready. Do not
+                // pull an image before mpv has actually decoded the target.
+                if self.mainFramePreviewAwaitingSeek,
+                   let target = self.mainFramePreviewTarget {
+                    let measured = (data?["positionSeconds"] as? NSNumber)?.doubleValue
+                        ?? self.core?.timePos ?? -1
+                    if measured.isFinite && abs(measured - Double(target)) <= 5 {
+                        self.mainFramePreviewAwaitingSeek = false
+                        self.captureNativePreviewTarget(target,
+                            generation: self.mainFramePreviewGeneration)
+                    }
+                }
+                if let restore = self.mainFramePreviewRestoreTarget {
+                    let measured = (data?["positionSeconds"] as? NSNumber)?.doubleValue
+                        ?? self.core?.timePos ?? -1
+                    if measured.isFinite && abs(measured - restore) <= 5 {
+                        self.finishNativePreviewRestore()
+                    }
+                }
                 // MPV only emits playback-restart after it has decoded at
                 // the new position. It is the authoritative point to release
                 // our temporary seek pin, even with a nearby keyframe seek.
@@ -596,6 +639,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         remote.backgroundColor = .clear
         remote.receiver = self
         view.addSubview(remote)
+
+        // Covers the actual video only while taking previews through mpv.
+        // The unchanged movie frame stays visible behind the scrub UI.
+        frozenVideo.frame = view.bounds
+        frozenVideo.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        frozenVideo.contentMode = .scaleAspectFit
+        frozenVideo.backgroundColor = .black
+        frozenVideo.isUserInteractionEnabled = false
+        frozenVideo.isHidden = true
+        view.insertSubview(frozenVideo, aboveSubview: remote)
 
         idleLabel.translatesAutoresizingMaskIntoConstraints = false
         idleLabel.text = "NUVIO PLAYER\n\nChoose a stream in Nuvio"
@@ -1318,16 +1371,44 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         panStartedWhilePlaying = false
         let shouldResume = resumeAfterLockedSeek
         resumeAfterLockedSeek = false
-        stopShowingThumbnail()
+        let wasUsingMainDecoder = mainFramePreviewOrigin != nil
+        stopShowingThumbnail(resumeAfterRestore: shouldResume)
         PlayerStartupDiagnostics.clear()
-        if shouldResume {
+        if shouldResume && !wasUsingMainDecoder {
             core?.setProperty("pause", value: "no")
             playing = true
         }
         refreshLabels()
     }
 
-    private func stopShowingThumbnail() {
+    private func stopShowingThumbnail(restoreMain: Bool = true,
+                                      resumeAfterRestore: Bool = false) {
+        mainFramePreviewGeneration += 1
+        mainFramePreviewBusy = false
+        mainFramePreviewAwaitingSeek = false
+        mainFramePreviewPending = nil
+        mainFramePreviewTarget = nil
+        let origin = mainFramePreviewOrigin
+        mainFramePreviewOrigin = nil
+        if restoreMain, let origin, let playbackCore = core {
+            mainFramePreviewRestoreTarget = origin
+            mainFramePreviewResumeAfterRestore = resumeAfterRestore
+            playbackCore.commandAsync(["seek",
+                String(format: "%.3f", origin), "absolute"]) { [weak self] _ in
+                // If the backend doesn't publish a playback-restart, never
+                // trap the user behind a frozen frame indefinitely.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                    guard let self,
+                          self.mainFramePreviewRestoreTarget == origin else { return }
+                    self.finishNativePreviewRestore()
+                }
+            }
+        } else if !restoreMain {
+            // Commit seeks retain the cover until the selected frame appears.
+        } else {
+            frozenVideo.isHidden = true
+            frozenVideo.image = nil
+        }
         touchpadPreviewMode = false
         thumbTimer?.invalidate()
         thumbTimer = nil
@@ -1661,10 +1742,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             previewHideTimer?.invalidate()
             previewHideTimer = Timer.scheduledTimer(withTimeInterval: 1.1,
                 repeats: false) { [weak self] _ in
-                self?.stopShowingThumbnail()
+                self?.stopShowingThumbnail(restoreMain: false)
             }
         } else {
-            stopShowingThumbnail()
+            stopShowingThumbnail(restoreMain: false)
+        }
+        if frozenVideo.image != nil && !frozenVideo.isHidden {
+            mainFramePreviewRestoreTarget = seconds
+            mainFramePreviewResumeAfterRestore = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+                guard let self, self.mainFramePreviewRestoreTarget == seconds else { return }
+                self.finishNativePreviewRestore()
+            }
         }
         if retainPreview {
             PlayerStartupDiagnostics.mark("touchpad-seek-commit")
@@ -1786,8 +1875,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 // A failed position must not be permanently blacklisted.
                 // Revisit it after a later touch movement (e.g. another
                 // seek region or once a remote connection is ready).
-                self.lastPreviewRequestedBucket = nil
-                PlayerStartupDiagnostics.mark("thumbnail-decoder-returned-no-frame")
+                // AVFoundation cannot demux Matroska and several other
+                // formats. Use the EXISTING mpv decoder for uncached
+                // targets, with a frozen original frame over the movie.
+                self.requestNativePreviewTarget(bucket, serial: serial)
+                PlayerStartupDiagnostics.mark("thumbnail-native-fallback-request")
             }
             self.previewLoadingLabel.isHidden = true
             self.previewStatusLabel.isHidden = true

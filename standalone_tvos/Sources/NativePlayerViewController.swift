@@ -796,12 +796,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             filmStrip.widthAnchor.constraint(equalToConstant: 432),
             filmStrip.heightAnchor.constraint(equalToConstant: 245),
             filmStrip.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            // Top boundary of the FIRST (bottommost) quarter:
-            // place the thumbnail center at 75% down from the TOP,
-            // or 25% UP from the BOTTOM. Keep it clear of timeline.
-            NSLayoutConstraint(item: filmStrip, attribute: .centerY,
+            // The BOTTOM EDGE of the thumbnail is 26% UP from screen
+            // bottom (74% down from top). The picture extends ABOVE
+            // this line; do NOT center the picture on the 25% boundary.
+            NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
-                multiplier: 0.75, constant: 0),
+                multiplier: 0.74, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -1892,20 +1892,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
-        // Progressively fill the on-device, uncapped disk cache while
-        // playback runs. One low-priority preview about every 18 seconds,
-        // slightly ahead of the playhead, not a parallel decoder flood.
-        // Foreground seeking cancels/deprioritizes these requests.
-        if playing, core?.isPaused == false, !isPreparingPlayback,
-           !waitingForFirstFrame, !displayNegotiationPending,
-           lockedSeekDirection == 0, !isTouchScrubbing,
-           !previewIsVisible, targetSeconds == nil,
-           let link, totalSeconds > 0, currentSeconds.isFinite,
-           Date().timeIntervalSince(lastBackgroundPreviewAttempt) >= 18 {
-            lastBackgroundPreviewAttempt = Date()
-            let next = max(0, min(totalSeconds - 0.25, currentSeconds + 9))
-            thumbs.prefetch(url: link.url, second: Int(next))
-        }
+        // SAFETY: Background *software decoding* during playback caused
+        // competing video decoders and likely tvOS memory termination.
+        // Keep the uncapped on-disk cache of previews already generated,
+        // but never launch a second FFmpeg decoder during active playback.
+        // Playback frame capture requires a separate renderer-based path.
         refreshLabels()
     }
 

@@ -11,16 +11,13 @@ BRANCH = "standalone-native-tvos-player"
 DEST = "standalone_tvos/AppIconSource.png"
 BASE = "repos/" + REPO + "/contents/" + DEST
 folder = Path.home() / "Downloads"
-candidates = [
-    *folder.glob("*neon*play*icon*.png"),
-    *folder.glob("*neon*glass*.png"),
-    *folder.glob("glossy*play*icon*.png"),
-]
-candidates = sorted(set(p for p in candidates if p.is_file()),
-                    key=lambda p: p.stat().st_mtime, reverse=True)
-if not candidates:
-    sys.exit("No approved Nuvio PNG found in ~/Downloads. Download the image from ChatGPT first.")
-src = candidates[0]
+# The user approved this specific image after removing the gray top-left panel.
+# Require its filename instead of silently uploading an older mockup.
+src = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else folder / "neon_blue_glass_play_icon.png"
+if not src.is_file():
+    sys.exit(f"Approved icon not found: {src}. Download neon_blue_glass_play_icon.png to ~/Downloads or pass its path.")
+if src.suffix.lower() != ".png":
+    sys.exit("The app icon source must be a PNG.")
 print("Uploading:", src)
 check = subprocess.run(["gh", "api", BASE + "?ref=" + BRANCH],
                        capture_output=True, text=True)

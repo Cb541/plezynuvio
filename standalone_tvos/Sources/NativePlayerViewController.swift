@@ -20,6 +20,61 @@ private final class RemoteSurface: UIView {
     }
 }
 
+/// Canvas-drawn transport symbols remain visible on sideloaded tvOS,
+/// without depending on UIButton-disabled imagery or SF Symbol fonts.
+private final class PlayerToolGlyph: UIView {
+    enum Kind { case waveform, subtitles, info }
+    let kind: Kind
+    init(kind: Kind) {
+        self.kind = kind
+        super.init(frame: .zero)
+        backgroundColor = .clear
+        isOpaque = false
+        isUserInteractionEnabled = false
+    }
+    required init?(coder: NSCoder) { return nil }
+    override func draw(_ rect: CGRect) {
+        let context = UIGraphicsGetCurrentContext()
+        context?.saveGState()
+        context?.translateBy(x: rect.midX - 20, y: rect.midY - 20)
+        UIColor.white.setFill()
+        UIColor.white.setStroke()
+        switch kind {
+        case .waveform:
+            for (index, height) in [12, 22, 32, 22, 12].enumerated() {
+                let h = CGFloat(height)
+                UIBezierPath(roundedRect: CGRect(x: CGFloat(4 + index * 7),
+                    y: 20 - h / 2, width: 4.5, height: h),
+                    cornerRadius: 2.25).fill()
+            }
+        case .subtitles:
+            let outline = UIBezierPath(roundedRect: CGRect(x: 3, y: 7, width: 34, height: 26),
+                                       cornerRadius: 4)
+            outline.lineWidth = 2.8
+            outline.stroke()
+            let lines = UIBezierPath()
+            lines.move(to: CGPoint(x: 9, y: 18))
+            lines.addLine(to: CGPoint(x: 18, y: 18))
+            lines.move(to: CGPoint(x: 23, y: 18))
+            lines.addLine(to: CGPoint(x: 31, y: 18))
+            lines.move(to: CGPoint(x: 9, y: 25))
+            lines.addLine(to: CGPoint(x: 22, y: 25))
+            lines.move(to: CGPoint(x: 27, y: 25))
+            lines.addLine(to: CGPoint(x: 31, y: 25))
+            lines.lineWidth = 2.8
+            lines.stroke()
+        case .info:
+            let ring = UIBezierPath(ovalIn: CGRect(x: 4, y: 4, width: 32, height: 32))
+            ring.lineWidth = 2.8
+            ring.stroke()
+            UIBezierPath(ovalIn: CGRect(x: 18, y: 11, width: 4, height: 4)).fill()
+            UIBezierPath(roundedRect: CGRect(x: 18.3, y: 19, width: 3.5, height: 11),
+                         cornerRadius: 1.7).fill()
+        }
+        context?.restoreGState()
+    }
+}
+
 /// Native TV player. The existing AVSampleBufferDisplayLayer/libmpv core owns
 /// hardware decoding, DV P7->P8.1 conversion and matching the HDMI output.
 /// UIView/CALayer transforms provide zoom + independent vertical stretch
@@ -84,7 +139,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var previewHideTimer: Timer?
     private var previewIsVisible = false
     private let toolbar = UIStackView()
-    private var toolbarButtons: [UILabel] = []
+    private var toolbarButtons: [PlayerToolGlyph] = []
     private let trackPanel = UIView()
     private let trackTitle = UILabel()
     private var trackLabels: [UILabel] = []
@@ -501,44 +556,38 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.axis = .horizontal
         toolbar.alignment = .center
-        toolbar.spacing = 12
+        toolbar.spacing = 11
         toolbar.distribution = .fill
         // Text-based controls are intentionally used rather than SF Symbols:
         // the assetless sideloaded tvOS app returned nil for some of the
         // requested system icons, leaving three invisible buttons.
-        // The older disabled UIButton instances were rendered blank on
-        // sideloaded tvOS. Real UILabel glyphs are always visible and do not
-        // depend on symbol-font availability or focus behavior.
-        for (name, caption, width) in [
-            ("Audio", "♫  AUDIO", 121.0),
-            ("Subtitles", "▣  CC", 88.0),
-            ("Info", "ⓘ  INFO", 106.0)
+        // Circles use genuine Liquid Glass; each symbol is drawn with a
+        // vector path so tvOS cannot silently omit the icon.
+        for (name, kind) in [
+            ("Audio", PlayerToolGlyph.Kind.waveform),
+            ("Subtitles", .subtitles),
+            ("Info", .info)
         ] {
-            let capsule = UIView()
-            capsule.translatesAutoresizingMaskIntoConstraints = false
-            capsule.layer.cornerRadius = 21
-            capsule.clipsToBounds = true
-            addGlassBackdrop(to: capsule, radius: 21)
-            let label = UILabel()
-            label.translatesAutoresizingMaskIntoConstraints = false
-            label.text = caption
-            label.textAlignment = .center
-            label.font = .systemFont(ofSize: 20, weight: .semibold)
-            label.textColor = .white
-            label.adjustsFontSizeToFitWidth = true
-            label.minimumScaleFactor = 0.78
-            label.accessibilityLabel = name
-            capsule.addSubview(label)
+            let circle = UIView()
+            circle.translatesAutoresizingMaskIntoConstraints = false
+            circle.layer.cornerRadius = 29
+            circle.clipsToBounds = true
+            circle.isUserInteractionEnabled = false
+            addGlassBackdrop(to: circle, radius: 29)
+            let glyph = PlayerToolGlyph(kind: kind)
+            glyph.translatesAutoresizingMaskIntoConstraints = false
+            glyph.accessibilityLabel = name
+            circle.addSubview(glyph)
             NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: capsule.leadingAnchor, constant: 9),
-                label.trailingAnchor.constraint(equalTo: capsule.trailingAnchor, constant: -9),
-                label.topAnchor.constraint(equalTo: capsule.topAnchor),
-                label.bottomAnchor.constraint(equalTo: capsule.bottomAnchor),
-                capsule.widthAnchor.constraint(equalToConstant: width),
-                capsule.heightAnchor.constraint(equalToConstant: 51)
+                glyph.centerXAnchor.constraint(equalTo: circle.centerXAnchor),
+                glyph.centerYAnchor.constraint(equalTo: circle.centerYAnchor),
+                glyph.widthAnchor.constraint(equalToConstant: 40),
+                glyph.heightAnchor.constraint(equalToConstant: 40),
+                circle.widthAnchor.constraint(equalToConstant: 58),
+                circle.heightAnchor.constraint(equalToConstant: 58)
             ])
-            toolbarButtons.append(label)
-            toolbar.addArrangedSubview(capsule)
+            toolbarButtons.append(glyph)
+            toolbar.addArrangedSubview(circle)
         }
         panel.addSubview(toolbar)
 
@@ -712,14 +761,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func updateToolbarFocus() {
-        for (index, label) in toolbarButtons.enumerated() {
+        for (index, icon) in toolbarButtons.enumerated() {
             let selected = toolbarFocused && toolPanel == .none && index == toolbarIndex
-            label.superview?.layer.borderWidth = selected ? 2.4 : 0
-            label.superview?.layer.borderColor = UIColor.white.withAlphaComponent(0.95).cgColor
-            label.superview?.backgroundColor = selected
+            icon.superview?.layer.borderWidth = selected ? 2.4 : 0
+            icon.superview?.layer.borderColor = UIColor.white.withAlphaComponent(0.95).cgColor
+            icon.superview?.backgroundColor = selected
                 ? UIColor.white.withAlphaComponent(0.17)
                 : .clear
-            label.textColor = .white
         }
     }
 

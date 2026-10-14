@@ -33,7 +33,7 @@ jobs:
         run: flutter test --no-pub test/services/nuvio_stream_link_test.dart
 
       - name: Analyze changed Dart integration
-        run: dart analyze lib/services/nuvio_stream_link.dart lib/screens/nuvio_stream_player_screen.dart lib/screens/main_screen.dart
+        run: dart analyze lib/services/nuvio_stream_link.dart lib/screens/nuvio_stream_player_screen.dart lib/main.dart
 
       - name: Prepare verified tvOS Flutter engine
         run: bash tvos/scripts/fetch_engine.sh

@@ -599,7 +599,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             case "file-loaded":
                 PlayerStartupDiagnostics.mark("mpv-file-loaded-paused")
                 self.statusLabel.text = "Video loaded; waiting for first frame…"
-                self.checkColorSourceMetadata()
+                // Read color metadata only after playback-restart, when mpv
+                // has decoded a frame and populated DV/HDR signal caches.
             case "playback-restart":
                 // Native single-decoder preview frame is now ready. Do not
                 // pull an image before mpv has actually decoded the target.
@@ -1176,8 +1177,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .upArrow:
             if toolPanel == .picture {
-                selectedPictureControl = 0
+                selectedPictureControl = max(0, selectedPictureControl - 1)
                 updatePictureLabels()
+                showPanel()
             } else if toolPanel == .audio || toolPanel == .subtitles {
                 choiceIndex = max(0, choiceIndex - 1)
                 renderTrackPanel()
@@ -2309,6 +2311,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         subtitleURLToLoad = nil
         subtitleAlreadyRequested = false
         PlayerStartupDiagnostics.clear()
+        colorFilterTimer?.invalidate()
+        colorFilterTimer = nil
+        colorFilterOperation += 1
         mainFramePreviewGeneration += 1
         mainFramePreviewOrigin = nil
         mainFramePreviewPending = nil
@@ -2474,6 +2479,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekCommitTimer?.invalidate()
         previewHideTimer?.invalidate()
         hideTimer?.invalidate()
+        colorFilterTimer?.invalidate()
         core?.dispose()
     }
 }

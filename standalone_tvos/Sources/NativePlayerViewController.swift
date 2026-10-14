@@ -605,12 +605,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         view.addSubview(filmStrip)
         let preview = UIImageView()
         preview.contentMode = .scaleAspectFill
-        // Entire separate decoded preview fills the display during LOCKED
-        // transport or PAUSED touch scrubbing. scaleAspectFill crops any
-        // letterboxing; this is NOT the currently playing video surface.
-        preview.backgroundColor = .black
-        preview.layer.cornerRadius = 0
-        preview.layer.borderWidth = 0
+        // Floating, independently decoded seek thumbnail, 20% larger
+        // than the original 360 × 204 pt preview. Never cover the movie.
+        // Aspect fill crops to the preview window; the FFmpeg decoder
+        // also trims source-encoded black letterboxing.
+        preview.backgroundColor = UIColor(white: 0.12, alpha: 0.86)
+        preview.layer.cornerRadius = 16
+        preview.layer.borderColor = UIColor.white.withAlphaComponent(0.38).cgColor
+        preview.layer.borderWidth = 1
         preview.clipsToBounds = true
         preview.translatesAutoresizingMaskIntoConstraints = false
         frameViews.append(preview)
@@ -634,8 +636,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.textAlignment = .center
         seekTimeLabel.alpha = 0
         view.addSubview(seekTimeLabel)
-        // A separate status label remains visible even when the full-screen
-        // image stays hidden until FFmpeg has produced the first real frame.
+        // A separate status label remains visible while the windowed
+        // thumbnail stays hidden until FFmpeg produces a real frame.
         previewStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         previewStatusLabel.text = "Preparing thumbnail…"
         previewStatusLabel.textAlignment = .center
@@ -717,12 +719,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             endLabel.widthAnchor.constraint(equalToConstant: 105),
             toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            filmStrip.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            filmStrip.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            filmStrip.topAnchor.constraint(equalTo: view.topAnchor),
-            filmStrip.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            seekTimeLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            seekTimeLabel.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -24),
+            filmStrip.widthAnchor.constraint(equalToConstant: 432),
+            filmStrip.heightAnchor.constraint(equalToConstant: 245),
+            filmStrip.centerXAnchor.constraint(equalTo: progress.centerXAnchor),
+            filmStrip.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -18),
+            seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
+            seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             previewStatusLabel.bottomAnchor.constraint(equalTo: seekTimeLabel.topAnchor, constant: -16),
             previewStatusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.9),
@@ -744,7 +746,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             rows.topAnchor.constraint(equalTo: trackPanel.topAnchor, constant: 20),
             rows.bottomAnchor.constraint(equalTo: trackPanel.bottomAnchor, constant: -20)
         ])
-        // The full-screen preview must be beneath the progress/time labels,
+        // The floating preview remains beneath the progress/time labels,
         // tools and picture menus. It's non-interactive, so the Siri Remote
         // surface beneath it continues to receive presses and gestures.
         view.bringSubviewToFront(panel)
@@ -1355,7 +1357,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func scheduleFrames() {
         guard targetSeconds != nil else { return }
         // Show loading state without obscuring live video with a black
-        // full-screen surface. Reveal the independent frame once decoded.
+        // windowed preview. Reveal the independent frame once decoded.
         let decoded = frameViews.first?.image != nil
         filmStrip.alpha = decoded ? 1 : 0
         previewStatusLabel.text = "Preparing thumbnail…"

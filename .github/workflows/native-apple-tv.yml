@@ -50,6 +50,22 @@ jobs:
           set -euo pipefail
           APP="$(find build/NuvioNativePlayer.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -type d | head -n1)"
           test -n "$APP"
+          # XcodeGen writes Info.plist from project.yml. A previous build
+          # silently dropped CFBundleURLTypes and could never receive handoffs.
+          python3 - "$APP/Info.plist" <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], 'rb') as file:
+              info = plistlib.load(file)
+          schemes = [
+              value
+              for item in info.get('CFBundleURLTypes', [])
+              for value in item.get('CFBundleURLSchemes', [])
+          ]
+          assert 'nuvio-player' in schemes, f'Native URL scheme missing in app bundle: {schemes!r}'
+          assert info.get('CFBundleIdentifier') == 'com.cb541.nuvionativeplayer', info.get('CFBundleIdentifier')
+          assert info.get('UIDeviceFamily') == [3], info.get('UIDeviceFamily')
+          print('Verified native deep-link scheme:', schemes)
+          PY
           mkdir -p build/native-ipa/Payload
           cp -R "$APP" build/native-ipa/Payload/
           (cd build/native-ipa && zip -qry Nuvio-Native-tvOS-unsigned.ipa Payload)

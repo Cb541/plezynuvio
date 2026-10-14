@@ -18,6 +18,21 @@ targets:
       - path: ../ios/Runner/MpvPlayer/MpvPlayerCore.swift
     info:
       path: Info.plist
+      properties:
+        CFBundleDisplayName: Nuvio Player
+        CFBundleName: Nuvio Player
+        CFBundleShortVersionString: "1.0.1"
+        CFBundleVersion: "2"
+        CFBundleURLTypes:
+          - CFBundleURLName: com.cb541.nuvio.player
+            CFBundleURLSchemes:
+              - nuvio-player
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities:
+          - arm64
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cb541.nuvionativeplayer

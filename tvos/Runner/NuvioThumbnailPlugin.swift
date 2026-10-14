@@ -102,7 +102,7 @@ final class NuvioThumbnailPlugin: NSObject, FlutterPlugin {
     defer { for item in owned { free(item) } }
     var argv: [UnsafePointer<CChar>?] = owned.map { UnsafePointer($0) }
     argv.append(nil)
-    guard argv.withUnsafeBufferPointer({ mpv_command(context, $0.baseAddress) }) >= 0 else {
+    guard argv.withUnsafeMutableBufferPointer({ mpv_command(context, $0.baseAddress) }) >= 0 else {
       return nil
     }
 

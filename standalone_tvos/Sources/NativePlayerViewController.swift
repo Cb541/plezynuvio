@@ -41,6 +41,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var thumbTimer: Timer?
     private var hideTimer: Timer?
     private var heldDirection = 0
+    private var holdTickCount = 0
+    private var isTouchScrubbing = false
 
     private var targetSeconds: Double?
     private var currentSeconds: Double = 0
@@ -109,13 +111,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             idleLabel.text = "NUVIO PLAYER\n\nLast playback stopped during: \(unfinished)\n\nTry opening a stream again. If the app closes, reopen it from the Home Screen to see the last stage."
             statusLabel.text = "Diagnostics: \(unfinished)"
         }
-        // One directional swipe = one 15 second step, regardless of swipe velocity.
-        for direction in [UISwipeGestureRecognizer.Direction.left, .right] {
-            let swipe = UISwipeGestureRecognizer(target: self, action: #selector(remoteSwipe(_:)))
-            swipe.direction = direction
-            swipe.cancelsTouchesInView = true
-            remote.addGestureRecognizer(swipe)
-        }
+        // Touch surface scrubs the thumbnail timeline only while paused.
+        let panGesture = UIPanGestureRecognizer(target: self, action: #selector(touchScrub(_:)))
+        panGesture.cancelsTouchesInView = false
+        remote.addGestureRecognizer(panGesture)
         clock = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(refreshClock),
                                      userInfo: nil, repeats: true)
     }
@@ -154,6 +153,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
             return
         }
         isPreparingPlayback = true
+        heldDirection = 0
+        holdTickCount = 0
+        isTouchScrubbing = false
+        repeatTimer?.invalidate()
+        repeatTimer = nil
         waitingForFirstFrame = true
         subtitleAlreadyRequested = false
         firstFrameTimeout?.cancel()
@@ -642,8 +646,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                     toolbarIndex = (toolbarIndex + direction + toolbarButtons.count) % toolbarButtons.count
                     updateToolbarFocus()
                     showPanel()
-                } else {
-                    stepSeek(direction)
+                } else if !isTouchScrubbing {
+                    beginDirectionalSeek(direction)
                 }
             }
         case .upArrow:
@@ -691,7 +695,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 togglePlayback()
             }
         case .playPause:
-            if toolPanel == .none { togglePlayback() }
+            if toolPanel == .none {
+                if targetSeconds != nil { commitSeek() }
+                togglePlayback()
+            }
         case .menu:
             if toolPanel != .none {
                 closeToolPanel()
@@ -708,15 +715,69 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     }
 
     func remoteEnded(_ key: UIPress.PressType) {
-        // Directional click release does NOT commit a seek; repeated clicks
-        // add to the same target before the short idle debounce completes.
+        guard key == .leftArrow || key == .rightArrow else { return }
+        let direction = key == .rightArrow ? 1 : -1
+        guard heldDirection == direction else { return }
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        heldDirection = 0
+        if holdTickCount == 0 {
+            stepSeek(direction, commitAfterIdle: true)
+        } else {
+            commitSeek()
+        }
+        holdTickCount = 0
     }
 
-    @objc private func remoteSwipe(_ recognizer: UISwipeGestureRecognizer) {
-        guard recognizer.state == .ended, core != nil, toolPanel == .none else { return }
-        toolbarFocused = false
-        updateToolbarFocus()
-        stepSeek(recognizer.direction == .right ? 1 : -1)
+    private func beginDirectionalSeek(_ direction: Int) {
+        guard core != nil, heldDirection == 0 else { return }
+        heldDirection = direction
+        holdTickCount = 0
+        seekCommitTimer?.invalidate()
+        seekCommitTimer = nil
+        // A short press steps once on release. Holding enters continuous
+        // scrubbing after 380ms and shows a changing preview until release.
+        repeatTimer?.invalidate()
+        repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.38, repeats: true) { [weak self] _ in
+            guard let self, self.heldDirection == direction else { return }
+            self.holdTickCount += 1
+            self.stepSeek(direction, commitAfterIdle: false)
+        }
+    }
+
+    @objc private func touchScrub(_ gesture: UIPanGestureRecognizer) {
+        guard core != nil, toolPanel == .none, !toolbarFocused else { return }
+        switch gesture.state {
+        case .began:
+            guard !playing, heldDirection == 0 else { return }
+            isTouchScrubbing = true
+            seekCommitTimer?.invalidate()
+            seekCommitTimer = nil
+            panOriginSeconds = targetSeconds ?? currentSeconds
+            targetSeconds = panOriginSeconds
+            scheduleFrames()
+            refreshLabels()
+            showPanel()
+        case .changed:
+            guard isTouchScrubbing, !playing else { return }
+            let dx = Double(gesture.translation(in: remote).x)
+            let bound = totalSeconds > 0 ? totalSeconds : 86_400
+            // Softer than the old sensitivity and anchored to press origin.
+            targetSeconds = max(0, min(bound, panOriginSeconds + dx * 0.18))
+            scheduleFrames()
+            refreshLabels()
+            showPanel()
+        case .ended:
+            guard isTouchScrubbing else { return }
+            isTouchScrubbing = false
+            commitSeek() // Leave playback paused.
+        case .cancelled, .failed:
+            guard isTouchScrubbing else { return }
+            isTouchScrubbing = false
+            cancelUncommittedScrub()
+            showPanel()
+        default: break
+        }
     }
 
     private func hidePlaybackChrome() {
@@ -939,7 +1000,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         showPanel()
     }
 
-    private func stepSeek(_ direction: Int) {
+    private func stepSeek(_ direction: Int, commitAfterIdle: Bool) {
         guard core != nil else { return }
         let base = targetSeconds ?? max(0, currentSeconds)
         let bound = totalSeconds > 0 ? totalSeconds : 86_400
@@ -948,10 +1009,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         refreshLabels()
         showPanel()
         seekCommitTimer?.invalidate()
-        // Short, consistent delay allows several consecutive remote swipes
-        // to accumulate, instead of seeking back to a stale mpv time-pos.
-        seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.82, repeats: false) { [weak self] _ in
-            self?.commitSeek()
+        seekCommitTimer = nil
+        if commitAfterIdle {
+            seekCommitTimer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: false) { [weak self] _ in
+                self?.commitSeek()
+            }
         }
     }
 
@@ -1023,6 +1085,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         thumbTimer?.invalidate()
         previewHideTimer?.invalidate()
         previewIsVisible = false
+        heldDirection = 0
+        holdTickCount = 0
+        isTouchScrubbing = false
+        repeatTimer?.invalidate()
+        repeatTimer = nil
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         toolPanel = .none
@@ -1053,7 +1120,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
         updateToolbarFocus()
         hideTimer?.invalidate()
-        if core != nil && targetSeconds == nil && toolPanel == .none {
+        if core != nil && targetSeconds == nil && heldDirection == 0 &&
+           !isTouchScrubbing && toolPanel == .none {
             // Both paused and playing timelines hide after 3 seconds of
             // inactivity. Leaving a menu open intentionally suspends timeout.
             hideTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in

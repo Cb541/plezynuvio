@@ -1165,88 +1165,136 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func applyColorFilterNow(operation: Int) {
-        guard let playbackCore = core,
-              operation == colorFilterOperation,
-              sourceColorMetadataReady else { return }
-        // Never stack duplicate lavfi filters during rapid remote clicks.
-        // All add/remove operations are serialized through the main queue.
-        guard !colorFilterInFlight else { return }
+        guard let playbackCore = core, operation == colorFilterOperation,
+              sourceColorMetadataReady, !colorFilterInFlight else { return }
         let generation = playbackGeneration
         let nonneutral = abs(colorSaturation - 1.0) > 0.001
             || abs(colorContrast - 1.0) > 0.001
-        let canProcess = !sourceIsHDR || experimentalHDRColorBoost
-        let enabled = nonneutral && canProcess && !colorFilterFailed
+        let enabled = nonneutral && (!sourceIsHDR || experimentalHDRColorBoost)
+            && !colorFilterFailed
 
+        // Never stack two filter graphs. Changes and disable requests remove
+        // the existing graph before any other decoder configuration.
         if colorFilterActive {
-            // A filter already exists. Remove before replacing; do not let
-            // rapid adjustments accumulate multiple 4K conversion stages.
             colorFilterInFlight = true
             playbackCore.commandAsync(["vf", "remove", "@nuvio-color"]) {
                 [weak self, weak playbackCore] _ in
-                guard let self, let playbackCore,
-                      self.core === playbackCore,
+                guard let self, let playbackCore, self.core === playbackCore,
                       self.playbackGeneration == generation else { return }
                 self.colorFilterInFlight = false
                 self.colorFilterActive = false
-                if enabled && operation == self.colorFilterOperation
-                    || self.colorFilterOperation != operation {
+                self.colorFilterVerified = false
+                self.scheduleColorFilterUpdate()
+                self.updatePictureLabels()
+            }
+            return
+        }
+
+        // Restore original direct VideoToolbox as soon as effect is off.
+        // This is important for native HDR/Dolby Vision metadata.
+        if !enabled {
+            guard colorCopyMode else {
+                updatePictureLabels()
+                return
+            }
+            colorFilterInFlight = true
+            playbackCore.setPropertyAsync("hwdec", value: "videotoolbox") {
+                [weak self, weak playbackCore] result in
+                guard let self, let playbackCore, self.core === playbackCore,
+                      self.playbackGeneration == generation else { return }
+                self.colorFilterInFlight = false
+                self.colorCopyMode = false
+                if case .failure(let error) = result {
+                    NSLog("[NuvioColor] Unable to restore direct decoder: %@",
+                          error.localizedDescription)
+                    self.colorFilterFailed = true
+                }
+                self.updatePictureLabels()
+                if self.colorFilterOperation != operation {
                     self.scheduleColorFilterUpdate()
                 }
             }
             return
         }
-        // No filter at neutral levels. HDR/DV is strictly opt-in and the
-        // genuine VideoToolbox -> AVFoundation path remains the default.
-        guard enabled else { return }
 
-        // Dolby Vision per-frame RPU metadata cannot be assumed valid after
-        // an image-space EQ. This experiment MAY drop native DV. Its use is
-        // limited to the current video, explicitly labeled as experimental.
+        // An FFmpeg eq graph cannot process opaque hardware video surfaces.
+        // videotoolbox-copy supplies ordinary image frames to libavfilter.
+        if !colorCopyMode {
+            colorFilterInFlight = true
+            colorFilterVerified = false
+            updatePictureLabels()
+            playbackCore.setPropertyAsync("hwdec", value: "videotoolbox-copy") {
+                [weak self, weak playbackCore] result in
+                guard let self, let playbackCore, self.core === playbackCore,
+                      self.playbackGeneration == generation else { return }
+                self.colorFilterInFlight = false
+                switch result {
+                case .success:
+                    self.colorCopyMode = true
+                    self.scheduleColorFilterUpdate()
+                case .failure(let error):
+                    self.colorFilterFailed = true
+                    self.experimentalHDRColorBoost = false
+                    NSLog("[NuvioColor] VideoToolbox copy mode rejected: %@",
+                          error.localizedDescription)
+                    self.scheduleColorFilterUpdate()
+                }
+                self.updatePictureLabels()
+            }
+            return
+        }
+
         let spec = String(format:
             "@nuvio-color:lavfi=[eq=contrast=%.2f:saturation=%.2f]",
             colorContrast, colorSaturation)
         colorFilterInFlight = true
+        colorFilterVerified = false
+        updatePictureLabels()
         playbackCore.commandAsync(["vf", "add", spec]) {
             [weak self, weak playbackCore] result in
-            guard let self, let playbackCore,
-                  self.core === playbackCore,
+            guard let self, let playbackCore, self.core === playbackCore,
                   self.playbackGeneration == generation else { return }
             self.colorFilterInFlight = false
             if case .failure(let error) = result {
                 self.colorFilterActive = false
                 self.colorFilterFailed = true
                 self.experimentalHDRColorBoost = false
-                NSLog("[NuvioNative] Video color filter failed: %@",
+                NSLog("[NuvioColor] FFmpeg eq filter rejected: %@",
                       error.localizedDescription)
-                playbackCore.command(["vf", "remove", "@nuvio-color"])
+                self.scheduleColorFilterUpdate()
             } else {
                 self.colorFilterActive = true
+                // Successful addition is not proof of active processing.
+                // Inspect the named runtime filter list.
+                playbackCore.getPropertyAsync("vf") { [weak self, weak playbackCore] property in
+                    guard let self, let playbackCore,
+                          self.core === playbackCore,
+                          self.playbackGeneration == generation else { return }
+                    let list = (try? property.get()) ?? ""
+                    self.colorFilterVerified = list.contains("nuvio-color")
+                    NSLog("[NuvioColor] vf graph %@; copy decoder requested",
+                          self.colorFilterVerified ? "listed" : "unverified")
+                    self.updatePictureLabels()
+                }
                 if self.sourceIsHDR {
-                    // Runtime color metadata is checked again after the
-                    // renderer responds to the new video filter. Revert
-                    // immediately if the HDR output reports an SDR transfer.
-                    let expected = self.playbackGeneration
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                         [weak self, weak playbackCore] in
                         guard let self, let playbackCore,
                               self.core === playbackCore,
-                              self.playbackGeneration == expected,
+                              self.playbackGeneration == generation,
                               self.experimentalHDRColorBoost else { return }
                         playbackCore.getPropertyAsync("video-out-params/gamma") {
                             [weak self] gammaResult in
-                            guard let self,
-                                  self.core === playbackCore,
-                                  self.playbackGeneration == expected,
+                            guard let self, self.core === playbackCore,
+                                  self.playbackGeneration == generation,
                                   self.experimentalHDRColorBoost else { return }
                             let gamma = (try? gammaResult.get())?.lowercased() ?? ""
-                            if gamma.contains("bt.1886")
-                                || gamma.contains("srgb")
-                                || gamma.contains("gamma2") {
+                            if ["bt.1886", "srgb", "gamma2"].contains(where: gamma.contains) {
                                 self.experimentalHDRColorBoost = false
                                 self.colorFilterFailed = true
                                 self.updatePictureLabels()
                                 self.scheduleColorFilterUpdate()
-                                NSLog("[NuvioNative] Reverted boost: HDR output became SDR")
+                                NSLog("[NuvioColor] Reverted boost on SDR output")
                             }
                         }
                     }

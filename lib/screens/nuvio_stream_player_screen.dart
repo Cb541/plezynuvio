@@ -365,7 +365,9 @@ class _NuvioStreamPlayerScreenState extends State<NuvioStreamPlayerScreen> {
         ? 0.0
         : (target.inMilliseconds / durationMs).clamp(0.0, 1.0).toDouble();
     return Scaffold(
-      backgroundColor: Colors.black,
+      // tvOS mpv draws through an AVSampleBufferDisplayLayer beneath Flutter.
+      // The on-screen route must not paint opaque black over that video plane.
+      backgroundColor: Colors.transparent,
       body: Stack(
         fit: StackFit.expand,
         children: [

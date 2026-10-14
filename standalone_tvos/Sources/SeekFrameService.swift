@@ -12,6 +12,12 @@ final class SeekFrameService {
         let slots: [Int]
         let writeMBPerSecond: Double
         let frameCount: Int
+        let deliveredFrames: Int
+        let jpegEncodedFrames: Int
+        let failedEncodes: Int
+        let failedWrites: Int
+        let missingDirectories: Int
+        let diskBytes: Int64
     }
 
     private struct Request {
@@ -44,6 +50,16 @@ final class SeekFrameService {
     // bounded. These slot indices are loaded once and amended after writes.
     private var cachedSlots = Set<Int>()
     private var recentDiskWrites: [(date: Date, bytes: Int)] = []
+    // Keep frame capture entirely separate from the seek/AVAsset worker.
+    // In particular, a slow remote seek can no longer prevent frames from
+    // an already-playing video from reaching persistent thumbnail storage.
+    private var cacheEpoch: UInt64 = 0
+    private var deliveredFrames = 0
+    private var jpegEncodedFrames = 0
+    private var failedEncodes = 0
+    private var failedWrites = 0
+    private var missingDirectories = 0
+    private var diskBytes: Int64 = 0
 
     init() {
         // RAM is bounded to protect playback; the persistent disk cache
@@ -72,6 +88,7 @@ final class SeekFrameService {
                                                           isDirectory: true)
         lock.lock()
         generation &+= 1
+        cacheEpoch &+= 1
         latestCacheLookup &+= 1
         activeToken?.cancelled = true
         pending = nil
@@ -83,6 +100,12 @@ final class SeekFrameService {
         backgroundPrefetchUnavailable = false
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
+        deliveredFrames = 0
+        jpegEncodedFrames = 0
+        failedEncodes = 0
+        failedWrites = 0
+        missingDirectories = 0
+        diskBytes = 0
         hotImages.removeAllObjects()
         let version = generation
         let oldDirectory = legacyScopedDirectory
@@ -126,7 +149,13 @@ final class SeekFrameService {
         let bytes = recentDiskWrites.reduce(0) { $0 + $1.bytes }
         let result = CacheStats(slots: Array(cachedSlots),
             writeMBPerSecond: Double(bytes) / 8_000_000.0,
-            frameCount: cachedSlots.count)
+            frameCount: cachedSlots.count,
+            deliveredFrames: deliveredFrames,
+            jpegEncodedFrames: jpegEncodedFrames,
+            failedEncodes: failedEncodes,
+            failedWrites: failedWrites,
+            missingDirectories: missingDirectories,
+            diskBytes: diskBytes)
         lock.unlock()
         return result
     }
@@ -182,21 +211,81 @@ final class SeekFrameService {
         }
     }
 
-    /// Accept a frame supplied by the already-running mpv video decoder.
-    /// No second media demuxer or codec is created for this fallback.
+    /// Receive an already-decoded frame through the native video tap.
+    /// The seek worker can be blocked by remote AVFoundation requests, so
+    /// NEVER enqueue playback captures onto that same queue.
+    /// Normal playback needs only a small retained UIImage; JPEG encoding
+    /// and all filesystem operations run on the serial disk writer.
     func cachePlaybackFrame(_ image: UIImage, second: Int) {
+        let slot = bucket(second)
         lock.lock()
         let directory = scopedDirectory
-        let version = generation
+        let epoch = cacheEpoch
+        deliveredFrames += 1
         lock.unlock()
-        worker.async { [weak self] in
+
+        // Immediate RAM availability for scrubbing, independent of disk IO.
+        hotImages.setObject(image, forKey: key(slot),
+            cost: max(1, Int(image.size.width * image.size.height * 4)))
+
+        diskWriter.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            let valid = self.generation == version
+            let valid = self.cacheEpoch == epoch &&
+                self.scopedDirectory == directory
             self.lock.unlock()
             guard valid else { return }
-            self.remember(image, slot: self.bucket(second),
-                          directory: directory, writeToDisk: true)
+
+            guard let directory else {
+                self.lock.lock()
+                self.missingDirectories += 1
+                self.lock.unlock()
+                NSLog("[NuvioCache] No active thumbnail directory")
+                return
+            }
+            let file = directory.appendingPathComponent("frame-\(slot).jpg")
+            let fm = FileManager.default
+            if fm.fileExists(atPath: file.path) {
+                // A thumbnail from an earlier session is already persistent.
+                self.lock.lock()
+                self.cachedSlots.insert(slot)
+                self.lock.unlock()
+                return
+            }
+
+            // Images from the frame tap are already small RGB CGImages.
+            // JPEG and disk writes occur outside the mpv render callback.
+            guard let bytes = image.jpegData(compressionQuality: 0.78) else {
+                self.lock.lock()
+                self.failedEncodes += 1
+                self.lock.unlock()
+                NSLog("[NuvioCache] JPEG encoding failed for frame %d", slot)
+                return
+            }
+            self.lock.lock()
+            self.jpegEncodedFrames += 1
+            self.lock.unlock()
+            do {
+                try fm.createDirectory(at: directory,
+                                       withIntermediateDirectories: true)
+                try bytes.write(to: file, options: .atomic)
+                self.lock.lock()
+                self.cachedSlots.insert(slot)
+                self.diskBytes += Int64(bytes.count)
+                let now = Date()
+                self.recentDiskWrites.append((date: now, bytes: bytes.count))
+                let cutoff = now.addingTimeInterval(-8)
+                self.recentDiskWrites.removeAll { $0.date < cutoff }
+                self.lock.unlock()
+                NSLog("[NuvioCache] Saved thumbnail frame %d (%d bytes)",
+                      slot, bytes.count)
+            } catch {
+                self.lock.lock()
+                self.failedWrites += 1
+                self.lock.unlock()
+                NSLog("[NuvioCache] Thumbnail disk write failed: %@",
+                      String(describing: error))
+            }
         }
     }
 
@@ -222,12 +311,19 @@ final class SeekFrameService {
     func clear() {
         cancel()
         lock.lock()
+        cacheEpoch &+= 1
         sourceKey = nil
         scopedDirectory = nil
         legacyScopedDirectory = nil
         backgroundPrefetchUnavailable = false
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
+        deliveredFrames = 0
+        jpegEncodedFrames = 0
+        failedEncodes = 0
+        failedWrites = 0
+        missingDirectories = 0
+        diskBytes = 0
         hotImages.removeAllObjects()
         lock.unlock()
         // Intentionally DO NOT delete stored previews.

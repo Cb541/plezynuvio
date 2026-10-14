@@ -28,6 +28,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     private var core: MpvPlayerCore?
     private let thumbs = SeekFrameService()
     private var pendingLink: NativeStreamLink?
+    private var hasAppeared = false
+    private var playbackGeneration = 0
+    private var isPreparingPlayback = false
     private var link: NativeStreamLink?
     private var clock: Timer?
     private var repeatTimer: Timer?
@@ -69,6 +72,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         super.viewDidLoad()
         view.backgroundColor = .clear
         buildUI()
+        // If a previous launch died in the decoder, tell the user WHICH stage
+        // was reached. Never persist, display or log the signed media URL.
+        if let unfinished = PlayerStartupDiagnostics.unfinishedPhase {
+            idleLabel.text = "NUVIO PLAYER\n\nLast playback stopped during: \(unfinished)\n\nTry opening a stream again. If the app closes, reopen it from the Home Screen to see the last stage."
+            statusLabel.text = "Diagnostics: \(unfinished)"
+        }
         let gesture = UIPanGestureRecognizer(target: self, action: #selector(pan(_:)))
         gesture.cancelsTouchesInView = false
         remote.addGestureRecognizer(gesture)
@@ -78,21 +87,42 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        hasAppeared = true
         setNeedsFocusUpdate()
         updateFocusIfNeeded()
+        // Don't initialize a new AVSampleBufferDisplayLayer / mpv VO while
+        // tvOS is still attaching the root controller to a scene window.
         if let pendingLink {
             self.pendingLink = nil
-            open(pendingLink)
+            DispatchQueue.main.async { [weak self] in self?.open(pendingLink) }
         }
     }
 
+    /// The scene delegate may receive the deep link before the first on-screen
+    /// frame. Hold it until viewDidAppear and avoid launching two MPV contexts
+    /// simultaneously if tvOS repeats the same URL callback.
     func open(_ media: NativeStreamLink) {
-        guard isViewLoaded, let window = view.window else {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.open(media) }
+            return
+        }
+        guard hasAppeared, isViewLoaded, view.window != nil else {
             pendingLink = media
             loadViewIfNeeded()
             return
         }
-        // Reset the per-title preview cache, not the source movie data.
+        pendingLink = nil
+        guard !isPreparingPlayback else {
+            // Store the newest link for when startup completes instead of
+            // tearing down a partially initialized native decoder.
+            pendingLink = media
+            return
+        }
+        isPreparingPlayback = true
+        playbackGeneration += 1
+        let generation = playbackGeneration
+        PlayerStartupDiagnostics.mark("handoff-received")
+
         thumbs.clear()
         link = media
         titleLabel.text = media.title
@@ -104,31 +134,81 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         targetSeconds = nil
         currentSeconds = 0
         totalSeconds = 0
-        core?.dispose()
-        core = nil
-        let newCore = MpvPlayerCore()
-        // The pinned native FFmpeg build implements Profile 7 RPU downleveling
-        // with P8.1 output. This sets the mode BEFORE mpv_initialize.
-        newCore.setDvConversionMode("dv81")
-        newCore.setDolbyVisionOutputAllowed(true)
-        newCore.delegate = self
-        guard newCore.initialize(in: window) else {
-            statusLabel.text = "Video decoder unavailable"
+        statusLabel.text = "Preparing video decoder…"
+        showPanel()
+
+        // A short delay gives the scene's window and display link a chance
+        // to attach before the native AVFoundation renderer initializes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.preparePlayback(media, generation: generation)
+        }
+    }
+
+    private func preparePlayback(_ media: NativeStreamLink, generation: Int) {
+        guard playbackGeneration == generation, let window = view.window else {
+            isPreparingPlayback = false
+            showHandoffError("TV window is not ready for playback")
             return
         }
+        core?.dispose()
+        core = nil
+
+        PlayerStartupDiagnostics.mark("mpv-core-creation")
+        let newCore = MpvPlayerCore()
+        newCore.delegate = self
+
+        // P7 -> P8.1 mode is applied before MPV initializes.
+        // auto also preserves the patched profile conversion behavior;
+        // defer display criteria changes until the stream is decoded.
+        newCore.setDvConversionMode("dv81")
+
+        PlayerStartupDiagnostics.mark("mpv-initialize")
+        guard newCore.initialize(in: window) else {
+            isPreparingPlayback = false
+            PlayerStartupDiagnostics.clear()
+            showHandoffError("Native MPV video decoder failed to initialize")
+            return
+        }
+
+        PlayerStartupDiagnostics.mark("mpv-initialized")
         core = newCore
         newCore.setVisible(true)
         newCore.updateFrame()
         applyPictureTransform()
-        // No authentication headers can cross an external-player handoff.
-        newCore.command(["loadfile", media.url.absoluteString, "replace"])
-        if let subtitle = media.subtitle {
-            newCore.command(["sub-add", subtitle.absoluteString, "select"])
-        }
-        newCore.setProperty("pause", value: "no")
         playing = true
-        statusLabel.text = "Loading media…"
+        isPreparingPlayback = false
+        statusLabel.text = "Opening video…"
         showPanel()
+
+        // Delay `loadfile` to a later main-loop turn. This also ensures the
+        // scene/window/display layer are ready for decoder callbacks.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self, weak newCore] in
+            guard let self,
+                  self.playbackGeneration == generation,
+                  self.core === newCore,
+                  let newCore else { return }
+            PlayerStartupDiagnostics.mark("mpv-loadfile-request")
+            newCore.commandAsync(["loadfile", media.url.absoluteString, "replace"]) { [weak self] result in
+                guard let self, self.playbackGeneration == generation else { return }
+                switch result {
+                case .success:
+                    // The file may still be demuxing; a video frame is signaled
+                    // by the playback-restart event, not by this command reply.
+                    PlayerStartupDiagnostics.mark("mpv-loadfile-accepted")
+                case .failure(let error):
+                    PlayerStartupDiagnostics.clear()
+                    self.showHandoffError("Unable to open this video: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    func showHandoffError(_ text: String) {
+        statusLabel.text = text
+        idleLabel.isHidden = true
+        panel.isHidden = false
+        showPanel()
+        NSLog("[NuvioNative] Playback error (URL redacted)")
     }
 
     func onPropertyChange(name: String, value: Any?, sourceId: Int64?) {
@@ -153,7 +233,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             switch name {
-            case "playback-restart", "file-loaded":
+            case "start-file":
+                PlayerStartupDiagnostics.mark("mpv-start-file")
+                self.statusLabel.text = "Opening media container…"
+            case "file-loaded":
+                PlayerStartupDiagnostics.mark("mpv-file-loaded")
+                self.statusLabel.text = "Video loaded; starting playback…"
+                // Subtitles must be attached after the file is loaded, not
+                // concurrently with loadfile (they can race demuxer startup).
+                if let subtitle = self.link?.subtitle {
+                    self.core?.command(["sub-add", subtitle.absoluteString, "select"])
+                }
+            case "playback-restart":
+                PlayerStartupDiagnostics.clear()
                 self.statusLabel.text = "Left/Right: seek  ·  Up: picture  ·  Menu: close"
                 self.applyPictureTransform()
             case "end-file":
@@ -482,6 +574,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     }
 
     private func leavePlayback() {
+        playbackGeneration += 1
+        isPreparingPlayback = false
+        PlayerStartupDiagnostics.clear()
         thumbs.clear()
         thumbTimer?.invalidate()
         core?.setVisible(false)

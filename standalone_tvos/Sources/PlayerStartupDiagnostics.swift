@@ -10,14 +10,14 @@ enum PlayerStartupDiagnostics {
         UserDefaults.standard.string(forKey: phaseKey)
     }
 
+    // Don't synchronously flush UserDefaults on the tvOS main thread during
+    // touchpad gestures. Repeated disk synchronization can cause large stalls.
     static func mark(_ phase: String) {
         UserDefaults.standard.set(phase, forKey: phaseKey)
-        UserDefaults.standard.synchronize()
         NSLog("[NuvioNative] Startup stage: %@", phase)
     }
 
     static func clear() {
         UserDefaults.standard.removeObject(forKey: phaseKey)
-        UserDefaults.standard.synchronize()
     }
 }

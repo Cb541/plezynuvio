@@ -27,6 +27,7 @@ void NuvioFrameTapStop(void);
 /// Diagnostic counts: number of renderer enqueues seen / images converted.
 uint64_t NuvioFrameTapEnqueueCount(void);
 uint64_t NuvioFrameTapImageCount(void);
+uint64_t NuvioFrameTapCallbackCount(void);
 uint64_t NuvioFrameTapMatchedCount(void);
 uint64_t NuvioFrameTapMissingPixelCount(void);
 uint64_t NuvioFrameTapConvertFailureCount(void);

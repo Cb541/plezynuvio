@@ -12,6 +12,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <limits.h>
+#import <math.h>
+#import <float.h>
 
 @implementation NuvioThumbnailAbortToken
 @end
@@ -192,10 +194,11 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
             // The previous NONREF mode often yielded zero frames, and the
             // fallback ran only after the shared network deadline expired.
             _decoder->thread_count = 1;
-            _decoder->skip_frame = sourceStream->codecpar->codec_id == AV_CODEC_ID_HEVC
-                ? AVDISCARD_DEFAULT : AVDISCARD_NONREF;
-            _decoder->skip_loop_filter = AVDISCARD_ALL;
-            _decoder->flags2 |= AV_CODEC_FLAG2_FAST;
+            // The previous NONREF/FAST shortcuts also affected H.264, VP9,
+            // AV1 and other streams. Accurate thumbnails require the same
+            // reference frames as regular video playback.
+            _decoder->skip_frame = AVDISCARD_DEFAULT;
+            _decoder->skip_loop_filter = AVDISCARD_DEFAULT;
             if (avcodec_open2(_decoder, codec, NULL) < 0) {
                 [self reset]; return nil;
             }
@@ -238,34 +241,32 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
         avcodec_flush_buffers(_decoder);
 
         UIImage *image = nil;
-        // First attempt: decode a reference picture near the target.
-        // On streams that cannot produce one, retry one GOP using normal
-        // decoding instead of leaving a permanent black preview.
+        double bestSeconds = DBL_MAX;
+        // For every codec, decode toward the requested PTS instead of
+        // blindly presenting the first frame after a distant keyframe.
+        // Keep the nearest valid frame as a fallback if the URL is slow.
+        const double tolerance = 0.65;
         for (int pass = 0; pass < 2 && !token.cancelled; ++pass) {
             if (pass == 1) {
-                // If a demuxer's indexed seek lands on an open-GOP picture,
-                // go several seconds earlier and decode full references.
-                // Some small HEVC encodes use few or irregular keyframes.
                 if (CFAbsoluteTimeGetCurrent() >= deadline.deadline) break;
-                _decoder->skip_frame = AVDISCARD_DEFAULT;
-                int64_t rewindTicks = av_rescale_q(5, (AVRational){1, 1},
-                                                    stream->time_base);
-                int64_t firstTimestamp = stream->start_time != AV_NOPTS_VALUE
+                int64_t rewindTicks = av_rescale_q(8, (AVRational){1, 1},
+                                                   stream->time_base);
+                int64_t baseTS = stream->start_time != AV_NOPTS_VALUE
                     ? MAX(0, stream->start_time) : 0;
-                int64_t retryTarget = MAX(firstTimestamp, target - rewindTicks);
-                int retrySeek = av_seek_frame(_format, _streamIndex, retryTarget,
+                int64_t earlier = MAX(baseTS, target - rewindTicks);
+                int retrySeek = av_seek_frame(_format, _streamIndex, earlier,
                                               AVSEEK_FLAG_BACKWARD);
                 if (retrySeek < 0)
                     retrySeek = avformat_seek_file(_format, _streamIndex,
-                                                  INT64_MIN, retryTarget, INT64_MAX, 0);
+                                                  INT64_MIN, earlier, INT64_MAX, 0);
                 if (retrySeek < 0) break;
                 avcodec_flush_buffers(_decoder);
             }
+            const int packetLimit = pass == 0 ? 210 : 320;
             int videoPackets = 0;
-            const int packetBudget = pass == 0 ? 140 : 180;
             while (!token.cancelled &&
                    CFAbsoluteTimeGetCurrent() < deadline.deadline &&
-                   videoPackets < packetBudget) {
+                   videoPackets < packetLimit) {
                 int readResult = av_read_frame(_format, _packet);
                 if (readResult < 0) break;
                 if (_packet->stream_index != _streamIndex) {
@@ -274,22 +275,54 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
                 }
                 ++videoPackets;
                 int sent = avcodec_send_packet(_decoder, _packet);
+                // FFmpeg requires callers to drain output before resending
+                // the exact packet after EAGAIN. Dropping these packets
+                // broke several codecs and resulted in a permanent black box.
+                if (sent == AVERROR(EAGAIN)) {
+                    while (!token.cancelled &&
+                           avcodec_receive_frame(_decoder, _frame) == 0) {
+                        int64_t pts = _frame->best_effort_timestamp;
+                        double distance = pts == AV_NOPTS_VALUE ? DBL_MAX :
+                            fabs((double)(pts - target) *
+                                 av_q2d(stream->time_base));
+                        if (!image || distance < bestSeconds - 0.4) {
+                            UIImage *candidate = nuvioMakeImage(_frame);
+                            if (candidate) {
+                                image = candidate;
+                                bestSeconds = distance;
+                            }
+                        }
+                        av_frame_unref(_frame);
+                        if (bestSeconds <= tolerance) break;
+                    }
+                    if (bestSeconds <= tolerance) {
+                        av_packet_unref(_packet);
+                        goto finished;
+                    }
+                    sent = avcodec_send_packet(_decoder, _packet);
+                }
                 av_packet_unref(_packet);
                 if (sent < 0) continue;
                 while (!token.cancelled &&
                        avcodec_receive_frame(_decoder, _frame) == 0) {
-                    image = nuvioMakeImage(_frame);
+                    int64_t pts = _frame->best_effort_timestamp;
+                    double distance = pts == AV_NOPTS_VALUE ? DBL_MAX :
+                        fabs((double)(pts - target) *
+                             av_q2d(stream->time_base));
+                    if (!image || distance < bestSeconds - 0.4) {
+                        UIImage *candidate = nuvioMakeImage(_frame);
+                        if (candidate) {
+                            image = candidate;
+                            bestSeconds = distance;
+                        }
+                    }
                     av_frame_unref(_frame);
-                    if (image) goto finished;
+                    if (bestSeconds <= tolerance) goto finished;
                 }
             }
         }
 
     finished:
-        // Keep full reference decoding for HEVC; NONREF caused permanent
-        // black boxes on ordinary SDR HEVC files as well as Dolby Vision.
-        if (_decoder && stream->codecpar->codec_id != AV_CODEC_ID_HEVC)
-            _decoder->skip_frame = AVDISCARD_NONREF;
         _format->interrupt_callback.opaque = NULL;
         if (token.cancelled) {
             [self reset];

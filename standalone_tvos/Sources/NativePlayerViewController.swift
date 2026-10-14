@@ -145,6 +145,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var experimentalHDRColorBoost = false
     private var colorFilterInFlight = false
     private var colorCopyMode = false
+    // Switching to CPU-accessible decoded frames can be expensive, so no
+    // color processing starts automatically when a movie first opens.
+    private var colorEffectRequestedForVideo = false
     private var colorFilterVerified = false
     private var colorFilterActive = false
     private var colorFilterOperation = 0
@@ -368,6 +371,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         colorFilterActive = false
         colorFilterInFlight = false
         colorCopyMode = false
+        colorEffectRequestedForVideo = false
         colorFilterVerified = false
         colorFilterFailed = false
         colorFilterOperation += 1
@@ -1048,7 +1052,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         } else if sourceIsHDR {
             colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\n\(colorFilterVerified ? "Filter loaded" : "Verify picture changes") • OFF restores original."
         } else {
-            colorStatusLabel.text = "SDR: \(colorFilterVerified ? "filter loaded" : "original picture")\n100% is original • Select resets all"
+            colorStatusLabel.text = colorEffectRequestedForVideo
+                ? "SDR: \(colorFilterVerified ? "filter listed" : "testing processing")\n100% is original • Select resets all"
+                : "SDR native picture • adjust a value to enable\n100% is original • Select resets all"
         }
     }
 
@@ -1074,17 +1080,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             colorSaturation = min(1.50, max(0.60,
                 (colorSaturation * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
+            colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
         case 3 where sourceColorMetadataReady
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
                 (colorContrast * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
+            colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
         case 4 where sourceColorMetadataReady && sourceIsHDR:
             // Only explicit Siri Remote interaction enables the experimental
             // HDR/DV path, per media item. Left = safe/off, right = test/on.
             experimentalHDRColorBoost = direction > 0
+            colorEffectRequestedForVideo = experimentalHDRColorBoost
             if experimentalHDRColorBoost {
                 // Make the opt-in visibly useful at neutral: a conservative
                 // boost that users can fine-tune with the rows above.
@@ -1109,6 +1118,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         colorSaturation = 1.0
         colorContrast = 1.0
         experimentalHDRColorBoost = false
+        colorEffectRequestedForVideo = false
         colorFilterFailed = false
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorSaturation")
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorContrast")
@@ -1170,7 +1180,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let generation = playbackGeneration
         let nonneutral = abs(colorSaturation - 1.0) > 0.001
             || abs(colorContrast - 1.0) > 0.001
-        let enabled = nonneutral && (!sourceIsHDR || experimentalHDRColorBoost)
+        let enabled = nonneutral && colorEffectRequestedForVideo
+            && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
 
         // Never stack two filter graphs. Changes and disable requests remove

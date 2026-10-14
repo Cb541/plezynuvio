@@ -47,7 +47,7 @@ final class SeekFrameService {
 
             // A real local decode. Unlike vo=image, this works with FFmpeg
             // sources independently from what mpv's VO was compiled to support.
-            let decoded = NuvioDecodedThumbnail(url as NSURL, Int64(key), 4.3)
+            let decoded = NuvioDecodedThumbnail(url, Int64(key), 4.3)
             let frame = decoded ?? self.appleFallback(url: url, second: key)
 
             self.lock.lock()

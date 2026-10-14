@@ -548,7 +548,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.waitingForFirstFrame = false
                     self.firstFrameTimeout?.cancel()
                 }
-                if self.currentSeconds < 2 {
+                // Real mpv END_FILE is different from tvOS terminating the
+                // app. Surface the reason even if this was mid-movie, rather
+                // than displaying only the stale startup breadcrumb.
+                let reason = (data?["reason"] as? NSNumber)?.intValue ?? -1
+                let message = data?["message"] as? String
+                if self.previewIsVisible || self.targetSeconds != nil {
+                    PlayerStartupDiagnostics.mark("mpv-end-file-during-preview-reason-\(reason)")
+                    self.statusLabel.text = message.map { "Playback stopped: \($0)" } ??
+                        "Playback stopped during seeking (mpv reason \(reason))"
+                    self.repeatTimer?.invalidate()
+                    self.repeatTimer = nil
+                    self.lockedSeekDirection = 0
+                    self.targetSeconds = nil
+                    self.stopShowingThumbnail()
+                    self.playing = false
+                    self.showPanel()
+                } else if self.currentSeconds < 2 {
                     self.statusLabel.text = "The stream ended or could not load"
                     self.showPanel()
                 }
@@ -1628,10 +1644,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
         showPanel()
 
-        // Give the thumbnail worker a short opportunity to observe the
-        // cancellation before the main mpv player requests its seek.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            [weak self, weak seekCore] in
+        // Never overlap an FFmpeg thumbnail decode with the main mpv seek.
+        // The previous fixed 180ms grace period was insufficient for 4K
+        // HEVC, which can keep CPU and decoder buffers busy for seconds.
+        // Serial cancellation also releases the thumbnail demux/codec RAM.
+        thumbs.cancelAndDrain { [weak self, weak seekCore] in
             guard let self, let seekCore, self.core === seekCore,
                   operation == self.seekCommitOperationID else { return }
             seekCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) {
@@ -1697,6 +1714,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         guard previewIsVisible, let link, let targetSeconds,
               serial == currentPreviewSerial,
               !(touchpadPreviewMode && isTouchScrubbing) else { return }
+        guard core?.isPaused == true else {
+            // Only decode when the native player has ACKNOWLEDGED Pause.
+            // A touchpad circular gesture may have paused it milliseconds
+            // earlier; racing a second 4K decode can terminate tvOS playback.
+            guard thumbTimer == nil else { return }
+            thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.3,
+                repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.thumbTimer = nil
+                self.loadFrames(serial: serial)
+            }
+            return
+        }
         let second = max(0, Int(targetSeconds.rounded()))
         let bucket = (second / 5) * 5
         guard lastPreviewRequestedBucket != bucket else { return }
@@ -1716,6 +1746,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 if self.touchpadPreviewMode {
                     PlayerStartupDiagnostics.mark("touchpad-thumbnail-ready")
                 }
+            } else {
+                // A failed position must not be permanently blacklisted.
+                // Revisit it after a later touch movement (e.g. another
+                // seek region or once a remote connection is ready).
+                self.lastPreviewRequestedBucket = nil
+                PlayerStartupDiagnostics.mark("thumbnail-decoder-returned-no-frame")
             }
             self.previewLoadingLabel.isHidden = true
             self.previewStatusLabel.isHidden = true

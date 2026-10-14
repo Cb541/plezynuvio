@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import "NuvioVideoFrameTap.h"
 
 NS_ASSUME_NONNULL_BEGIN
 

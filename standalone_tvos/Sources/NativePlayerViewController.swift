@@ -395,6 +395,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
                 PlayerStartupDiagnostics.mark("mpv-file-loaded-paused")
                 self.statusLabel.text = "Video loaded; waiting for first frame…"
             case "playback-restart":
+                // MPV only emits playback-restart after it has decoded at
+                // the new position. It is the authoritative point to release
+                // our temporary seek pin, even with a nearby keyframe seek.
+                if let _ = self.committedSeekTarget,
+                   let measured = (data?["positionSeconds"] as? NSNumber)?.doubleValue,
+                   measured.isFinite {
+                    self.committedSeekTarget = nil
+                    self.committedSeekDate = nil
+                    self.currentSeconds = max(0, measured)
+                    self.refreshLabels()
+                }
                 if self.waitingForFirstFrame {
                     PlayerStartupDiagnostics.mark("mpv-first-frame-ready")
                     self.applyPictureTransform()
@@ -1079,14 +1090,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
     }
 
     private func loadFrames(serial: Int) {
-        guard let link, let targetSeconds else { return }
+        guard let link, let targetSeconds,
+              serial == currentPreviewSerial else { return }
         // One high-priority decoder request for the CURRENT playhead only.
         // Five competing MKV decoder contexts starved the center preview.
         let second = max(0, Int(targetSeconds.rounded()))
-        thumbs.cancel()
+        // Do not abort the in-flight 4K decoder on every remote tick.
+        // SeekFrameService coalesces to the most recent target and delivers
+        // completed frames as they become available.
         thumbs.request(url: link.url, second: second) { [weak self] image in
-            guard let self, self.currentPreviewSerial == serial,
-                  self.previewIsVisible else { return }
+            guard let self, self.previewIsVisible,
+                  self.link?.url == link.url else { return }
             if let image {
                 self.frameViews.first?.image = image
                 self.previewLoadingLabel.isHidden = true
@@ -1164,7 +1178,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate {
         if targetSeconds == nil {
             let actual = max(0, core?.timePos ?? currentSeconds)
             if let pin = committedSeekTarget {
-                let aged = Date().timeIntervalSince(committedSeekDate ?? .distantPast) > 3.0
+                // Long remote remux seeks can take multiple seconds. Do not
+                // let stale mpv time-pos suddenly move the timeline back.
+                let aged = Date().timeIntervalSince(committedSeekDate ?? .distantPast) > 12.0
                 if abs(actual - pin) <= 3.0 || aged {
                     committedSeekTarget = nil
                     committedSeekDate = nil

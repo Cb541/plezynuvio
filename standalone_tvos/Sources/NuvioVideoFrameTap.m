@@ -26,6 +26,7 @@ static atomic_uintptr_t sTargetLayer;
 static atomic_int_fast64_t sMediaSecond;
 static atomic_int_fast64_t sAnchorNs;
 static atomic_int_fast64_t sLastSlot;
+static atomic_int_fast64_t sLastCapturedPresentationNs;
 static atomic_bool sIsPaused;
 static atomic_uint_fast64_t sGeneration;
 static atomic_uint_fast64_t sEnqueueCount;
@@ -59,29 +60,56 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
         return;
 
     atomic_fetch_add_explicit(&sMatchedCount, 1, memory_order_relaxed);
-    if (atomic_load_explicit(&sIsPaused, memory_order_acquire))
-        return;
-    int64_t second = atomic_load_explicit(&sMediaSecond, memory_order_acquire);
-    if (second < 0 || !sample)
+    if (!sample)
         return;
 
-    int64_t anchor = atomic_load_explicit(&sAnchorNs, memory_order_relaxed);
-    if (anchor > 0) {
-        int64_t elapsed = (nuvio_host_ns() - anchor) / 1000000000LL;
-        // A delayed main runloop must not pin playback thumbnails to a
-        // single timestamp. Extrapolate while video samples keep arriving.
-        // If playback stalls there are no new decoded sample callbacks.
-        if (elapsed > 0 && elapsed < 86400)
-            second += elapsed;
-    }
-    int64_t slot = (second / 2) * 2;
-    if (atomic_load_explicit(&sLastSlot, memory_order_relaxed) == slot)
+    // MPV's AVFoundation VO emits a *host-clock* PTS on each video sample.
+    // That advances continuously on the native video-output thread even
+    // when the Swift playback timer, pause observer, or seek UI is stale.
+    // Sample exactly once every two seconds of *video being enqueued*.
+    // The presence of video frames itself is the playback signal.
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
+    double ptsSeconds = CMTIME_IS_NUMERIC(pts) ? CMTimeGetSeconds(pts) : NAN;
+    int64_t sampleNs = isfinite(ptsSeconds) && ptsSeconds > 0
+        && ptsSeconds < (double)INT64_MAX / 1e9
+        ? (int64_t)(ptsSeconds * 1000000000.0)
+        : nuvio_host_ns();
+
+    int64_t lastPresentation = atomic_load_explicit(
+        &sLastCapturedPresentationNs, memory_order_relaxed);
+    if (lastPresentation > 0 && sampleNs >= lastPresentation &&
+        sampleNs - lastPresentation < 2000000000LL)
         return;
 
     bool available = false;
     if (!atomic_compare_exchange_strong_explicit(&sInFlight, &available, true,
                memory_order_acq_rel, memory_order_relaxed))
         return;
+
+    // Use mpv's actual time-pos whenever provided; otherwise continue from
+    // the native presentation timestamp. A player that starts from 0 should
+    // still accumulate frames even if *no* Swift observer fires.
+    int64_t second = atomic_load_explicit(&sMediaSecond,
+                                           memory_order_relaxed);
+    int64_t anchor = atomic_load_explicit(&sAnchorNs,
+                                          memory_order_relaxed);
+    if (second < 0) {
+        second = 0;
+        anchor = sampleNs;
+        atomic_store_explicit(&sAnchorNs, anchor, memory_order_relaxed);
+        atomic_store_explicit(&sMediaSecond, second, memory_order_relaxed);
+    } else if (anchor <= 0) {
+        anchor = sampleNs;
+        atomic_store_explicit(&sAnchorNs, anchor, memory_order_relaxed);
+    }
+    int64_t elapsed = (sampleNs - anchor) / 1000000000LL;
+    if (elapsed > 0 && elapsed < 86400)
+        second += elapsed;
+    int64_t slot = (MAX(0, second) / 2) * 2;
+    if (atomic_load_explicit(&sLastSlot, memory_order_relaxed) == slot) {
+        atomic_store_explicit(&sInFlight, false, memory_order_release);
+        return;
+    }
 
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sample);
     if (!imageBuffer) {
@@ -93,6 +121,7 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
     CVPixelBufferRetain(retained);
     uint64_t generation = atomic_load(&sGeneration);
     atomic_store(&sLastSlot, slot);
+    atomic_store(&sLastCapturedPresentationNs, sampleNs);
 
     dispatch_async(sConvertQueue, ^{
         @autoreleasepool {
@@ -235,6 +264,7 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sMediaSecond, -1);
     atomic_store(&sAnchorNs, 0);
     atomic_store(&sLastSlot, -1);
+    atomic_store(&sLastCapturedPresentationNs, 0);
     NuvioFrameTapRefreshTargets(layer, renderer);
     NSLog(@"[NuvioCache] Frame tap: layer=%d renderer=%d",
           layerOK, rendererOK);
@@ -258,22 +288,18 @@ void NuvioFrameTapRefreshTargets(AVSampleBufferDisplayLayer *layer,
 
 void NuvioFrameTapSetPlaybackSecond(int64_t second)
 {
-    if (atomic_load_explicit(&sIsPaused, memory_order_relaxed))
-        return;
     if (second < 0) {
-        atomic_store_explicit(&sMediaSecond, -1, memory_order_release);
-        atomic_store(&sAnchorNs, 0);
-        atomic_store(&sLastSlot, -1);
+        // -1 from a UI update is NOT evidence that native playback has
+        // stopped. Never disarm an active stream of video samples.
         return;
     }
-
-    // Do not reset the elapsed-time anchor on every quarter-second UI tick.
-    // Only a genuine progress update or seek reanchors this clock. Repeated
-    // stale time-pos events therefore cannot suppress continuous capture.
-    int64_t previous = atomic_load_explicit(&sMediaSecond, memory_order_relaxed);
+    int64_t previous = atomic_load_explicit(&sMediaSecond,
+                                            memory_order_relaxed);
     if (previous != second) {
-        atomic_store(&sAnchorNs, nuvio_host_ns());
-        atomic_store_explicit(&sMediaSecond, second, memory_order_release);
+        atomic_store_explicit(&sAnchorNs, nuvio_host_ns(),
+                              memory_order_relaxed);
+        atomic_store_explicit(&sMediaSecond, second,
+                              memory_order_release);
     }
 }
 
@@ -283,13 +309,13 @@ void NuvioFrameTapSetPaused(BOOL paused)
                                          memory_order_acq_rel);
     if (old == !!paused)
         return;
-
-    // Starting playback afresh must not extrapolate from the time a
-    // paused frame was shown minutes earlier. The next mpv time-pos event
-    // will provide a new media timestamp and anchor.
-    atomic_store(&sMediaSecond, -1);
-    atomic_store(&sAnchorNs, 0);
-    atomic_store(&sLastSlot, -1);
+    // The native renderer is authoritative. Do not suppress any video sample
+    // on the basis of a cached pause flag; mpv's VO stops enqueuing when
+    // paused. Reanchor to the next video sample after an actual resume.
+    if (!paused) {
+        atomic_store(&sAnchorNs, 0);
+        atomic_store(&sLastCapturedPresentationNs, 0);
+    }
 }
 
 void NuvioFrameTapStop(void)
@@ -300,6 +326,7 @@ void NuvioFrameTapStop(void)
     atomic_store(&sMediaSecond, -1);
     atomic_store(&sAnchorNs, 0);
     atomic_store(&sLastSlot, -1);
+    atomic_store(&sLastCapturedPresentationNs, 0);
     atomic_fetch_add(&sGeneration, 1);
     os_unfair_lock_lock(&sCallbackLock);
     sCallback = nil;

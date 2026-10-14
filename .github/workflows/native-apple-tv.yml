@@ -64,7 +64,13 @@ jobs:
           assert 'nuvio-player' in schemes, f'Native URL scheme missing in app bundle: {schemes!r}'
           assert info.get('CFBundleIdentifier') == 'com.cb541.nuvionativeplayer', info.get('CFBundleIdentifier')
           assert info.get('UIDeviceFamily') == [3], info.get('UIDeviceFamily')
-          print('Verified native deep-link scheme:', schemes)
+          config = info.get('UIApplicationSceneManifest', {}).get('UISceneConfigurations', {})
+          sessions = config.get('UIWindowSceneSessionRoleApplication', [])
+          assert any(
+              entry.get('UISceneDelegateClassName') == 'NuvioNativePlayer.NuvioSceneDelegate'
+              for entry in sessions
+          ), f'tvOS scene URL handler not registered: {sessions!r}'
+          print('Verified native deep-link scheme and tvOS scene:', schemes, sessions)
           PY
           mkdir -p build/native-ipa/Payload
           cp -R "$APP" build/native-ipa/Payload/

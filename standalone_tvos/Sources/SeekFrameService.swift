@@ -62,6 +62,8 @@ final class SeekFrameService {
     private var aheadLastSeconds = 0.0
     private var aheadDisabled = false
     private var aheadSuccessfulDecodes = 0
+    private var aheadRetryAfter = Date.distantPast
+    private var aheadResetPending = false
     private var sourceKey: String?
     // Only the compressed JPEGs consume persistent disk; memory remains
     // bounded. These slot indices are loaded once and amended after writes.
@@ -131,6 +133,8 @@ final class SeekFrameService {
         aheadLastSeconds = 0
         aheadDisabled = false
         aheadSuccessfulDecodes = 0
+        aheadRetryAfter = .distantPast
+        aheadResetPending = false
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -438,6 +442,8 @@ final class SeekFrameService {
         aheadLastSeconds = 0
         aheadDisabled = false
         aheadSuccessfulDecodes = 0
+        aheadRetryAfter = .distantPast
+        aheadResetPending = false
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -485,7 +491,15 @@ final class SeekFrameService {
         let slot = bucket(second)
         lock.lock()
         let cached = cachedSlots.contains(slot) || compressedFrames[slot] != nil
-        let canStart = !cached && !aheadDisabled &&
+        if cached {
+            // CRITICAL: tell the caller to advance its index cursor.
+            // Returning false permanently trapped pre-indexing on the first
+            // future slot that happened to be saved by earlier playback.
+            lock.unlock()
+            return true
+        }
+        let canStart = !aheadDisabled &&
+            Date() >= aheadRetryAfter &&
             pending == nil && pendingBackground == nil && !activeWasBackground
         if canStart {
             pendingBackground = Request(url: url, second: slot,
@@ -582,14 +596,24 @@ final class SeekFrameService {
                 aheadLastSeconds = Date().timeIntervalSince(startedAt)
                 if decoded == nil {
                     aheadFailures += 1
-                    if aheadFailures >= 3 { aheadDisabled = true }
+                    // Signed URLs may intermittently miss a random-access
+                    // frame. Do not kill the *entire movie's* pre-indexing
+                    // after just three GOPs. Let it try new time positions.
+                    // A bounded cooldown protects the active decoder.
+                    if aheadFailures >= 4 {
+                        aheadRetryAfter = Date().addingTimeInterval(
+                            min(18.0, Double(aheadFailures) * 1.5))
+                    }
+                    if aheadFailures >= 16 { aheadDisabled = true }
                 } else {
                     aheadFailures = 0
+                    aheadRetryAfter = .distantPast
                     aheadSuccessfulDecodes += 1
                 }
-                // Release 4K codec reference buffers and the extra HTTP
-                // handle after at most four previews, avoiding tvOS jetsam.
-                if aheadSuccessfulDecodes >= 4 || aheadDisabled {
+                // Reuse the same demuxer/HTTP connection across eight I-frame
+                // samples rather than reopening after every four, then
+                // release it before retained 4K buffers can accumulate.
+                if aheadSuccessfulDecodes >= 8 || aheadDisabled {
                     aheadDecoder?.reset()
                     aheadSuccessfulDecodes = 0
                 }

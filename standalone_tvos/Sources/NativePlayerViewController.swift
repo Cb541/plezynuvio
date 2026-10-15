@@ -151,6 +151,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var lastCacheLookupBucket: Int?
     private var lastSDRIndexAttempt = Date.distantPast
     private var nextSDRIndexSlot = 0
+    private var lastAheadObservedPosition: Double = -1
+    private var lastAheadProgressAt = Date.distantPast
     private var backgroundSnapshotsUnavailable = false
     private var playbackSnapshotInFlight = false
     // Only one small CoreImage output is created at a time. This captures
@@ -405,6 +407,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lastCacheLookupBucket = nil
         lastSDRIndexAttempt = .distantPast
         nextSDRIndexSlot = 0
+        lastAheadObservedPosition = -1
+        lastAheadProgressAt = .distantPast
         backgroundSnapshotsUnavailable = false
         playbackSnapshotInFlight = false
         lastConfirmedPauseAt = nil
@@ -2941,11 +2945,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // samples positions the movie has NOT yet played. One cancellable
         // I-frame probe at a time; it never blocks the playback/UI thread.
         // Dynamic backoff and foreground-seek priority protect 4K DV playback.
+        // Detect genuinely advancing playback from mpv's observed media
+        // position, not a stale UI pause/play flag. This also stops all
+        // future indexing during extended pauses and stalls.
+        if let indexCore = core, indexCore.timePos.isFinite {
+            let position = indexCore.timePos
+            if position > lastAheadObservedPosition + 0.3 {
+                lastAheadProgressAt = Date()
+            }
+            if abs(position - lastAheadObservedPosition) > 0.3 {
+                lastAheadObservedPosition = position
+            }
+        }
         if let media = link, let playbackCore = core,
            !isPreparingPlayback && !waitingForFirstFrame &&
            !displayNegotiationPending && !previewIsVisible &&
            targetSeconds == nil && !isTouchScrubbing &&
-           (playing || !playbackCore.isPaused),
+           Date().timeIntervalSince(lastAheadProgressAt) < 4.0,
            playbackCore.timePos.isFinite && playbackCore.timePos >= 12,
            totalSeconds.isFinite && totalSeconds > 90 {
             let metrics = thumbs.cacheStats()

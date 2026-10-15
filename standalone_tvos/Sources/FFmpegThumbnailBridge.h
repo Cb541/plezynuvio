@@ -19,6 +19,13 @@ NS_ASSUME_NONNULL_BEGIN
                                 second:(int64_t)seconds
                         timeoutSeconds:(double)timeoutSeconds
                                  token:(NuvioThumbnailAbortToken *)token;
+/// Only use on the low-priority background worker. Decodes a nearest
+/// independent keyframe, never a full 4K GOP. Bounded by the supplied token
+/// and timeout; a failed probe returns nil instead of stressing playback.
+- (nullable UIImage *)keyframeThumbnailForURL:(NSURL *)url
+                                        second:(int64_t)seconds
+                                timeoutSeconds:(double)timeoutSeconds
+                                         token:(NuvioThumbnailAbortToken *)token;
 - (void)reset;
 @end
 

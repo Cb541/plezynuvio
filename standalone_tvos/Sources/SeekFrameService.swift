@@ -223,6 +223,24 @@ final class SeekFrameService {
         return compressed.flatMap(UIImage.init(data:))
     }
 
+    /// Nearby cached stills are usable for fast scrub previews without
+    /// performing a costly native seek or starting another decoder.
+    /// Disk reads are left to lookupCached on its dedicated diskReader queue.
+    func hasCachedFrameNear(second: Int) -> Bool {
+        let slot = bucket(second)
+        lock.lock()
+        defer { lock.unlock() }
+        for delta in [0, -2, 2, -4, 4, -6, 6] {
+            let candidate = slot + delta
+            if candidate >= 0 &&
+               (cachedSlots.contains(candidate) ||
+                compressedFrames[candidate] != nil) {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Cache-only lookups never wait for the media decoder or a pause.
     /// Search the exact 2s bucket first, then nearby frames (at most 6s).
     /// Cancel superseded scrubs before disk access to avoid I/O backlogs.

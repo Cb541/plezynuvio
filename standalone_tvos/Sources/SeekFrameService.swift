@@ -539,26 +539,43 @@ final class SeekFrameService {
             let cached = cachedImage(second: job.second)
                 ?? currentDiskImage
                 ?? readDisk(slot: job.second, directory: legacyDirectory)
+            let startedAt = Date()
             let decoded: UIImage?
             if let cached {
                 decoded = cached
             } else if token.cancelled || !job.allowSystemDecode {
-                // HDR/DV uncached targets use the existing mpv decoder,
-                // never a competing AVFoundation 4K generator.
                 decoded = nil
+            } else if job.keyframeOnly {
+                // Only a single FFmpeg thread; codec discards all non-key
+                // pictures. This never creates a second hardware renderer.
+                if aheadDecoder == nil { aheadDecoder = NuvioThumbnailDecoder() }
+                decoded = aheadDecoder?.keyframeThumbnail(
+                    for: job.url, second: Int64(job.second),
+                    timeoutSeconds: 2.5, token: token)
             } else {
-                // Do NOT invoke FFmpeg. It previously decoded 4K streams
-                // independently of the main renderer and repeatedly caused
-                // app termination. System-backed decoding is limited to
-                // formats supported natively by AVFoundation.
                 decoded = appleFallback(url: job.url, second: job.second)
             }
 
             lock.lock()
             let valid = generation == version && !token.cancelled
             let foregroundWaiting = pending != nil
-            if valid, job.prefetch, decoded == nil {
-                // Avoid repeating costly generator probes on unsupported sources.
+            if valid && job.keyframeOnly {
+                aheadAttempts += 1
+                aheadLastSeconds = Date().timeIntervalSince(startedAt)
+                if decoded == nil {
+                    aheadFailures += 1
+                    if aheadFailures >= 3 { aheadDisabled = true }
+                } else {
+                    aheadFailures = 0
+                    aheadSuccessfulDecodes += 1
+                }
+                // Release 4K codec reference buffers and the extra HTTP
+                // handle after at most four previews, avoiding tvOS jetsam.
+                if aheadSuccessfulDecodes >= 4 || aheadDisabled {
+                    aheadDecoder?.reset()
+                    aheadSuccessfulDecodes = 0
+                }
+            } else if valid && job.prefetch && decoded == nil {
                 backgroundPrefetchUnavailable = true
             }
             if activeToken === token { activeToken = nil }
@@ -566,8 +583,13 @@ final class SeekFrameService {
             lock.unlock()
 
             if valid, let image = decoded {
-                remember(image, slot: job.second, directory: directory,
-                         writeToDisk: currentDiskImage == nil)
+                if job.keyframeOnly {
+                    cachePlaybackFrame(image, second: job.second,
+                                       automatic: false, ahead: true)
+                } else {
+                    remember(image, slot: job.second, directory: directory,
+                             writeToDisk: currentDiskImage == nil)
+                }
             }
             if valid, !job.prefetch, !foregroundWaiting,
                let callback = job.callback {

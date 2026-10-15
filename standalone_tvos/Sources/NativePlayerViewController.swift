@@ -2469,6 +2469,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             lastPreviewRequestedBucket = bucket
             return
         }
+        // A pre-indexed frame within 6 seconds is already being retrieved
+        // asynchronously by scheduleFrames(). Avoid an unnecessary native
+        // decoder seek while the user moves across that cached region.
+        if thumbs.hasCachedFrameNear(second: second) { return }
         guard core?.isPaused == true,
               let observedPause = lastConfirmedPauseAt,
               Date().timeIntervalSince(observedPause) >= 0.9 else {

@@ -2962,17 +2962,27 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
            !displayNegotiationPending && !previewIsVisible &&
            targetSeconds == nil && !isTouchScrubbing &&
            Date().timeIntervalSince(lastAheadProgressAt) < 4.0,
-           playbackCore.timePos.isFinite && playbackCore.timePos >= 12,
+           playbackCore.timePos.isFinite && playbackCore.timePos >= 2,
            totalSeconds.isFinite && totalSeconds > 90 {
             let metrics = thumbs.cacheStats()
-            let delay = max(9.0, min(60.0, metrics.aheadLastSeconds * 3.0))
+            // One-at-a-time I-frame extraction is self-throttling: if a
+            // remote seek takes 2.5 seconds, a new one can't start until
+            // that probe finishes. Remove the artificial 9-60s sleep
+            // which left only two future previews after a minute.
+            let thermal = ProcessInfo.processInfo.thermalState
+            let heatPenalty: Double = thermal == .nominal ? 0.0 :
+                (thermal == .fair ? 1.0 : 6.0)
+            let delay = max(0.6, min(5.0, metrics.aheadLastSeconds * 0.35))
+                + heatPenalty
             let current = Int(playbackCore.timePos)
-            // Start forty seconds ahead and advance in 12-second steps,
-            // so nearby seeks usually have a cached still within 6 seconds.
+            // Start 24 seconds ahead; index every 8 seconds to give fast
+            // scrubbing several usable preview options per minute of movie.
+            // An uninterrupted minute can index many minutes ahead if the
+            // source server permits fast random-access reads.
             // Re-anchor following a large real seek without discarding prior
             // cached future frames or touching mpv's own media cache.
-            if nextSDRIndexSlot < current + 40 {
-                nextSDRIndexSlot = ((current + 40) / 2) * 2
+            if nextSDRIndexSlot < current + 24 {
+                nextSDRIndexSlot = ((current + 24) / 2) * 2
             }
             if !metrics.aheadDisabled &&
                nextSDRIndexSlot < Int(totalSeconds) - 2 &&
@@ -2980,7 +2990,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 lastSDRIndexAttempt = Date()
                 if thumbs.prefetchAhead(url: media.url,
                                        second: nextSDRIndexSlot) {
-                    nextSDRIndexSlot += 12
+                    nextSDRIndexSlot += 8
                 }
             }
         }
@@ -3058,10 +3068,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     stats.autoCapturedSlots, stats.seekCapturedSlots)
             } else {
                 thumbnailCacheHealthLabel.text = String(
-                    format: "AHEAD:%d AUTO:%d SEEK:%d · %d disk %d RAM",
-                    stats.aheadCapturedSlots, stats.autoCapturedSlots,
-                    stats.seekCapturedSlots,
-                    stats.diskFrames, stats.ramOnlyFrames)
+                    format: "AHEAD:%d (%d tried) · AUTO:%d SEEK:%d · %d disk",
+                    stats.aheadCapturedSlots, stats.aheadAttempts,
+                    stats.autoCapturedSlots, stats.seekCapturedSlots,
+                    stats.diskFrames)
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

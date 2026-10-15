@@ -105,6 +105,7 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
 // almost every 4K GOP frame; hundreds of temporary CoreGraphics buffers
 // could accumulate in an autorelease pool and trigger tvOS jetsam.
 static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBase,
+                               double acceptableDistance,
                                double *bestDistance, UIImage **bestImage) {
     if (!frame) return false;
     int64_t pts = frame->best_effort_timestamp;
@@ -113,7 +114,8 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     if (*bestImage != nil) {
         if (distance == DBL_MAX ||
             distance >= *bestDistance - 0.7 ||
-            distance > 2.0) return *bestDistance <= 0.65;
+            distance > MAX(2.0, acceptableDistance * 1.5))
+            return *bestDistance <= acceptableDistance;
     }
     // Drain all autoreleased NSData/CGImage objects after each sampled
     // candidate instead of retaining them for the full decode session.
@@ -125,7 +127,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         *bestImage = candidate;
         *bestDistance = distance;
     }
-    return *bestDistance <= 0.65;
+    return *bestDistance <= acceptableDistance;
 }
 
 // This object lives on the SeekFrameService's private serial worker.
@@ -298,6 +300,10 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
 
         UIImage *image = nil;
         double bestSeconds = DBL_MAX;
+        // User-initiated seek is precise. Background pre-indexing accepts
+        // a nearby independent keyframe to avoid decoding another long GOP.
+        // Eight-second future-index intervals still yield useful previews.
+        const double acceptableDistance = keyframesOnly ? 3.0 : 0.65;
         // For every codec, decode toward the requested PTS instead of
         // blindly presenting the first frame after a distant keyframe.
         // Keep the nearest valid frame as a fallback if the URL is slow.
@@ -337,11 +343,12 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                     while (!token.cancelled &&
                            avcodec_receive_frame(_decoder, _frame) == 0) {
                         bool closeEnough = nuvioConsiderFrame(_frame, target,
-                            stream->time_base, &bestSeconds, &image);
+                            stream->time_base, acceptableDistance,
+                            &bestSeconds, &image);
                         av_frame_unref(_frame);
                         if (closeEnough) break;
                     }
-                    if (bestSeconds <= 0.65) {
+                    if (bestSeconds <= acceptableDistance) {
                         av_packet_unref(_packet);
                         goto finished;
                     }
@@ -352,7 +359,8 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                 while (!token.cancelled &&
                        avcodec_receive_frame(_decoder, _frame) == 0) {
                     bool closeEnough = nuvioConsiderFrame(_frame, target,
-                        stream->time_base, &bestSeconds, &image);
+                        stream->time_base, acceptableDistance,
+                            &bestSeconds, &image);
                     av_frame_unref(_frame);
                     if (closeEnough) goto finished;
                 }

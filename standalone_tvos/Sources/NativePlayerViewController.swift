@@ -2987,9 +2987,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if !metrics.aheadDisabled &&
                nextSDRIndexSlot < Int(totalSeconds) - 2 &&
                Date().timeIntervalSince(lastSDRIndexAttempt) >= delay {
-                lastSDRIndexAttempt = Date()
                 if thumbs.prefetchAhead(url: media.url,
                                        second: nextSDRIndexSlot) {
+                    // Reset the cooldown only after the worker accepts a
+                    // request or skips an already-cached slot. Rejected calls
+                    // while the FFmpeg worker is busy must never add another
+                    // artificial delay between successfully indexed frames.
+                    lastSDRIndexAttempt = Date()
                     nextSDRIndexSlot += 8
                 }
             }

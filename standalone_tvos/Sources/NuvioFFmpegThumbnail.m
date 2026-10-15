@@ -161,6 +161,26 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                                 second:(int64_t)seconds
                         timeoutSeconds:(double)timeoutSeconds
                                  token:(NuvioThumbnailAbortToken *)token {
+    return [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
+                    token:token keyframesOnly:NO];
+}
+
+- (nullable UIImage *)keyframeThumbnailForURL:(NSURL *)url
+                                        second:(int64_t)seconds
+                                timeoutSeconds:(double)timeoutSeconds
+                                         token:(NuvioThumbnailAbortToken *)token {
+    return [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
+                    token:token keyframesOnly:YES];
+}
+
+// The future indexer must never run full-GOP 4K software decoding alongside
+// mpv's VideoToolbox renderer. A keyframe probe decodes I/IDR/CRA frames only,
+// at one worker thread, and stops after a very small packet/time budget.
+- (nullable UIImage *)decodeURL:(NSURL *)url
+                          second:(int64_t)seconds
+                  timeoutSeconds:(double)timeoutSeconds
+                           token:(NuvioThumbnailAbortToken *)token
+                   keyframesOnly:(BOOL)keyframesOnly {
     @autoreleasepool {
         if (token.cancelled || !url) return nil;
         NSString *scheme = url.scheme.lowercaseString;
@@ -247,7 +267,12 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         _format->interrupt_callback.opaque = &deadline;
         // Refresh the budget after open/probe, so fallback decoding is not
         // starved by HTTP negotiation time on small remote files.
-        deadline.deadline = CFAbsoluteTimeGetCurrent() + MAX(5.0, timeoutSeconds);
+        deadline.deadline = CFAbsoluteTimeGetCurrent() +
+            (keyframesOnly ? MAX(2.0, timeoutSeconds) : MAX(5.0, timeoutSeconds));
+        // Frame dropping at the codec level prevents secondary 4K P/B-frame
+        // decoding. This is essential to tvOS memory/thermal stability.
+        _decoder->skip_frame = keyframesOnly ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;
+        _decoder->skip_loop_filter = keyframesOnly ? AVDISCARD_ALL : AVDISCARD_DEFAULT;
         AVStream *stream = _format->streams[_streamIndex];
         int64_t target = av_rescale_q(MAX(0, seconds), (AVRational){1, 1},
                                       stream->time_base);
@@ -276,7 +301,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         // For every codec, decode toward the requested PTS instead of
         // blindly presenting the first frame after a distant keyframe.
         // Keep the nearest valid frame as a fallback if the URL is slow.
-        for (int pass = 0; pass < 2 && !token.cancelled; ++pass) {
+        for (int pass = 0; pass < (keyframesOnly ? 1 : 2) && !token.cancelled; ++pass) {
             if (pass == 1) {
                 if (CFAbsoluteTimeGetCurrent() >= deadline.deadline) break;
                 int64_t rewindTicks = av_rescale_q(8, (AVRational){1, 1},
@@ -292,7 +317,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                 if (retrySeek < 0) break;
                 avcodec_flush_buffers(_decoder);
             }
-            const int packetLimit = pass == 0 ? 210 : 320;
+            const int packetLimit = keyframesOnly ? 55 : (pass == 0 ? 210 : 320);
             int videoPackets = 0;
             while (!token.cancelled &&
                    CFAbsoluteTimeGetCurrent() < deadline.deadline &&
@@ -342,6 +367,10 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         }
         // Keep a fully initialized demuxer across seeks. A failed decode
         // resets the session so a later request can reconnect cleanly.
+        if (keyframesOnly && bestSeconds > 5.5) {
+            // Avoid showing a frame many seconds away as an exact seek still.
+            image = nil;
+        }
         if (!image) {
             NSLog(@"[NuvioPreview] no frame: video=%d codec=%d index=%d range=%d; source URL redacted",
                   _streamIndex, stream->codecpar->codec_id, _streamIndex, seekResult);

@@ -23,6 +23,11 @@ final class SeekFrameService {
         let storageError: String
         let autoCapturedSlots: Int
         let seekCapturedSlots: Int
+        let aheadCapturedSlots: Int
+        let aheadAttempts: Int
+        let aheadFailures: Int
+        let aheadLastSeconds: Double
+        let aheadDisabled: Bool
     }
 
     private struct Request {
@@ -30,6 +35,7 @@ final class SeekFrameService {
         let second: Int
         let prefetch: Bool
         let allowSystemDecode: Bool
+        let keyframeOnly: Bool
         let callback: ((UIImage?) -> Void)?
     }
 
@@ -50,6 +56,12 @@ final class SeekFrameService {
     // Keep older thumbnails readable while new frames live in Application Support.
     private var legacyScopedDirectory: URL?
     private var backgroundPrefetchUnavailable = false
+    private var aheadDecoder: NuvioThumbnailDecoder?
+    private var aheadAttempts = 0
+    private var aheadFailures = 0
+    private var aheadLastSeconds = 0.0
+    private var aheadDisabled = false
+    private var aheadSuccessfulDecodes = 0
     private var sourceKey: String?
     // Only the compressed JPEGs consume persistent disk; memory remains
     // bounded. These slot indices are loaded once and amended after writes.
@@ -75,6 +87,7 @@ final class SeekFrameService {
     private var lastStorageError = ""
     private var autoCapturedSlots = Set<Int>()
     private var seekCapturedSlots = Set<Int>()
+    private var aheadCapturedSlots = Set<Int>()
 
     init() {
         // RAM is bounded to protect playback; the persistent disk cache
@@ -113,6 +126,11 @@ final class SeekFrameService {
         legacyScopedDirectory = legacyRoot.appendingPathComponent(identity,
                                                                   isDirectory: true)
         backgroundPrefetchUnavailable = false
+        aheadAttempts = 0
+        aheadFailures = 0
+        aheadLastSeconds = 0
+        aheadDisabled = false
+        aheadSuccessfulDecodes = 0
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -127,10 +145,12 @@ final class SeekFrameService {
         lastStorageError = ""
         autoCapturedSlots.removeAll()
         seekCapturedSlots.removeAll()
+        aheadCapturedSlots.removeAll()
         hotImages.removeAllObjects()
         let version = generation
         let oldDirectory = legacyScopedDirectory
         lock.unlock()
+        worker.async { [weak self] in self?.aheadDecoder?.reset() }
         // Populate timeline coverage from this movie's previous sessions.
         // One directory scan, never one filesystem lookup per UI frame.
         diskReader.async { [weak self] in
@@ -182,7 +202,12 @@ final class SeekFrameService {
             ramOnlyFrames: coverage.count - cachedSlots.count,
             storageError: lastStorageError,
             autoCapturedSlots: autoCapturedSlots.count,
-            seekCapturedSlots: seekCapturedSlots.count)
+            seekCapturedSlots: seekCapturedSlots.count,
+            aheadCapturedSlots: aheadCapturedSlots.count,
+            aheadAttempts: aheadAttempts,
+            aheadFailures: aheadFailures,
+            aheadLastSeconds: aheadLastSeconds,
+            aheadDisabled: aheadDisabled)
         lock.unlock()
         return result
     }
@@ -250,14 +275,16 @@ final class SeekFrameService {
     /// Normal playback needs only a small retained UIImage; JPEG encoding
     /// and all filesystem operations run on the serial disk writer.
     func cachePlaybackFrame(_ image: UIImage, second: Int,
-                            automatic: Bool = true) {
+                            automatic: Bool = true, ahead: Bool = false) {
         let slot = bucket(second)
         lock.lock()
         let primary = scopedDirectory
         let fallback = legacyScopedDirectory
         let epoch = cacheEpoch
         deliveredFrames += 1
-        if automatic {
+        if ahead {
+            aheadCapturedSlots.insert(slot)
+        } else if automatic {
             autoCapturedSlots.insert(slot)
         } else {
             seekCapturedSlots.insert(slot)
@@ -388,6 +415,11 @@ final class SeekFrameService {
         scopedDirectory = nil
         legacyScopedDirectory = nil
         backgroundPrefetchUnavailable = false
+        aheadAttempts = 0
+        aheadFailures = 0
+        aheadLastSeconds = 0
+        aheadDisabled = false
+        aheadSuccessfulDecodes = 0
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -402,8 +434,10 @@ final class SeekFrameService {
         lastStorageError = ""
         autoCapturedSlots.removeAll()
         seekCapturedSlots.removeAll()
+        aheadCapturedSlots.removeAll()
         hotImages.removeAllObjects()
         lock.unlock()
+        worker.async { [weak self] in self?.aheadDecoder?.reset() }
         // Intentionally DO NOT delete stored previews.
     }
 
@@ -417,7 +451,7 @@ final class SeekFrameService {
         lock.lock()
         let request = Request(url: url, second: slot,
                               prefetch: false, allowSystemDecode: allowSystemDecode,
-                              callback: callback)
+                              keyframeOnly: false, callback: callback)
         pending = request
         // A foreground preview always supersedes any background decode.
         if activeWasBackground { activeToken?.cancelled = true }
@@ -425,21 +459,30 @@ final class SeekFrameService {
         lock.unlock()
     }
 
-    /// Opportunistically generate one thumbnail near playback. Uses the
-    /// same serial decoder and is always lower priority than user seeking.
-    func prefetch(url: URL, second: Int) {
-        // No second decoder for MKV/HDR/DV; caller enables this only for SDR.
-        guard ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased()) else { return }
+    /// Index future, UNWATCHED positions, not the already-played frame tap.
+    /// A single low-priority slot, cancelled by foreground seeking.
+    @discardableResult
+    func prefetchAhead(url: URL, second: Int) -> Bool {
+        guard url.scheme == "http" || url.scheme == "https" else { return false }
         let slot = bucket(second)
-        if hotImages.object(forKey: key(slot)) != nil { return }
         lock.lock()
-        if !backgroundPrefetchUnavailable, pending == nil, pendingBackground == nil {
+        let cached = cachedSlots.contains(slot) || compressedFrames[slot] != nil
+        let canStart = !cached && !aheadDisabled &&
+            pending == nil && pendingBackground == nil && !activeWasBackground
+        if canStart {
             pendingBackground = Request(url: url, second: slot,
-                                        prefetch: true, allowSystemDecode: true,
-                                        callback: nil)
+                prefetch: true, allowSystemDecode: true,
+                keyframeOnly: true, callback: nil)
             scheduleWorkerLocked()
         }
         lock.unlock()
+        return canStart
+    }
+
+    func prefetch(url: URL, second: Int) {
+        guard ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased())
+        else { return }
+        _ = prefetchAhead(url: url, second: second)
     }
 
     private func scheduleWorkerLocked() {

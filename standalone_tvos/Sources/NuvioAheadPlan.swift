@@ -1,4 +1,4 @@
-/// First cover future positions at 24-second intervals, then fill to 8 seconds.
+/// First cover future positions at 24-second intervals, then fill to 12 seconds.
 /// This is independent of the seek UI and runs until both passes are complete.
 struct NuvioAheadPlan {
     private(set) var cursor = 0
@@ -10,7 +10,7 @@ struct NuvioAheadPlan {
     var hasPending: Bool { pass < 2 }
 
     mutating func update(playback: Int, duration: Int) {
-        let minimum = ((max(0, playback) + 8) / 8) * 8
+        let minimum = ((max(0, playback) + 12) / 12) * 12
         if lastPlayback == nil || abs(playback - (lastPlayback ?? playback)) > 20 {
             pass = 0
             cursor = minimum
@@ -29,7 +29,7 @@ struct NuvioAheadPlan {
                 continue
             }
             let result = cursor
-            cursor += pass == 0 ? 24 : 8
+            cursor += pass == 0 ? 24 : 12
             return result
         }
         return nil

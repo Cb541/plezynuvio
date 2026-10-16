@@ -101,7 +101,7 @@ final class SeekFrameService {
     }
 
     private func bucket(_ second: Int) -> Int {
-        max(0, (second / 2) * 2)
+        max(0, (second / 12) * 12)
     }
 
     private func key(_ second: Int) -> NSString {
@@ -244,7 +244,7 @@ final class SeekFrameService {
         let slot = bucket(second)
         lock.lock()
         defer { lock.unlock() }
-        for delta in [0, -2, 2, -4, 4, -6, 6, -8, 8, -10, 10, -12, 12] {
+        for delta in [0, -12, 12] {
             let candidate = slot + delta
             if candidate >= 0 &&
                (cachedSlots.contains(candidate) ||
@@ -256,7 +256,7 @@ final class SeekFrameService {
     }
 
     /// Cache-only lookups never wait for the media decoder or a pause.
-    /// Search the exact 2s bucket first, then nearby frames (at most 12s on the coarse pass).
+    /// Search the exact 12s bucket first, then nearby frames (at most 12s on the coarse pass).
     /// Cancel superseded scrubs before disk access to avoid I/O backlogs.
     func lookupCached(second: Int,
                       callback: @escaping (UIImage?, Int?, Bool) -> Void) {
@@ -272,10 +272,7 @@ final class SeekFrameService {
             guard let self else { return }
             var found: UIImage?
             var foundSlot: Int?
-            let candidates = [slot, slot - 2, slot + 2,
-                              slot - 4, slot + 4, slot - 6, slot + 6,
-                              slot - 8, slot + 8, slot - 10, slot + 10,
-                              slot - 12, slot + 12]
+            let candidates = [slot, slot - 12, slot + 12]
             for candidate in candidates where candidate >= 0 {
                 self.lock.lock()
                 let stillCurrent = self.generation == version
@@ -312,6 +309,10 @@ final class SeekFrameService {
                             automatic: Bool = true, ahead: Bool = false) {
         let slot = bucket(second)
         lock.lock()
+        if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
+            lock.unlock()
+            return
+        }
         let primary = scopedDirectory
         let fallback = legacyScopedDirectory
         let epoch = cacheEpoch
@@ -337,7 +338,7 @@ final class SeekFrameService {
             self.lock.unlock()
             guard valid else { return }
 
-            // One 720px frame every ~2sec. Keeping a 24MiB compressed RAM
+            // One 720px frame every ~12sec. Keeping a 24MiB compressed RAM
             // ring permits real cached thumbnails even if disk IO fails.
             guard let bytes = image.jpegData(compressionQuality: 0.78) else {
                 self.lock.lock()
@@ -504,7 +505,7 @@ final class SeekFrameService {
         lock.lock()
         let request = Request(url: url, second: slot,
                               prefetch: false, allowSystemDecode: allowSystemDecode,
-                              keyframeOnly: false, callback: callback)
+                              keyframeOnly: true, callback: callback)
         pending = request
         // A foreground preview always supersedes any background decode.
         if activeWasBackground { activeToken?.cancelled = true }
@@ -629,7 +630,7 @@ final class SeekFrameService {
             lock.lock()
             let valid = generation == version && !token.cancelled
             let foregroundWaiting = pending != nil
-            if valid && job.keyframeOnly {
+            if valid && job.keyframeOnly && job.prefetch {
                 aheadAttempts += 1
                 aheadLastSeconds = Date().timeIntervalSince(startedAt)
                 if decoded == nil {
@@ -654,7 +655,7 @@ final class SeekFrameService {
             if valid, let image = decoded {
                 if job.keyframeOnly {
                     cachePlaybackFrame(image, second: job.second,
-                                       automatic: false, ahead: true)
+                                       automatic: false, ahead: job.prefetch)
                     diskWriter.sync {}
                 } else {
                     remember(image, slot: job.second, directory: directory,

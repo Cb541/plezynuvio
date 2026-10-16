@@ -2401,10 +2401,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             lastPreviewImageSecond = nil
         }
 
-        // Cache is consulted immediately, independently of hardware pause
-        // and video decoding. Approximate previews are at most 6s away;
-        // uncached targets still generate their own exact frame on demand.
-        let slot = max(0, (Int(seconds.rounded()) / 2) * 2)
+        // The preview grid stays at twelve seconds inside the fast-forward
+        // menu too. Moving the cursor within a cell must not decode more frames.
+        let slot = max(0, (Int(seconds.rounded()) / 12) * 12)
         if lastCacheLookupBucket != slot {
             lastCacheLookupBucket = slot
             if let hot = thumbs.cachedImage(second: slot) {
@@ -2416,7 +2415,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     guard let self, self.previewIsVisible,
                           self.currentPreviewSerial == serial,
                           let target = self.targetSeconds,
-                          max(0, (Int(target.rounded()) / 2) * 2) == slot,
+                          max(0, (Int(target.rounded()) / 12) * 12) == slot,
                           let image, let foundSlot else { return }
                     if exact || self.lastPreviewImageSecond != slot {
                         self.frameViews.first?.image = image
@@ -2456,73 +2455,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func loadFrames(serial: Int) {
         guard previewIsVisible, let link, let targetSeconds,
               serial == currentPreviewSerial else { return }
-        let second = max(0, Int(targetSeconds.rounded()))
-        let bucket = (second / 2) * 2
-        // Exact RAM hit: no pause wait and no video decoder request.
-        if let cached = thumbs.cachedImage(second: second) {
+        let slot = max(0, (Int(targetSeconds.rounded()) / 12) * 12)
+        if let cached = thumbs.cachedImage(second: slot) {
             frameViews.first?.image = cached
-            lastPreviewImageSecond = bucket
-            lastPreviewRequestedBucket = bucket
+            lastPreviewImageSecond = slot
+            lastPreviewRequestedBucket = slot
             return
         }
-        // A pre-indexed frame within 6 seconds is already being retrieved
-        // asynchronously by scheduleFrames(). Avoid an unnecessary native
-        // decoder seek while the user moves across that cached region.
-        if thumbs.hasCachedFrameNear(second: second) { return }
-        guard core?.isPaused == true,
-              let observedPause = lastConfirmedPauseAt,
-              Date().timeIntervalSince(observedPause) >= 0.9 else {
-            // Optimistic core.isPaused can flip before the hardware video
-            // renderer actually stops. Give it time to release frames before
-            // starting a software FFmpeg decoder on the same 4K stream.
-            guard thumbTimer == nil else { return }
-            thumbTimer = Timer.scheduledTimer(withTimeInterval: 0.35,
-                repeats: false) { [weak self] _ in
-                guard let self else { return }
-                self.thumbTimer = nil
-                self.loadFrames(serial: serial)
-            }
-            return
-        }
-        guard lastPreviewRequestedBucket != bucket else { return }
-        lastPreviewRequestedBucket = bucket
-        if touchpadPreviewMode && isTouchScrubbing {
-            lastLiveTouchpadRequest = Date()
-        }
-        if touchpadPreviewMode {
-            PlayerStartupDiagnostics.mark("touchpad-thumbnail-decode")
-        }
-        // Always check the persistent disk cache FIRST, even for MKV.
-        // For unsupported containers Apple's generator returns nil and the
-        // existing mpv decoder takes over without starting a second FFmpeg.
-        // HDR/DV cache misses must never start a competing decoder.
-        let allowSystemDecode = sourceColorMetadataReady && !sourceIsHDR
-            && !requiresNativeDolbyVision
-        thumbs.request(url: link.url, second: second,
-                       allowSystemDecode: allowSystemDecode) { [weak self] image in
+        // Nearby disk frames are already being loaded by scheduleFrames.
+        // Never refine them to an exact cursor position or seek the main video.
+        if thumbs.hasCachedFrameNear(second: slot) { return }
+        guard lastPreviewRequestedBucket != slot else { return }
+        lastPreviewRequestedBucket = slot
+        thumbs.request(url: link.url, second: slot) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,
                   self.link?.url == link.url,
                   let current = self.targetSeconds,
-                  max(0, (Int(current.rounded()) / 2) * 2) == bucket else { return }
+                  max(0, (Int(current.rounded()) / 12) * 12) == slot else { return }
             if let image {
-                // One latest available preview, with no status message.
                 self.frameViews.first?.image = image
-                self.lastPreviewImageSecond = bucket
+                self.lastPreviewImageSecond = slot
                 self.filmStrip.alpha = 1
-                if self.touchpadPreviewMode {
-                    PlayerStartupDiagnostics.mark("touchpad-thumbnail-ready")
-                }
-            } else {
-                // A failed position must not be permanently blacklisted.
-                // Revisit it after a later touch movement (e.g. another
-                // seek region or once a remote connection is ready).
-                // AVFoundation cannot demux Matroska and several other
-                // formats. Use the EXISTING mpv decoder for uncached
-                // targets, with a frozen original frame over the movie.
-                self.requestNativePreviewTarget(bucket, serial: serial)
-                PlayerStartupDiagnostics.mark("thumbnail-native-fallback-request")
             }
+            // Missing frames stay on the same sparse grid. No native-player
+            // seek fallback: it was filling the cache with dense exact frames.
             self.previewLoadingLabel.isHidden = true
             self.previewStatusLabel.isHidden = true
         }
@@ -2938,9 +2895,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // Only the actual playback timestamp anchors the forward index.
         if let media = link, let playbackCore = core,
            !isPreparingPlayback && !waitingForFirstFrame &&
-           !displayNegotiationPending && !previewIsVisible &&
-           targetSeconds == nil && !isTouchScrubbing &&
-           committedSeekTarget == nil {
+           !displayNegotiationPending && committedSeekTarget == nil {
             thumbs.updateAheadIndex(url: media.url,
                 playback: playbackCore.timePos, duration: totalSeconds)
         } else {

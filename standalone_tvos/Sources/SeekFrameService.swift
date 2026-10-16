@@ -62,10 +62,9 @@ final class SeekFrameService {
     private var aheadLastSeconds = 0.0
     private var aheadDisabled = false
     private var indexURL: URL?
-    private var indexCursor = 0
-    private var indexEnd = 0
+    private var indexPlan = NuvioAheadPlan()
+    private var indexSourceURL: URL?
     private var indexPlayback = 0
-    private var indexLastPlayback = 0
     private var indexingSuspended = false
     private var aheadRetryAfter = Date.distantPast
     private var sourceKey: String?
@@ -137,10 +136,9 @@ final class SeekFrameService {
         aheadLastSeconds = 0
         aheadDisabled = false
         indexURL = nil
-        indexCursor = 0
-        indexEnd = 0
+        indexPlan = NuvioAheadPlan()
+        indexSourceURL = nil
         indexPlayback = 0
-        indexLastPlayback = 0
         aheadRetryAfter = .distantPast
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
@@ -161,7 +159,10 @@ final class SeekFrameService {
         let version = generation
         let oldDirectory = legacyScopedDirectory
         lock.unlock()
-        worker.async { [weak self] in self?.aheadDecoder?.reset() }
+        worker.async { [weak self] in
+            self?.aheadDecoder?.reset()
+            self?.aheadDecoder = nil
+        }
         // Populate timeline coverage from this movie's previous sessions.
         // One directory scan, never one filesystem lookup per UI frame.
         diskReader.async { [weak self] in
@@ -243,7 +244,7 @@ final class SeekFrameService {
         let slot = bucket(second)
         lock.lock()
         defer { lock.unlock() }
-        for delta in [0, -2, 2, -4, 4, -6, 6] {
+        for delta in [0, -2, 2, -4, 4, -6, 6, -8, 8, -10, 10, -12, 12] {
             let candidate = slot + delta
             if candidate >= 0 &&
                (cachedSlots.contains(candidate) ||
@@ -255,7 +256,7 @@ final class SeekFrameService {
     }
 
     /// Cache-only lookups never wait for the media decoder or a pause.
-    /// Search the exact 2s bucket first, then nearby frames (at most 6s).
+    /// Search the exact 2s bucket first, then nearby frames (at most 12s on the coarse pass).
     /// Cancel superseded scrubs before disk access to avoid I/O backlogs.
     func lookupCached(second: Int,
                       callback: @escaping (UIImage?, Int?, Bool) -> Void) {
@@ -272,7 +273,9 @@ final class SeekFrameService {
             var found: UIImage?
             var foundSlot: Int?
             let candidates = [slot, slot - 2, slot + 2,
-                              slot - 4, slot + 4, slot - 6, slot + 6]
+                              slot - 4, slot + 4, slot - 6, slot + 6,
+                              slot - 8, slot + 8, slot - 10, slot + 10,
+                              slot - 12, slot + 12]
             for candidate in candidates where candidate >= 0 {
                 self.lock.lock()
                 let stillCurrent = self.generation == version
@@ -463,10 +466,9 @@ final class SeekFrameService {
         aheadLastSeconds = 0
         aheadDisabled = false
         indexURL = nil
-        indexCursor = 0
-        indexEnd = 0
+        indexPlan = NuvioAheadPlan()
+        indexSourceURL = nil
         indexPlayback = 0
-        indexLastPlayback = 0
         aheadRetryAfter = .distantPast
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
@@ -485,7 +487,10 @@ final class SeekFrameService {
         aheadCapturedSlots.removeAll()
         hotImages.removeAllObjects()
         lock.unlock()
-        worker.async { [weak self] in self?.aheadDecoder?.reset() }
+        worker.async { [weak self] in
+            self?.aheadDecoder?.reset()
+            self?.aheadDecoder = nil
+        }
         // Intentionally DO NOT delete stored previews.
     }
 
@@ -518,25 +523,22 @@ final class SeekFrameService {
         defer { lock.unlock() }
         guard !indexingSuspended else { return }
         let position = Int(playback)
-        if indexURL != url || abs(position - indexLastPlayback) > 20 {
-            indexCursor = bucket(position + 8)
+        if indexSourceURL != url {
+            indexPlan = NuvioAheadPlan()
+            indexSourceURL = url
         }
         indexURL = url
         indexPlayback = position
-        indexLastPlayback = position
-        indexEnd = Int(duration) - 1
-        indexCursor = max(indexCursor, bucket(position + 8))
+        indexPlan.update(playback: position, duration: Int(duration))
         scheduleWorkerLocked()
     }
 
-    // Called with lock held. Eight-second spacing gives broad coverage first;
-    // every sample is persisted before another decode, keeping RAM bounded.
+    // Called with lock held. Coarse coverage first, then dense coverage.
+    // The disk range cache reuses downloaded bytes on the refinement pass.
     private func nextIndexRequestLocked() -> Request? {
         guard let url = indexURL, !indexingSuspended,
               Date() >= aheadRetryAfter else { return nil }
-        while indexCursor < indexEnd {
-            let slot = indexCursor
-            indexCursor += 8
+        while let slot = indexPlan.next() {
             if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
                 continue
             }
@@ -614,8 +616,8 @@ final class SeekFrameService {
             } else if token.cancelled || !job.allowSystemDecode {
                 decoded = nil
             } else if job.keyframeOnly {
-                // One software decoder, keyframes first with reference
-                // fallback. No second hardware renderer is created.
+                // Keyframes first, two slice threads at most; fetched ranges
+                // live on disk. No second hardware renderer is created.
                 if aheadDecoder == nil { aheadDecoder = NuvioThumbnailDecoder() }
                 decoded = aheadDecoder?.keyframeThumbnail(
                     for: job.url, second: Int64(job.second),
@@ -666,7 +668,7 @@ final class SeekFrameService {
             lock.lock()
             isWorkerRunning = false
             if pending != nil || pendingBackground != nil ||
-               (indexURL != nil && indexCursor < indexEnd && Date() >= aheadRetryAfter) {
+               (indexURL != nil && indexPlan.hasPending && Date() >= aheadRetryAfter) {
                 scheduleWorkerLocked()
             }
             lock.unlock()

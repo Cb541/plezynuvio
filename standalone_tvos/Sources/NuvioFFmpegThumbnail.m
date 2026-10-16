@@ -1,4 +1,6 @@
 #import "FFmpegThumbnailBridge.h"
+#include "NuvioRangeCache.h"
+#include <Libavformat/avio.h>
 
 // Import only the FFmpeg declarations used here. Importing the generated
 // Libavutil umbrella module also imports desktop-only AMF headers, which
@@ -27,6 +29,38 @@ static int nuvioInterrupt(void *opaque) {
     if (!opaque) return 1;
     NuvioReadDeadline *state = (NuvioReadDeadline *)opaque;
     return state->token.cancelled || CFAbsoluteTimeGetCurrent() > state->deadline;
+}
+
+// Each preview decoder owns a separate network cursor and sparse disk cache.
+// No mpv playback seek/cache state is modified by this input.
+typedef struct {
+    AVIOContext *remote;
+    NuvioRangeCache *ranges;
+    NuvioReadDeadline deadline;
+    int64_t size;
+} NuvioCachedInput;
+
+static int nuvioRemoteRead(void *opaque, uint8_t *buffer, int size) {
+    NuvioCachedInput *input = opaque;
+    return avio_read(input->remote, buffer, size);
+}
+static int64_t nuvioRemoteSeek(void *opaque, int64_t offset) {
+    NuvioCachedInput *input = opaque;
+    return avio_seek(input->remote, offset, SEEK_SET);
+}
+static int nuvioCacheInterrupt(void *opaque) {
+    NuvioCachedInput *input = opaque;
+    return nuvioInterrupt(&input->deadline);
+}
+static int nuvioCachedRead(void *opaque, uint8_t *buffer, int size) {
+    NuvioCachedInput *input = opaque;
+    int result = nuvio_range_read(input->ranges, buffer, size);
+    return result == 0 ? AVERROR_EOF : result;
+}
+static int64_t nuvioCachedSeek(void *opaque, int64_t offset, int whence) {
+    NuvioCachedInput *input = opaque;
+    if (whence & AVSEEK_SIZE) return input->size;
+    return nuvio_range_seek(input->ranges, offset, whence & ~AVSEEK_FORCE);
 }
 
 // Detect letterbox rows embedded into a decoded frame. scaleAspectFill
@@ -140,6 +174,70 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     AVFrame *_frame;
     int _streamIndex;
     NSString *_sourceURL;
+    NuvioCachedInput *_cachedInput;
+    AVIOContext *_cachedIO;
+    NSURL *_rangeDirectory;
+    NSString *_rangeSourceURL;
+}
+
+- (void)prepareRangeDirectory:(NSURL *)url {
+    if ([_rangeSourceURL isEqualToString:url.absoluteString]) return;
+    if (_rangeDirectory) [[NSFileManager defaultManager] removeItemAtURL:_rangeDirectory error:nil];
+    NSURL *root = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory
+                                                      inDomains:NSUserDomainMask].firstObject;
+    _rangeDirectory = [[root URLByAppendingPathComponent:@"NuvioPreviewRanges"]
+        URLByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    [[NSFileManager defaultManager] createDirectoryAtURL:_rangeDirectory
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    _rangeSourceURL = [url.absoluteString copy];
+}
+
+- (void)closeCachedInput {
+    if (_cachedIO) {
+        av_freep(&_cachedIO->buffer);
+        avio_context_free(&_cachedIO);
+    }
+    if (_cachedInput) {
+        nuvio_range_free(_cachedInput->ranges);
+        _cachedInput->deadline.token = nil;
+        _cachedInput->deadline.deadline = 0;
+        avio_closep(&_cachedInput->remote);
+        free(_cachedInput);
+        _cachedInput = NULL;
+    }
+}
+
+- (BOOL)openCachedInput:(NSURL *)url deadline:(NuvioReadDeadline)deadline {
+    // Let playlist demuxers manage their own child resources as before.
+    if ([@[@"m3u8", @"mpd"] containsObject:url.pathExtension.lowercaseString]) return NO;
+    [self prepareRangeDirectory:url];
+    if (!_rangeDirectory) return NO;
+    _cachedInput = calloc(1, sizeof(*_cachedInput));
+    if (!_cachedInput) return NO;
+    _cachedInput->deadline = deadline;
+    AVIOInterruptCB interrupt = { nuvioCacheInterrupt, _cachedInput };
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "rw_timeout", "5500000", 0);
+    av_dict_set(&options, "multiple_requests", "1", 0);
+    int rc = avio_open2(&_cachedInput->remote, url.absoluteString.UTF8String,
+                       AVIO_FLAG_READ, &interrupt, &options);
+    av_dict_free(&options);
+    if (rc < 0 || !_cachedInput->remote) { [self closeCachedInput]; return NO; }
+    _cachedInput->size = avio_size(_cachedInput->remote);
+    if (_cachedInput->size <= 0 || !(_cachedInput->remote->seekable & AVIO_SEEKABLE_NORMAL)) {
+        [self closeCachedInput]; return NO;
+    }
+    _cachedInput->ranges = nuvio_range_create(_rangeDirectory.fileSystemRepresentation,
+        _cachedInput->size, nuvioRemoteRead, nuvioRemoteSeek, nuvioCacheInterrupt, _cachedInput);
+    if (!_cachedInput->ranges) { [self closeCachedInput]; return NO; }
+    uint8_t *buffer = av_malloc(65536);
+    if (!buffer) { [self closeCachedInput]; return NO; }
+    _cachedIO = avio_alloc_context(buffer, 65536, 0, _cachedInput,
+                                  nuvioCachedRead, NULL, nuvioCachedSeek);
+    if (!_cachedIO) { av_free(buffer); [self closeCachedInput]; return NO; }
+    _cachedIO->seekable = AVIO_SEEKABLE_NORMAL;
+    return YES;
+
 }
 
 - (void)reset {
@@ -150,6 +248,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         _format->interrupt_callback.opaque = NULL;
         avformat_close_input(&_format);
     }
+    [self closeCachedInput];
     _format = NULL;
     _streamIndex = -1;
     _sourceURL = nil;
@@ -157,6 +256,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
 
 - (void)dealloc {
     [self reset];
+    if (_rangeDirectory) [[NSFileManager defaultManager] removeItemAtURL:_rangeDirectory error:nil];
 }
 
 - (nullable UIImage *)thumbnailForURL:(NSURL *)url
@@ -182,7 +282,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     return image;
 }
 
-// One software decoder/thread, with cancellable network deadlines. Prefer
+// One software decoder with up to two slice threads, with cancellable network deadlines. Prefer
 // independent pictures; use reference decoding only when that cannot emit one.
 - (nullable UIImage *)decodeURL:(NSURL *)url
                           second:(int64_t)seconds
@@ -209,6 +309,10 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
             _format->interrupt_callback.callback = nuvioInterrupt;
             _format->interrupt_callback.opaque = &deadline;
 
+            if ([self openCachedInput:url deadline:deadline]) {
+                _format->pb = _cachedIO;
+                _format->flags |= AVFMT_FLAG_CUSTOM_IO;
+            }
             AVDictionary *options = NULL;
             av_dict_set(&options, "rw_timeout", "5500000", 0);
             int rc = avformat_open_input(&_format, url.absoluteString.UTF8String,
@@ -252,7 +356,8 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
             // reference decoding before ANY displayable frame is emitted.
             // The previous NONREF mode often yielded zero frames, and the
             // fallback ran only after the shared network deadline expired.
-            _decoder->thread_count = 1;
+            _decoder->thread_count = 2;
+            _decoder->thread_type = FF_THREAD_SLICE;
             // The previous NONREF/FAST shortcuts also affected H.264, VP9,
             // AV1 and other streams. Accurate thumbnails require the same
             // reference frames as regular video playback.
@@ -277,6 +382,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         // starved by HTTP negotiation time on small remote files.
         deadline.deadline = CFAbsoluteTimeGetCurrent() +
             (keyframesOnly ? MAX(2.0, timeoutSeconds) : MAX(5.0, timeoutSeconds));
+        if (_cachedInput) _cachedInput->deadline = deadline;
         // Frame dropping at the codec level prevents secondary 4K P/B-frame
         // decoding. This is essential to tvOS memory/thermal stability.
         _decoder->skip_frame = keyframesOnly ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;
@@ -398,6 +504,10 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         av_frame_unref(_frame);
         av_packet_unref(_packet);
         _format->interrupt_callback.opaque = NULL;
+        if (_cachedInput) {
+            _cachedInput->deadline.token = nil;
+            _cachedInput->deadline.deadline = 0;
+        }
         if (token.cancelled) {
             [self reset];
             return nil;

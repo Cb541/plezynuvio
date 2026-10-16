@@ -28,6 +28,7 @@ final class SeekFrameService {
         let aheadDisabled: Bool
         let futureDiskFrames: Int
         let furthestAheadSeconds: Int
+        let previewTiming: String
     }
 
     private struct Request {
@@ -60,6 +61,7 @@ final class SeekFrameService {
     private var aheadAttempts = 0
     private var aheadFailures = 0
     private var aheadLastSeconds = 0.0
+    private var previewTiming = ""
     private var aheadDisabled = false
     private var indexURL: URL?
     private var indexPlan = NuvioAheadPlan()
@@ -134,6 +136,7 @@ final class SeekFrameService {
         aheadAttempts = 0
         aheadFailures = 0
         aheadLastSeconds = 0
+        previewTiming = ""
         aheadDisabled = false
         indexURL = nil
         indexPlan = NuvioAheadPlan()
@@ -221,7 +224,8 @@ final class SeekFrameService {
             aheadLastSeconds: aheadLastSeconds,
             aheadDisabled: aheadDisabled,
             futureDiskFrames: cachedSlots.filter { $0 > indexPlayback + 6 }.count,
-            furthestAheadSeconds: max(0, (cachedSlots.max() ?? indexPlayback) - indexPlayback))
+            furthestAheadSeconds: max(0, (cachedSlots.max() ?? indexPlayback) - indexPlayback),
+            previewTiming: previewTiming)
         lock.unlock()
         return result
     }
@@ -465,6 +469,7 @@ final class SeekFrameService {
         aheadAttempts = 0
         aheadFailures = 0
         aheadLastSeconds = 0
+        previewTiming = ""
         aheadDisabled = false
         indexURL = nil
         indexPlan = NuvioAheadPlan()
@@ -630,6 +635,9 @@ final class SeekFrameService {
             lock.lock()
             let valid = generation == version && !token.cancelled
             let foregroundWaiting = pending != nil
+            if valid && cached == nil && job.keyframeOnly {
+                previewTiming = aheadDecoder?.lastTimingSummary ?? ""
+            }
             if valid && job.keyframeOnly && job.prefetch {
                 aheadAttempts += 1
                 aheadLastSeconds = Date().timeIntervalSince(startedAt)

@@ -907,6 +907,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             ofSize: 12, weight: .regular)
         thumbnailCacheHealthLabel.textColor = UIColor.white.withAlphaComponent(0.74)
         thumbnailCacheHealthLabel.textAlignment = .right
+        thumbnailCacheHealthLabel.numberOfLines = 2
         thumbnailCacheHealthLabel.text = ""
         thumbnailCacheHealthLabel.isUserInteractionEnabled = false
         thumbnailCacheHealthLabel.isHidden = true
@@ -1093,8 +1094,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 equalTo: cacheRateLabel.trailingAnchor),
             thumbnailCacheHealthLabel.bottomAnchor.constraint(
                 equalTo: cacheRateLabel.topAnchor, constant: -2),
-            thumbnailCacheHealthLabel.widthAnchor.constraint(equalToConstant: 390),
-            thumbnailCacheHealthLabel.heightAnchor.constraint(equalToConstant: 15),
+            thumbnailCacheHealthLabel.widthAnchor.constraint(equalToConstant: 700),
+            thumbnailCacheHealthLabel.heightAnchor.constraint(equalToConstant: 32),
             endLabel.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -17),
             endLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             endLabel.widthAnchor.constraint(equalToConstant: 105),
@@ -2979,6 +2980,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     stats.futureDiskFrames, stats.furthestAheadSeconds / 60,
                     stats.aheadCapturedSlots, stats.autoCapturedSlots,
                     stats.seekCapturedSlots)
+            }
+            if !stats.previewTiming.isEmpty {
+                thumbnailCacheHealthLabel.text = (thumbnailCacheHealthLabel.text ?? "")
+                    + "\n" + stats.previewTiming
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

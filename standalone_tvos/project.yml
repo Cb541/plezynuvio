@@ -23,7 +23,7 @@ targets:
         CFBundleDisplayName: Nuvio Player
         CFBundleName: Nuvio Player
         CFBundleShortVersionString: "1.1.3"
-        CFBundleVersion: "10"
+        CFBundleVersion: "11"
         CFBundleURLTypes:
           - CFBundleURLName: com.cb541.nuvio.player
             CFBundleURLSchemes:

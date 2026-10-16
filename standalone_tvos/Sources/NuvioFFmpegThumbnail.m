@@ -31,6 +31,14 @@ static int nuvioInterrupt(void *opaque) {
     return state->token.cancelled || CFAbsoluteTimeGetCurrent() > state->deadline;
 }
 
+// Stage times are wall-clock durations. NET can overlap OPEN/SEEK;
+// disk time excludes time spent inside the upstream network callbacks.
+typedef struct {
+    double open, seek, read, decode, network, disk;
+    int64_t bytes;
+} NuvioPreviewTiming;
+static const double NuvioPreviewTolerance = 12.0;
+
 // Each preview decoder owns a separate network cursor and sparse disk cache.
 // No mpv playback seek/cache state is modified by this input.
 typedef struct {
@@ -38,15 +46,23 @@ typedef struct {
     NuvioRangeCache *ranges;
     NuvioReadDeadline deadline;
     int64_t size;
+    NuvioPreviewTiming *timing;
 } NuvioCachedInput;
 
 static int nuvioRemoteRead(void *opaque, uint8_t *buffer, int size) {
     NuvioCachedInput *input = opaque;
-    return avio_read(input->remote, buffer, size);
+    double started = CFAbsoluteTimeGetCurrent();
+    int result = avio_read(input->remote, buffer, size);
+    input->timing->network += CFAbsoluteTimeGetCurrent() - started;
+    if (result > 0) input->timing->bytes += result;
+    return result;
 }
 static int64_t nuvioRemoteSeek(void *opaque, int64_t offset) {
     NuvioCachedInput *input = opaque;
-    return avio_seek(input->remote, offset, SEEK_SET);
+    double started = CFAbsoluteTimeGetCurrent();
+    int64_t result = avio_seek(input->remote, offset, SEEK_SET);
+    input->timing->network += CFAbsoluteTimeGetCurrent() - started;
+    return result;
 }
 static int nuvioCacheInterrupt(void *opaque) {
     NuvioCachedInput *input = opaque;
@@ -54,7 +70,11 @@ static int nuvioCacheInterrupt(void *opaque) {
 }
 static int nuvioCachedRead(void *opaque, uint8_t *buffer, int size) {
     NuvioCachedInput *input = opaque;
+    double started = CFAbsoluteTimeGetCurrent();
+    double previousNetwork = input->timing->network;
     int result = nuvio_range_read(input->ranges, buffer, size);
+    input->timing->disk += MAX(0.0, CFAbsoluteTimeGetCurrent() - started -
+                              (input->timing->network - previousNetwork));
     return result == 0 ? AVERROR_EOF : result;
 }
 static int64_t nuvioCachedSeek(void *opaque, int64_t offset, int whence) {
@@ -178,6 +198,14 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     AVIOContext *_cachedIO;
     NSURL *_rangeDirectory;
     NSString *_rangeSourceURL;
+    NSString *_lastTimingSummary;
+    NuvioPreviewTiming _timing;
+    BOOL _usedRangeInput;
+}
+
+- (NSString *)lastTimingSummary {
+    return _lastTimingSummary ?: @"";
+
 }
 
 - (void)prepareRangeDirectory:(NSURL *)url {
@@ -215,15 +243,20 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     _cachedInput = calloc(1, sizeof(*_cachedInput));
     if (!_cachedInput) return NO;
     _cachedInput->deadline = deadline;
+    _cachedInput->timing = &_timing;
     AVIOInterruptCB interrupt = { nuvioCacheInterrupt, _cachedInput };
     AVDictionary *options = NULL;
     av_dict_set(&options, "rw_timeout", "5500000", 0);
     av_dict_set(&options, "multiple_requests", "1", 0);
+    double networkStarted = CFAbsoluteTimeGetCurrent();
     int rc = avio_open2(&_cachedInput->remote, url.absoluteString.UTF8String,
                        AVIO_FLAG_READ, &interrupt, &options);
+    _timing.network += CFAbsoluteTimeGetCurrent() - networkStarted;
     av_dict_free(&options);
     if (rc < 0 || !_cachedInput->remote) { [self closeCachedInput]; return NO; }
+    networkStarted = CFAbsoluteTimeGetCurrent();
     _cachedInput->size = avio_size(_cachedInput->remote);
+    _timing.network += CFAbsoluteTimeGetCurrent() - networkStarted;
     if (_cachedInput->size <= 0 || !(_cachedInput->remote->seekable & AVIO_SEEKABLE_NORMAL)) {
         [self closeCachedInput]; return NO;
     }
@@ -236,6 +269,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                                   nuvioCachedRead, NULL, nuvioCachedSeek);
     if (!_cachedIO) { av_free(buffer); [self closeCachedInput]; return NO; }
     _cachedIO->seekable = AVIO_SEEKABLE_NORMAL;
+    _usedRangeInput = YES;
     return YES;
 
 }
@@ -271,14 +305,26 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                                         second:(int64_t)seconds
                                 timeoutSeconds:(double)timeoutSeconds
                                          token:(NuvioThumbnailAbortToken *)token {
+    _timing = (NuvioPreviewTiming){0};
+    _usedRangeInput = _cachedInput != NULL;
+    double started = CFAbsoluteTimeGetCurrent();
     UIImage *image = [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
                               token:token keyframesOnly:YES];
-    // Some open-GOP codecs cannot emit a usable independent picture with
-    // NONKEY discard. Decode one bounded GOP instead of failing forever.
-    if (!image && !token.cancelled) {
+    BOOL fallback = !image && !token.cancelled;
+    if (fallback) {
         image = [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
                           token:token keyframesOnly:NO];
     }
+    NSString *mode = token.cancelled ? @"CANCEL" : (!image ? @"MISS" : (fallback ? @"REF" : @"KF"));
+    NSString *network = _usedRangeInput ? [NSString stringWithFormat:@"%.1f", _timing.network] : @"—";
+    _lastTimingSummary = [NSString stringWithFormat:
+        @"OPEN %.1f SEEK %.1f READ %.1f NET %@ IO %.1f DEC %.1f %@",
+        _timing.open, _timing.seek, _timing.read, network, _timing.disk, _timing.decode, mode];
+    NSLog(@"[NuvioPreviewPerf] slot=%lld total=%.3f open=%.3f seek=%.3f read=%.3f decode=%.3f network=%.3f disk=%.3f bytes=%lld range=%d mode=%@",
+          (long long)seconds, CFAbsoluteTimeGetCurrent() - started,
+          _timing.open, _timing.seek, _timing.read, _timing.decode,
+          _timing.network, _timing.disk, (long long)_timing.bytes, _usedRangeInput, mode);
+
     return image;
 }
 
@@ -290,6 +336,11 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                            token:(NuvioThumbnailAbortToken *)token
                    keyframesOnly:(BOOL)keyframesOnly {
     @autoreleasepool {
+        int timingStage = 0; // opening, seeking, then decode/read loop
+        double stageStarted = CFAbsoluteTimeGetCurrent();
+        double readBeforeLoop = _timing.read;
+        double seekBeforeLoop = _timing.seek;
+        @try {
         if (token.cancelled || !url) return nil;
         NSString *scheme = url.scheme.lowercaseString;
         if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return nil;
@@ -374,6 +425,9 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
             _sourceURL = [url.absoluteString copy];
         }
 
+        _timing.open += CFAbsoluteTimeGetCurrent() - stageStarted;
+        timingStage = 1;
+        stageStarted = CFAbsoluteTimeGetCurrent();
         // Previous call's callback pointed at its stack-local deadline.
         // Rebind it for EVERY seek/read and clear before returning.
         _format->interrupt_callback.callback = nuvioInterrupt;
@@ -410,12 +464,16 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         }
         avcodec_flush_buffers(_decoder);
 
+        _timing.seek += CFAbsoluteTimeGetCurrent() - stageStarted;
+        timingStage = 2;
+        stageStarted = CFAbsoluteTimeGetCurrent();
+        readBeforeLoop = _timing.read;
+        seekBeforeLoop = _timing.seek;
         UIImage *image = nil;
         double bestSeconds = DBL_MAX;
-        // User-initiated seek is precise. Background pre-indexing accepts
-        // a nearby independent keyframe to avoid decoding another long GOP.
-        // Eight-second future-index intervals still yield useful previews.
-        const double acceptableDistance = keyframesOnly ? 3.0 : 0.65;
+        // All callers use the sparse preview grid. A nearby frame is useful
+        // even on the reference-decoding fallback; do not chase exact PTS.
+        const double acceptableDistance = NuvioPreviewTolerance;
         // For every codec, decode toward the requested PTS instead of
         // blindly presenting the first frame after a distant keyframe.
         // Keep the nearest valid frame as a fallback if the URL is slow.
@@ -427,11 +485,13 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                 int64_t baseTS = stream->start_time != AV_NOPTS_VALUE
                     ? MAX(0, stream->start_time) : 0;
                 int64_t earlier = MAX(baseTS, target - rewindTicks);
+                double retryStarted = CFAbsoluteTimeGetCurrent();
                 int retrySeek = av_seek_frame(_format, _streamIndex, earlier,
                                               AVSEEK_FLAG_BACKWARD);
                 if (retrySeek < 0)
                     retrySeek = avformat_seek_file(_format, _streamIndex,
                                                   INT64_MIN, earlier, INT64_MAX, 0);
+                _timing.seek += CFAbsoluteTimeGetCurrent() - retryStarted;
                 if (retrySeek < 0) break;
                 avcodec_flush_buffers(_decoder);
             }
@@ -440,7 +500,9 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
             while (!token.cancelled &&
                    CFAbsoluteTimeGetCurrent() < deadline.deadline &&
                    videoPackets < packetLimit) {
+                double readStarted = CFAbsoluteTimeGetCurrent();
                 int readResult = av_read_frame(_format, _packet);
+                _timing.read += CFAbsoluteTimeGetCurrent() - readStarted;
                 if (readResult < 0) break;
                 if (_packet->stream_index != _streamIndex) {
                     av_packet_unref(_packet);
@@ -451,7 +513,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                     ? _packet->pts : _packet->dts;
                 const bool drainKeyframe = keyframesOnly &&
                     (_packet->flags & AV_PKT_FLAG_KEY) && packetPTS != AV_NOPTS_VALUE &&
-                    fabs(((double)packetPTS - target) * av_q2d(stream->time_base)) <= 5.5;
+                    fabs(((double)packetPTS - target) * av_q2d(stream->time_base)) <= NuvioPreviewTolerance;
                 int sent = avcodec_send_packet(_decoder, _packet);
                 // FFmpeg requires callers to drain output before resending
                 // the exact packet after EAGAIN. Dropping these packets
@@ -514,16 +576,25 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         }
         // Keep a fully initialized demuxer across seeks. A failed decode
         // resets the session so a later request can reconnect cleanly.
-        if (bestSeconds > 5.5) {
+        if (bestSeconds > NuvioPreviewTolerance) {
             // Avoid showing a frame many seconds away as an exact seek still.
             image = nil;
         }
         if (!image) {
             NSLog(@"[NuvioPreview] no frame: video=%d codec=%d index=%d range=%d; source URL redacted",
                   _streamIndex, stream->codecpar->codec_id, _streamIndex, seekResult);
-            [self reset];
+            // A missing keyframe is not a broken connection. Retain the
+            // demuxer and cached ranges for the reference-decoding retry.
+            if (!keyframesOnly || (_format->pb && _format->pb->error < 0)) [self reset];
         }
         return image;
+        } @finally {
+            double elapsed = CFAbsoluteTimeGetCurrent() - stageStarted;
+            if (timingStage == 0) _timing.open += elapsed;
+            else if (timingStage == 1) _timing.seek += elapsed;
+            else _timing.decode += MAX(0.0, elapsed - (_timing.read - readBeforeLoop) -
+                                       (_timing.seek - seekBeforeLoop));
+        }
     }
 }
 @end

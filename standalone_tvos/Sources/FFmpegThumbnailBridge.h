@@ -15,6 +15,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// dramatically reducing repeated Matroska probing and HTTP handshakes.
 /// Always call on a single serial queue; reset only on that queue.
 @interface NuvioThumbnailDecoder : NSObject
+/// Last completed sample; read only on the decoder worker queue.
+@property (nonatomic, readonly, copy) NSString *lastTimingSummary;
 - (nullable UIImage *)thumbnailForURL:(NSURL *)url
                                 second:(int64_t)seconds
                         timeoutSeconds:(double)timeoutSeconds

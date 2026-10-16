@@ -149,10 +149,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var backgroundSnapshotRequestID = 0
     private var lastPlaybackCapturedBucket: Int?
     private var lastCacheLookupBucket: Int?
-    private var lastSDRIndexAttempt = Date.distantPast
-    private var nextSDRIndexSlot = 0
-    private var lastAheadObservedPosition: Double = -1
-    private var lastAheadProgressAt = Date.distantPast
     private var backgroundSnapshotsUnavailable = false
     private var playbackSnapshotInFlight = false
     // Only one small CoreImage output is created at a time. This captures
@@ -405,10 +401,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         backgroundSnapshotRequestID += 1
         lastPlaybackCapturedBucket = nil
         lastCacheLookupBucket = nil
-        lastSDRIndexAttempt = .distantPast
-        nextSDRIndexSlot = 0
-        lastAheadObservedPosition = -1
-        lastAheadProgressAt = .distantPast
         backgroundSnapshotsUnavailable = false
         playbackSnapshotInFlight = false
         lastConfirmedPauseAt = nil
@@ -2941,62 +2933,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         NuvioFrameTapSetPlaybackSecond(captureAllowed
             ? Int64(playbackSecond) : -1)
         refreshLabels()
-        // Speculative FUTURE seek-preview index. Unlike the frame tap, this
-        // samples positions the movie has NOT yet played. One cancellable
-        // I-frame probe at a time; it never blocks the playback/UI thread.
-        // Dynamic backoff and foreground-seek priority protect 4K DV playback.
-        // Detect genuinely advancing playback from mpv's observed media
-        // position, not a stale UI pause/play flag. This also stops all
-        // future indexing during extended pauses and stalls.
-        if let indexCore = core, indexCore.timePos.isFinite {
-            let position = indexCore.timePos
-            if position > lastAheadObservedPosition + 0.3 {
-                lastAheadProgressAt = Date()
-            }
-            if abs(position - lastAheadObservedPosition) > 0.3 {
-                lastAheadObservedPosition = position
-            }
-        }
+        // A service-owned loop generates future previews without depending
+        // on control visibility, pause flags or progress of the scrub cursor.
+        // Only the actual playback timestamp anchors the forward index.
         if let media = link, let playbackCore = core,
            !isPreparingPlayback && !waitingForFirstFrame &&
            !displayNegotiationPending && !previewIsVisible &&
            targetSeconds == nil && !isTouchScrubbing &&
-           Date().timeIntervalSince(lastAheadProgressAt) < 4.0,
-           playbackCore.timePos.isFinite && playbackCore.timePos >= 2,
-           totalSeconds.isFinite && totalSeconds > 90 {
-            let metrics = thumbs.cacheStats()
-            // One-at-a-time I-frame extraction is self-throttling: if a
-            // remote seek takes 2.5 seconds, a new one can't start until
-            // that probe finishes. Remove the artificial 9-60s sleep
-            // which left only two future previews after a minute.
-            let thermal = ProcessInfo.processInfo.thermalState
-            let heatPenalty: Double = thermal == .nominal ? 0.0 :
-                (thermal == .fair ? 1.0 : 6.0)
-            let delay = max(0.6, min(5.0, metrics.aheadLastSeconds * 0.35))
-                + heatPenalty
-            let current = Int(playbackCore.timePos)
-            // Start 24 seconds ahead; index every 8 seconds to give fast
-            // scrubbing several usable preview options per minute of movie.
-            // An uninterrupted minute can index many minutes ahead if the
-            // source server permits fast random-access reads.
-            // Re-anchor following a large real seek without discarding prior
-            // cached future frames or touching mpv's own media cache.
-            if nextSDRIndexSlot < current + 24 {
-                nextSDRIndexSlot = ((current + 24) / 2) * 2
-            }
-            if !metrics.aheadDisabled &&
-               nextSDRIndexSlot < Int(totalSeconds) - 2 &&
-               Date().timeIntervalSince(lastSDRIndexAttempt) >= delay {
-                if thumbs.prefetchAhead(url: media.url,
-                                       second: nextSDRIndexSlot) {
-                    // Reset the cooldown only after the worker accepts a
-                    // request or skips an already-cached slot. Rejected calls
-                    // while the FFmpeg worker is busy must never add another
-                    // artificial delay between successfully indexed frames.
-                    lastSDRIndexAttempt = Date()
-                    nextSDRIndexSlot += 8
-                }
-            }
+           committedSeekTarget == nil {
+            thumbs.updateAheadIndex(url: media.url,
+                playback: playbackCore.timePos, duration: totalSeconds)
+        } else {
+            thumbs.pauseAheadIndex()
         }
         // Update the disk-write rate and covered sections once a second.
         // This measures saved JPEG bytes, not video download throughput.
@@ -3072,10 +3020,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     stats.autoCapturedSlots, stats.seekCapturedSlots)
             } else {
                 thumbnailCacheHealthLabel.text = String(
-                    format: "AHEAD:%d (%d tried) · AUTO:%d SEEK:%d · %d disk",
-                    stats.aheadCapturedSlots, stats.aheadAttempts,
-                    stats.autoCapturedSlots, stats.seekCapturedSlots,
-                    stats.diskFrames)
+                    format: "FUTURE:%d disk · furthest +%dm · AHEAD:%d · AUTO:%d SEEK:%d",
+                    stats.futureDiskFrames, stats.furthestAheadSeconds / 60,
+                    stats.aheadCapturedSlots, stats.autoCapturedSlots,
+                    stats.seekCapturedSlots)
             }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots

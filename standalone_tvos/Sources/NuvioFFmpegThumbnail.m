@@ -171,13 +171,19 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                                         second:(int64_t)seconds
                                 timeoutSeconds:(double)timeoutSeconds
                                          token:(NuvioThumbnailAbortToken *)token {
-    return [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
-                    token:token keyframesOnly:YES];
+    UIImage *image = [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
+                              token:token keyframesOnly:YES];
+    // Some open-GOP codecs cannot emit a usable independent picture with
+    // NONKEY discard. Decode one bounded GOP instead of failing forever.
+    if (!image && !token.cancelled) {
+        image = [self decodeURL:url second:seconds timeoutSeconds:timeoutSeconds
+                          token:token keyframesOnly:NO];
+    }
+    return image;
 }
 
-// The future indexer must never run full-GOP 4K software decoding alongside
-// mpv's VideoToolbox renderer. A keyframe probe decodes I/IDR/CRA frames only,
-// at one worker thread, and stops after a very small packet/time budget.
+// One software decoder/thread, with cancellable network deadlines. Prefer
+// independent pictures; use reference decoding only when that cannot emit one.
 - (nullable UIImage *)decodeURL:(NSURL *)url
                           second:(int64_t)seconds
                   timeoutSeconds:(double)timeoutSeconds
@@ -323,7 +329,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                 if (retrySeek < 0) break;
                 avcodec_flush_buffers(_decoder);
             }
-            const int packetLimit = keyframesOnly ? 55 : (pass == 0 ? 210 : 320);
+            const int packetLimit = keyframesOnly ? 240 : (pass == 0 ? 320 : 480);
             int videoPackets = 0;
             while (!token.cancelled &&
                    CFAbsoluteTimeGetCurrent() < deadline.deadline &&
@@ -335,6 +341,11 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                     continue;
                 }
                 ++videoPackets;
+                const int64_t packetPTS = _packet->pts != AV_NOPTS_VALUE
+                    ? _packet->pts : _packet->dts;
+                const bool drainKeyframe = keyframesOnly &&
+                    (_packet->flags & AV_PKT_FLAG_KEY) && packetPTS != AV_NOPTS_VALUE &&
+                    fabs(((double)packetPTS - target) * av_q2d(stream->time_base)) <= 5.5;
                 int sent = avcodec_send_packet(_decoder, _packet);
                 // FFmpeg requires callers to drain output before resending
                 // the exact packet after EAGAIN. Dropping these packets
@@ -364,10 +375,28 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                     av_frame_unref(_frame);
                     if (closeEnough) goto finished;
                 }
+                // Do not download the next GOP merely to release a reordered
+                // I-frame that is already decoded. Drain it immediately.
+                if (drainKeyframe) break;
+            }
+            // HEVC/H.264 can retain the only decoded I-frame in their
+            // reorder buffer when NONKEY skips subsequent pictures. Explicit
+            // draining is required even if packet/time budget ended the probe.
+            // Without it a valid future keyframe was repeatedly thrown away.
+            if (!token.cancelled) {
+                avcodec_send_packet(_decoder, NULL);
+                while (!token.cancelled && avcodec_receive_frame(_decoder, _frame) == 0) {
+                    bool closeEnough = nuvioConsiderFrame(_frame, target,
+                        stream->time_base, acceptableDistance, &bestSeconds, &image);
+                    av_frame_unref(_frame);
+                    if (closeEnough) goto finished;
+                }
             }
         }
 
     finished:
+        av_frame_unref(_frame);
+        av_packet_unref(_packet);
         _format->interrupt_callback.opaque = NULL;
         if (token.cancelled) {
             [self reset];
@@ -375,7 +404,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         }
         // Keep a fully initialized demuxer across seeks. A failed decode
         // resets the session so a later request can reconnect cleanly.
-        if (keyframesOnly && bestSeconds > 5.5) {
+        if (bestSeconds > 5.5) {
             // Avoid showing a frame many seconds away as an exact seek still.
             image = nil;
         }

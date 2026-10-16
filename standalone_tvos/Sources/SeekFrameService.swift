@@ -3,10 +3,8 @@ import CryptoKit
 import Foundation
 import UIKit
 
-/// Crash-safe previews use Apple's AVAssetImageGenerator rather than a
-/// second unmanaged FFmpeg decoder. The old FFmpeg path terminated tvOS on
-/// unrelated codecs and is intentionally NEVER invoked by this service.
-/// Unsupported formats fail gracefully; disk-cached previews remain intact.
+/// Disk-backed previews with an independent, continuous future indexer.
+/// Playback capture supplements coverage; it is not the source of future frames.
 final class SeekFrameService {
     struct CacheStats {
         let slots: [Int]
@@ -28,6 +26,8 @@ final class SeekFrameService {
         let aheadFailures: Int
         let aheadLastSeconds: Double
         let aheadDisabled: Bool
+        let futureDiskFrames: Int
+        let furthestAheadSeconds: Int
     }
 
     private struct Request {
@@ -61,9 +61,13 @@ final class SeekFrameService {
     private var aheadFailures = 0
     private var aheadLastSeconds = 0.0
     private var aheadDisabled = false
-    private var aheadSuccessfulDecodes = 0
+    private var indexURL: URL?
+    private var indexCursor = 0
+    private var indexEnd = 0
+    private var indexPlayback = 0
+    private var indexLastPlayback = 0
+    private var indexingSuspended = false
     private var aheadRetryAfter = Date.distantPast
-    private var aheadResetPending = false
     private var sourceKey: String?
     // Only the compressed JPEGs consume persistent disk; memory remains
     // bounded. These slot indices are loaded once and amended after writes.
@@ -132,9 +136,12 @@ final class SeekFrameService {
         aheadFailures = 0
         aheadLastSeconds = 0
         aheadDisabled = false
-        aheadSuccessfulDecodes = 0
+        indexURL = nil
+        indexCursor = 0
+        indexEnd = 0
+        indexPlayback = 0
+        indexLastPlayback = 0
         aheadRetryAfter = .distantPast
-        aheadResetPending = false
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -211,7 +218,9 @@ final class SeekFrameService {
             aheadAttempts: aheadAttempts,
             aheadFailures: aheadFailures,
             aheadLastSeconds: aheadLastSeconds,
-            aheadDisabled: aheadDisabled)
+            aheadDisabled: aheadDisabled,
+            futureDiskFrames: cachedSlots.filter { $0 > indexPlayback + 6 }.count,
+            furthestAheadSeconds: max(0, (cachedSlots.max() ?? indexPlayback) - indexPlayback))
         lock.unlock()
         return result
     }
@@ -417,15 +426,27 @@ final class SeekFrameService {
         activeToken?.cancelled = true
         pending = nil
         pendingBackground = nil
+        indexURL = nil
         lock.unlock()
     }
 
     /// Wait until the serial system frame generator is no longer active
     /// before allowing the main playback engine to seek.
     func cancelAndDrain(_ completion: @escaping () -> Void) {
+        lock.lock()
+        indexingSuspended = true
+        lock.unlock()
         cancel()
-        worker.async {
-            DispatchQueue.main.async(execute: completion)
+        worker.async { [weak self] in
+            self?.aheadDecoder?.reset()
+            DispatchQueue.main.async {
+                completion()
+                if let self {
+                    self.lock.lock()
+                    self.indexingSuspended = false
+                    self.lock.unlock()
+                }
+            }
         }
     }
 
@@ -441,9 +462,12 @@ final class SeekFrameService {
         aheadFailures = 0
         aheadLastSeconds = 0
         aheadDisabled = false
-        aheadSuccessfulDecodes = 0
+        indexURL = nil
+        indexCursor = 0
+        indexEnd = 0
+        indexPlayback = 0
+        indexLastPlayback = 0
         aheadRetryAfter = .distantPast
-        aheadResetPending = false
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -483,38 +507,50 @@ final class SeekFrameService {
         lock.unlock()
     }
 
-    /// Index future, UNWATCHED positions, not the already-played frame tap.
-    /// A single low-priority slot, cancelled by foreground seeking.
-    @discardableResult
-    func prefetchAhead(url: URL, second: Int) -> Bool {
-        guard url.scheme == "http" || url.scheme == "https" else { return false }
-        let slot = bucket(second)
+    /// Update the real playback anchor. The worker schedules its own next
+    /// sample immediately after saving the previous one, even with chrome hidden
+    /// or playback paused. The uncommitted scrub cursor is never used here.
+    func updateAheadIndex(url: URL, playback: Double, duration: Double) {
+        guard ["http", "https"].contains(url.scheme ?? ""),
+              playback.isFinite, playback >= 0,
+              duration.isFinite, duration > 2 else { return }
         lock.lock()
-        let cached = cachedSlots.contains(slot) || compressedFrames[slot] != nil
-        if cached {
-            // CRITICAL: tell the caller to advance its index cursor.
-            // Returning false permanently trapped pre-indexing on the first
-            // future slot that happened to be saved by earlier playback.
-            lock.unlock()
-            return true
+        defer { lock.unlock() }
+        guard !indexingSuspended else { return }
+        let position = Int(playback)
+        if indexURL != url || abs(position - indexLastPlayback) > 20 {
+            indexCursor = bucket(position + 8)
         }
-        let canStart = !aheadDisabled &&
-            Date() >= aheadRetryAfter &&
-            pending == nil && pendingBackground == nil && !activeWasBackground
-        if canStart {
-            pendingBackground = Request(url: url, second: slot,
-                prefetch: true, allowSystemDecode: true,
-                keyframeOnly: true, callback: nil)
-            scheduleWorkerLocked()
-        }
-        lock.unlock()
-        return canStart
+        indexURL = url
+        indexPlayback = position
+        indexLastPlayback = position
+        indexEnd = Int(duration) - 1
+        indexCursor = max(indexCursor, bucket(position + 8))
+        scheduleWorkerLocked()
     }
 
-    func prefetch(url: URL, second: Int) {
-        guard ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased())
-        else { return }
-        _ = prefetchAhead(url: url, second: second)
+    // Called with lock held. Eight-second spacing gives broad coverage first;
+    // every sample is persisted before another decode, keeping RAM bounded.
+    private func nextIndexRequestLocked() -> Request? {
+        guard let url = indexURL, !indexingSuspended,
+              Date() >= aheadRetryAfter else { return nil }
+        while indexCursor < indexEnd {
+            let slot = indexCursor
+            indexCursor += 8
+            if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
+                continue
+            }
+            return Request(url: url, second: slot, prefetch: true,
+                           allowSystemDecode: true, keyframeOnly: true, callback: nil)
+        }
+        return nil
+    }
+
+    func pauseAheadIndex() {
+        lock.lock()
+        indexURL = nil
+        if activeWasBackground { activeToken?.cancelled = true }
+        lock.unlock()
     }
 
     private func scheduleWorkerLocked() {
@@ -551,7 +587,7 @@ final class SeekFrameService {
     private func processRequests() {
         while true {
             lock.lock()
-            guard let job = pending ?? pendingBackground else {
+            guard let job = pending ?? pendingBackground ?? nextIndexRequestLocked() else {
                 isWorkerRunning = false
                 activeToken = nil
                 activeWasBackground = false
@@ -578,12 +614,12 @@ final class SeekFrameService {
             } else if token.cancelled || !job.allowSystemDecode {
                 decoded = nil
             } else if job.keyframeOnly {
-                // Only a single FFmpeg thread; codec discards all non-key
-                // pictures. This never creates a second hardware renderer.
+                // One software decoder, keyframes first with reference
+                // fallback. No second hardware renderer is created.
                 if aheadDecoder == nil { aheadDecoder = NuvioThumbnailDecoder() }
                 decoded = aheadDecoder?.keyframeThumbnail(
                     for: job.url, second: Int64(job.second),
-                    timeoutSeconds: 2.5, token: token)
+                    timeoutSeconds: 12.0, token: token)
             } else {
                 decoded = appleFallback(url: job.url, second: job.second)
             }
@@ -596,27 +632,16 @@ final class SeekFrameService {
                 aheadLastSeconds = Date().timeIntervalSince(startedAt)
                 if decoded == nil {
                     aheadFailures += 1
-                    // Signed URLs may intermittently miss a random-access
-                    // frame. Do not kill the *entire movie's* pre-indexing
-                    // after just three GOPs. Let it try new time positions.
-                    // A bounded cooldown protects the active decoder.
-                    if aheadFailures >= 4 {
-                        aheadRetryAfter = Date().addingTimeInterval(
-                            min(18.0, Double(aheadFailures) * 1.5))
-                    }
-                    if aheadFailures >= 16 { aheadDisabled = true }
+                    // Retry transient network/codec failures on a later tick;
+                    // never permanently disable indexing for the entire movie.
+                    aheadRetryAfter = Date().addingTimeInterval(
+                        min(5.0, Double(aheadFailures)))
                 } else {
                     aheadFailures = 0
                     aheadRetryAfter = .distantPast
-                    aheadSuccessfulDecodes += 1
                 }
-                // Reuse the same demuxer/HTTP connection across eight I-frame
-                // samples rather than reopening after every four, then
-                // release it before retained 4K buffers can accumulate.
-                if aheadSuccessfulDecodes >= 8 || aheadDisabled {
-                    aheadDecoder?.reset()
-                    aheadSuccessfulDecodes = 0
-                }
+                // Retain the demuxer/HTTP connection. AVFrame and AVPacket
+                // references are released by the bridge after every sample.
             } else if valid && job.prefetch && decoded == nil {
                 backgroundPrefetchUnavailable = true
             }
@@ -628,6 +653,7 @@ final class SeekFrameService {
                 if job.keyframeOnly {
                     cachePlaybackFrame(image, second: job.second,
                                        automatic: false, ahead: true)
+                    diskWriter.sync {}
                 } else {
                     remember(image, slot: job.second, directory: directory,
                              writeToDisk: currentDiskImage == nil)
@@ -637,6 +663,14 @@ final class SeekFrameService {
                let callback = job.callback {
                 deliver(decoded, version: version, callback: callback)
             }
+            lock.lock()
+            isWorkerRunning = false
+            if pending != nil || pendingBackground != nil ||
+               (indexURL != nil && indexCursor < indexEnd && Date() >= aheadRetryAfter) {
+                scheduleWorkerLocked()
+            }
+            lock.unlock()
+            return
         }
     }
 

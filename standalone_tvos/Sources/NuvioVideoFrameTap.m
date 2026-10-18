@@ -55,6 +55,9 @@ static atomic_int sDVTrimBright100;
 static atomic_uint_fast64_t sDVTrimEdits;
 static atomic_int sDVTrimLastTargetCount;
 static atomic_uint_fast64_t sDVTrimUnavailable;
+static atomic_uint_fast64_t sDVTrimInterceptedFrames;
+static atomic_uint_fast64_t sDVTrimRPUFrames;
+static atomic_int sDVTrimLastStatus;
 static atomic_uint_fast64_t sDVTrimSlowFrames;
 
 // Strict opt-in. Only edit the RPU attachment (not pixel buffer contents)
@@ -62,6 +65,8 @@ static atomic_uint_fast64_t sDVTrimSlowFrames;
 static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
     if (!atomic_load_explicit(&sDVTrimEnabled, memory_order_relaxed) || !sample)
         return;
+    atomic_fetch_add_explicit(&sDVTrimInterceptedFrames, 1,
+                              memory_order_relaxed);
     // AVSampleBufferDisplayLayer may forward the same sample to its internal
     // video renderer. Tag the *sample*, not a reusable CVPixelBuffer, so this
     // metadata is never adjusted twice.
@@ -80,7 +85,12 @@ static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
         id value = values[key];
         if (![value isKindOfClass:[NSData class]]) break;
         NSData *original = (NSData *)value;
-        if (original.length < 8 || original.length > 4096) break;
+        atomic_fetch_add_explicit(&sDVTrimRPUFrames, 1,
+                                  memory_order_relaxed);
+        if (original.length < 8 || original.length > 4096) {
+            atomic_store_explicit(&sDVTrimLastStatus, -1, memory_order_relaxed);
+            break;
+        }
         uint8_t output[8192];
         int32_t status = -1;
         CFTimeInterval started = CACurrentMediaTime();
@@ -90,6 +100,7 @@ static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
             atomic_load(&sDVTrimContrast100) / 100.0f,
             atomic_load(&sDVTrimBright100) / 100.0f,
             &status);
+        atomic_store_explicit(&sDVTrimLastStatus, status, memory_order_relaxed);
         if (length > 0 && status > 0) {
             CFDataRef changed = CFDataCreate(kCFAllocatorDefault, output, (CFIndex)length);
             if (changed) {
@@ -125,7 +136,24 @@ void NuvioDVTrimSet(BOOL enabled, double saturation, double contrast, double bri
 uint64_t NuvioDVTrimEditedCount(void) { return atomic_load(&sDVTrimEdits); }
 int NuvioDVTrimLastTargetCount(void) { return atomic_load(&sDVTrimLastTargetCount); }
 uint64_t NuvioDVTrimUneditableCount(void) { return atomic_load(&sDVTrimUnavailable); }
+uint64_t NuvioDVTrimInterceptedFrames(void) { return atomic_load(&sDVTrimInterceptedFrames); }
+uint64_t NuvioDVTrimRPUFrames(void) { return atomic_load(&sDVTrimRPUFrames); }
+int NuvioDVTrimLastStatus(void) { return atomic_load(&sDVTrimLastStatus); }
 BOOL NuvioDVTrimIsEnabled(void) { return atomic_load(&sDVTrimEnabled); }
+NSString *NuvioDVTrimLastFailureReason(void) {
+    switch (atomic_load(&sDVTrimLastStatus)) {
+        case 0: return @"no RPU attempted yet";
+        case -1: return @"invalid or neutral input";
+        case -2: return @"no Level 2/8 trim blocks";
+        case -3: return @"RPU not byte-exact on roundtrip";
+        case -4: return @"edited RPU failed reparse";
+        case -5: return @"libdovi cannot parse RPU";
+        case -6: return @"trim values outside guarded range";
+        case -7: return @"no Dolby DM metadata";
+        case -8: return @"RPU serialization failed";
+        default: return @"modified trim block(s)";
+    }
+}
 
 static os_unfair_lock sDVProbeSummaryLock = OS_UNFAIR_LOCK_INIT;
 static NSString *sDVProbeSummary = @"No matching metadata key";
@@ -421,6 +449,9 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sDVTrimEdits, 0);
     atomic_store(&sDVTrimLastTargetCount, 0);
     atomic_store(&sDVTrimUnavailable, 0);
+    atomic_store(&sDVTrimInterceptedFrames, 0);
+    atomic_store(&sDVTrimRPUFrames, 0);
+    atomic_store(&sDVTrimLastStatus, 0);
     atomic_store(&sDVTrimSlowFrames, 0);
     os_unfair_lock_lock(&sCallbackLock);
     sCallback = [callback copy];

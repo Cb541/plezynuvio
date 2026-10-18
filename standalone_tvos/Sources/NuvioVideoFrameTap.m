@@ -151,6 +151,7 @@ NSString *NuvioDVTrimLastFailureReason(void) {
         case -6: return @"trim values outside guarded range";
         case -7: return @"no Dolby DM metadata";
         case -8: return @"RPU serialization failed";
+        case -9: return @"unrecognized RPU wrapper format";
         default: return @"modified trim block(s)";
     }
 }

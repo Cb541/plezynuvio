@@ -126,6 +126,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var firstFrameTimeout: DispatchWorkItem?
     private var subtitleURLToLoad: URL?
     private var subtitleAlreadyRequested = false
+    private let persistentSubtitlesKey = "Nuvio.PermanentlyDisableSubtitles"
+    private var permanentlyDisableSubtitles: Bool {
+        UserDefaults.standard.bool(forKey: persistentSubtitlesKey)
+    }
     private var link: NativeStreamLink?
     private var clock: Timer?
     private var repeatTimer: Timer?
@@ -521,6 +525,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         newCore.observeProperty("time-pos", format: "double")
         newCore.observeProperty("duration", format: "double")
         newCore.observeProperty("pause", format: "flag")
+        // Prevent mpv from automatically choosing embedded subtitle tracks.
+        if permanentlyDisableSubtitles { newCore.setProperty("sid", value: "no") }
         core = newCore
         // Observe the AVFoundation renderer's *input* samples, not its
         // displayedPixelBuffer() output (nil on some tvOS hardware paths).
@@ -658,7 +664,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.statusLabel.text = ""
                     self.showPanel()
                     // Defer subtitles until after the video is running.
-                    self.attachInitialSubtitleIfAvailable()
+                    if self.permanentlyDisableSubtitles {
+                        core.setProperty("sid", value: "no")
+                    } else {
+                        self.attachInitialSubtitleIfAvailable()
+                    }
                     self.schedulePreferredEnglishAudioSelection()
                     self.showPanel()
                 case .failure(let error):
@@ -670,7 +680,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func attachInitialSubtitleIfAvailable() {
-        guard !subtitleAlreadyRequested, let subtitleURLToLoad, let core else { return }
+        guard !permanentlyDisableSubtitles,
+              !subtitleAlreadyRequested, let subtitleURLToLoad, let core else { return }
         subtitleAlreadyRequested = true
         let generation = playbackGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self, weak core] in
@@ -1556,7 +1567,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if toolPanel == .picture {
                 changePictureValue(direction)
             } else if toolPanel == .none {
-                if toolbarFocused {
+                if targetSeconds != nil || previewIsVisible || lockedSeekDirection != 0 {
+                    // Preview takes priority over toolbar focus. A short click
+                    // steps its playhead; a long hold still enters the existing
+                    // locked fast-forward/rewind transport.
+                    beginDirectionalSeek(direction)
+                } else if toolbarFocused {
                     toolbarIndex = (toolbarIndex + direction + toolbarButtons.count) % toolbarButtons.count
                     updateToolbarFocus()
                     showPanel()
@@ -1608,11 +1624,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 closeToolPanel()
             } else if lockedSeekDirection != 0 {
                 // Seek confirmation outranks toolbar focus on the same click.
-                finishLockedSeek(commit: true)
+                finishLockedSeek(commit: true, resumeWhenCommitted: true)
             } else if targetSeconds != nil {
-                let shouldResume = resumeAfterLockedSeek
                 resumeAfterLockedSeek = false
-                commitSeek(resumeAfter: shouldResume, closeChrome: true)
+                // A single center click accepts the thumbnail and starts playback.
+                commitSeek(resumeAfter: true, closeChrome: true)
             } else if toolbarFocused {
                 explicitChromeHidden = false
                 openToolbarSelection()
@@ -1658,7 +1674,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // A real hold locks the transport even after release. The next
         // left/right click changes speed without closing the thumbnail.
         if lockedSeekDirection == 0 {
-            silentSkip(direction)
+            if targetSeconds != nil || previewIsVisible {
+                // A click in thumbnail mode moves ONLY the preview playhead.
+                // Never issue an uncommitted seek to the actual movie.
+                stepSeek(direction, commitAfterIdle: false)
+            } else {
+                silentSkip(direction)
+            }
         }
     }
 
@@ -2090,6 +2112,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func chooseSelectedTrack() {
         guard let core, trackChoices.indices.contains(choiceIndex) else { return }
         let choice = trackChoices[choiceIndex]
+        if toolPanel == .subtitles && choice.id == "permanent-subtitle-toggle" {
+            let disable = !permanentlyDisableSubtitles
+            UserDefaults.standard.set(disable, forKey: persistentSubtitlesKey)
+            // Applies immediately, and the saved preference survives every
+            // stream change and future app launches.
+            core.setProperty("sid", value: disable ? "no" : "auto")
+            closeToolPanel()
+            return
+        }
         let property = toolPanel == .audio ? "aid" : "sid"
         if toolPanel == .audio { hasSelectedPreferredAudio = true }
         core.setProperty(property, value: choice.id)
@@ -2171,6 +2202,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
+    private func subtitleMenuPrefix(selectedOff: Bool) -> [TrackChoice] {
+        [
+            TrackChoice(id: "no", caption: "Off (this video)", selected: selectedOff),
+            TrackChoice(id: "permanent-subtitle-toggle",
+                        caption: permanentlyDisableSubtitles
+                            ? "Enable automatic subtitles for all videos"
+                            : "Permanently disable subtitles for all videos",
+                        selected: permanentlyDisableSubtitles)
+        ]
+    }
+
     private func loadTracks(request: Int) {
         guard let core else { return }
         let wanted: TrackKind = toolPanel == .audio ? .audio : .sub
@@ -2179,7 +2221,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let count = min(96, max(0, Int((try? result.get()) ?? "") ?? 0))
             guard count > 0 else {
                 self.trackChoices = wanted == .sub
-                    ? [TrackChoice(id: "no", caption: "Off", selected: false)] : []
+                    ? self.subtitleMenuPrefix(selectedOff: true) : []
                 self.renderTrackPanel()
                 return
             }
@@ -2202,7 +2244,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                       self.trackRefreshID == request else { return }
                 var choices: [TrackChoice] = []
                 if wanted == .sub {
-                    choices.append(TrackChoice(id: "no", caption: "Off", selected: false))
+                    let hasSelected = values.contains {
+                        $0["type"] == "sub" && $0["selected"] == "yes"
+                    }
+                    choices.append(contentsOf: self.subtitleMenuPrefix(selectedOff: !hasSelected))
                 }
                 var ordinal = 0
                 for value in values where value["type"] == wanted.rawValue {

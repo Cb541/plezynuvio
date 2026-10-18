@@ -44,6 +44,8 @@ static atomic_uint_fast64_t sDVProbeSamples;
 static atomic_uint_fast64_t sDVProbeTaggedSamples;
 static atomic_uint_fast64_t sDVProbeFrameBytes;
 static atomic_uint_fast64_t sDVProbeSequenceBytes;
+static os_unfair_lock sDVProbeSummaryLock = OS_UNFAIR_LOCK_INIT;
+static NSString *sDVProbeSummary = @"No matching metadata key";
 
 
 // Use the monotonic host clock to advance frame-index timestamps when the
@@ -135,10 +137,12 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
     CFDictionaryRef attachments = CVBufferCopyAttachments(retained,
         kCVAttachmentMode_ShouldPropagate);
     uint64_t frameBytes = 0, sequenceBytes = 0;
+    NSMutableArray<NSString *> *matchedKeys = [NSMutableArray array];
     if (attachments) {
         NSDictionary *all = (__bridge NSDictionary *)attachments;
         for (id key in all) {
-            NSString *label = [[key description] lowercaseString];
+            NSString *name = [key description];
+            NSString *label = [name lowercaseString];
             if ([label containsString:@"dolby"] ||
                 [label containsString:@"rpu"] ||
                 [label containsString:@"postdecode"] ||
@@ -150,10 +154,25 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
                     sequenceBytes += bytes;
                 else
                     frameBytes += bytes;
+                // Only attachment names, object types and lengths are shown.
+                // No video data or private metadata payload is logged.
+                [matchedKeys addObject:[NSString stringWithFormat:
+                    @"%@ [%@, %llu B]", name,
+                    NSStringFromClass([value class]),
+                    (unsigned long long)bytes]];
             }
         }
         CFRelease(attachments);
     }
+    NSString *summary = matchedKeys.count > 0
+        ? [matchedKeys componentsJoinedByString:@"; "]
+        : @"No matching metadata key";
+    os_unfair_lock_lock(&sDVProbeSummaryLock);
+    if (![sDVProbeSummary isEqualToString:summary]) {
+        sDVProbeSummary = [summary copy];
+        NSLog(@"[NuvioDVProbe] attachment key/type: %@", summary);
+    }
+    os_unfair_lock_unlock(&sDVProbeSummaryLock);
     atomic_store_explicit(&sDVProbeFrameBytes, frameBytes, memory_order_relaxed);
     atomic_store_explicit(&sDVProbeSequenceBytes, sequenceBytes, memory_order_relaxed);
     if (frameBytes || sequenceBytes)
@@ -323,6 +342,9 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sDVProbeTaggedSamples, 0);
     atomic_store(&sDVProbeFrameBytes, 0);
     atomic_store(&sDVProbeSequenceBytes, 0);
+    os_unfair_lock_lock(&sDVProbeSummaryLock);
+    sDVProbeSummary = @"No matching metadata key";
+    os_unfair_lock_unlock(&sDVProbeSummaryLock);
     atomic_store(&sIsPaused, true);
     atomic_store(&sMediaSecond, -1);
     atomic_store(&sAnchorNs, 0);
@@ -406,3 +428,9 @@ uint64_t NuvioDVProbeSampleCount(void) { return atomic_load(&sDVProbeSamples); }
 uint64_t NuvioDVProbeTaggedSampleCount(void) { return atomic_load(&sDVProbeTaggedSamples); }
 uint64_t NuvioDVProbeFrameMetadataBytes(void) { return atomic_load(&sDVProbeFrameBytes); }
 uint64_t NuvioDVProbeSequenceMetadataBytes(void) { return atomic_load(&sDVProbeSequenceBytes); }
+NSString *NuvioDVProbeAttachmentSummary(void) {
+    os_unfair_lock_lock(&sDVProbeSummaryLock);
+    NSString *value = [sDVProbeSummary copy];
+    os_unfair_lock_unlock(&sDVProbeSummaryLock);
+    return value ?: @"No matching metadata key";
+}

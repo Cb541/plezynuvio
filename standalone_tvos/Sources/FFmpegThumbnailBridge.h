@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import "NuvioVideoFrameTap.h"
+#import "NuvioRangeCache.h"
 
 NS_ASSUME_NONNULL_BEGIN
 

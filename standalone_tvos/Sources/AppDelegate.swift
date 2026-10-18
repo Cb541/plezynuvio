@@ -69,6 +69,9 @@ struct NativeStreamLink {
     let url: URL
     let title: String
     let subtitle: URL?
+    // Optional episode metadata from the caller. Existing handoffs carrying
+    // only url/title/sub remain fully compatible.
+    let introEpisode: IntroEpisodeDescriptor?
 
     init?(link: URL) {
         guard link.scheme?.lowercased() == "nuvio-player",
@@ -80,6 +83,22 @@ struct NativeStreamLink {
               video.host != nil else { return nil }
         url = video
         title = components.queryItems?.first(where: { ["title", "name"].contains($0.name) })?.value ?? "Now Playing"
+        let query = Dictionary((components.queryItems ?? []).map {
+            ($0.name.lowercased(), $0.value ?? "")
+        }, uniquingKeysWith: { first, _ in first })
+        func firstValue(_ names: [String]) -> String? {
+            for name in names {
+                if let value = query[name], !value.isEmpty { return value }
+            }
+            return nil
+        }
+        introEpisode = IntroEpisodeDescriptor(
+            title: title,
+            showName: firstValue(["show", "series", "series_title", "show_title"]),
+            imdbID: firstValue(["imdb_id", "imdb", "imdbid"]),
+            season: firstValue(["season", "season_number"]).flatMap(Int.init),
+            episode: firstValue(["episode", "episode_number"]).flatMap(Int.init)
+        )
         if let value = components.queryItems?.first(where: { $0.name == "sub" })?.value,
            let subtitleURL = URL(string: value),
            ["https", "http"].contains(subtitleURL.scheme?.lowercased() ?? ""),

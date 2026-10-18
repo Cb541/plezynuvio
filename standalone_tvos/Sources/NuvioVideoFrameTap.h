@@ -52,5 +52,12 @@ uint64_t NuvioDVTrimEditedCount(void);
 int NuvioDVTrimLastTargetCount(void);
 uint64_t NuvioDVTrimUneditableCount(void);
 BOOL NuvioDVTrimIsEnabled(void);
+/// Live counters distinguish no intercepted frames, no RPU attachments,
+/// libdovi parsing/roundtrip failures and absent saturation target blocks.
+/// A successful parse does NOT guarantee a visible picture adjustment.
+uint64_t NuvioDVTrimInterceptedFrames(void);
+uint64_t NuvioDVTrimRPUFrames(void);
+int NuvioDVTrimLastStatus(void);
+NSString *NuvioDVTrimLastFailureReason(void);
 
 NS_ASSUME_NONNULL_END

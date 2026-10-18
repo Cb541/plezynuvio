@@ -290,6 +290,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var videoDiskCacheBytes: Double?
     private var lastVideoDiskCacheSampleAt: Date?
     private var videoDiskWriteRateMBps: Double?
+    private var lastRangeCacheBytesWritten: UInt64?
+    private var lastRangeCacheSampleAt: Date?
+    private var rangeCacheWriteRateMBps = 0.0
     private var frameTapInstalled = false
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
@@ -406,6 +409,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         videoDiskCacheBytes = nil
         lastVideoDiskCacheSampleAt = nil
         videoDiskWriteRateMBps = nil
+        lastRangeCacheBytesWritten = nil
+        lastRangeCacheSampleAt = nil
+        rangeCacheWriteRateMBps = 0
         cachedTimeline.frameSlots = []
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
@@ -3104,8 +3110,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         } else {
             thumbs.pauseAheadIndex()
         }
-        // Update the disk-write rate and covered sections once a second.
-        // This measures saved JPEG bytes, not video download throughput.
+        // Sample the separate media-cache, sparse range-cache and JPEG disk
+        // writers once a second. Only actual writes count toward DISK MB/s.
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
             // This mpv property is the INPUT/network bytes per second,
@@ -3152,14 +3158,27 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let videoText = videoInputRateMbps.map {
                 String(format: "%.1f", $0)
             } ?? "—"
-            // The mpv file-cache byte counter is optional. It can be absent
-            // even when the thumbnail disk writer is actively saving frames.
-            // Combine the measured video-cache growth when available with the
-            // thumbnail writer's recorded successful JPEG writes. Never
-            // report "nothing cached" just because mpv omits its counter.
+            // The separate native sparse range cache writes compressed
+            // network video segments to .range files. Account for those real
+            // bytes as well as mpv's (optional) file cache and saved JPEGs.
+            let rangeBytes = nuvio_range_written_bytes()
+            let sampledAt = Date()
+            if let lastBytes = lastRangeCacheBytesWritten,
+               let previousAt = lastRangeCacheSampleAt {
+                let elapsed = sampledAt.timeIntervalSince(previousAt)
+                if elapsed > 0.25 {
+                    let growth = rangeBytes >= lastBytes
+                        ? rangeBytes - lastBytes : 0
+                    rangeCacheWriteRateMBps = Double(growth)
+                        / elapsed / 1_000_000
+                }
+            }
+            lastRangeCacheBytesWritten = rangeBytes
+            lastRangeCacheSampleAt = sampledAt
             let stats = thumbs.cacheStats()
             let diskRate = max(0, videoDiskWriteRateMBps ?? 0)
                 + max(0, stats.writeMBPerSecond)
+                + rangeCacheWriteRateMBps
             let diskText = String(format: "%.3f", diskRate)
             cacheRateLabel.text = "VIDEO \(videoText) Mb/s  ·  DISK \(diskText) MB/s"
             // Keep cached-frame highlighting; omit all capture/decode/debug

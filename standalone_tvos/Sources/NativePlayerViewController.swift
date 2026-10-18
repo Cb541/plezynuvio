@@ -1270,18 +1270,29 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             || (sourceColorMetadataReady && sourceIsHDR)
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
         if requiresNativeDolbyVision {
-            // An experimental, read-only check for Dolby's post-decode
-            // metadata. Never present these numbers as functional picture
-            // controls: no RPU rewriting is active.
+            // Report real libdovi outcomes rather than treating a displayed
+            // UI percentage as proof that Dolby Vision changed on the TV.
             let sampled = NuvioDVProbeSampleCount()
             let tagged = NuvioDVProbeTaggedSampleCount()
             let frameBytes = NuvioDVProbeFrameMetadataBytes()
-            let sequenceBytes = NuvioDVProbeSequenceMetadataBytes()
             let edited = NuvioDVTrimEditedCount()
             let skipped = NuvioDVTrimUneditableCount()
             if dvTrimEnabled {
                 let targets = NuvioDVTrimLastTargetCount()
-                colorStatusLabel.text = "DV SAT TEST: edited \(edited) · skipped \(skipped)\n\(NuvioDVTrimIsEnabled() ? "\(targets) target trims changed" : "neutral/fail-safe off") · contrast/brightness locked"
+                let inspected = NuvioDVTrimInterceptedFrames()
+                let rpuFrames = NuvioDVTrimRPUFrames()
+                let reason = NuvioDVTrimLastFailureReason()
+                if !NuvioDVTrimIsEnabled() {
+                    colorStatusLabel.text = "DV test idle/disabled · \(edited) edits\n\(abs(dvTrimSaturation - 1) < 0.001 ? "Set saturation away from 100%" : "Performance fail-safe disabled test")"
+                } else if inspected == 0 {
+                    colorStatusLabel.text = "DV test ON · 0 frames intercepted\nRenderer hook not receiving frames"
+                } else if rpuFrames == 0 {
+                    colorStatusLabel.text = "DV test ON · \(inspected) intercepted frames\n0 Dolby RPU attachments found"
+                } else if targets == 0 {
+                    colorStatusLabel.text = "DV edits 0 · skipped \(skipped) · RPU \(rpuFrames)\nReason: \(reason) (code \(NuvioDVTrimLastStatus()))"
+                } else {
+                    colorStatusLabel.text = "DV edits \(edited) · skipped \(skipped)\n\(targets) target trim(s) · \(reason)"
+                }
             } else if sampled == 0 {
                 colorStatusLabel.text = "DV RPU: awaiting samples\nTurn test ON then adjust a value"
             } else if tagged > 0 {

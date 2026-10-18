@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - standalone-native-tvos-player
+      - experiment-dv-rpu-trims
     paths:
       - 'standalone_tvos/**'
       - '.github/workflows/native-apple-tv.yml'
@@ -41,6 +42,14 @@ jobs:
           python3 -m venv /tmp/nuvio-icon-venv
           /tmp/nuvio-icon-venv/bin/python -m pip install --quiet Pillow
           /tmp/nuvio-icon-venv/bin/python standalone_tvos/tools/generate_app_icon.py
+
+      - name: Build experimental Dolby RPU trim adapter for Apple TV
+        run: |
+          rustc --version
+          rustup target add aarch64-apple-tvos
+          cargo build --manifest-path standalone_tvos/DVTrimRust/Cargo.toml \
+            --target aarch64-apple-tvos --release
+          test -s standalone_tvos/DVTrimRust/target/aarch64-apple-tvos/release/libnuvio_dv_trim.a
 
       - name: Create independent Xcode project
         run: |

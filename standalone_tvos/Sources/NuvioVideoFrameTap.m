@@ -53,6 +53,7 @@ static atomic_int sDVTrimSat100;
 static atomic_int sDVTrimContrast100;
 static atomic_int sDVTrimBright100;
 static atomic_uint_fast64_t sDVTrimEdits;
+static atomic_int sDVTrimLastTargetCount;
 static atomic_uint_fast64_t sDVTrimUnavailable;
 static atomic_uint_fast64_t sDVTrimSlowFrames;
 
@@ -89,13 +90,14 @@ static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
             atomic_load(&sDVTrimContrast100) / 100.0f,
             atomic_load(&sDVTrimBright100) / 100.0f,
             &status);
-        if (length > 0 && status == 1) {
+        if (length > 0 && status > 0) {
             CFDataRef changed = CFDataCreate(kCFAllocatorDefault, output, (CFIndex)length);
             if (changed) {
                 CVBufferSetAttachment(buffer, (__bridge CFStringRef)key, changed,
                     kCVAttachmentMode_ShouldPropagate);
                 CFRelease(changed);
                 atomic_fetch_add(&sDVTrimEdits, 1);
+                atomic_store(&sDVTrimLastTargetCount, status);
             }
         } else {
             atomic_fetch_add(&sDVTrimUnavailable, 1);
@@ -121,6 +123,7 @@ void NuvioDVTrimSet(BOOL enabled, double saturation, double contrast, double bri
     atomic_store(&sDVTrimEnabled, enabled && (sat != 100 || con != 100 || bri != 100));
 }
 uint64_t NuvioDVTrimEditedCount(void) { return atomic_load(&sDVTrimEdits); }
+int NuvioDVTrimLastTargetCount(void) { return atomic_load(&sDVTrimLastTargetCount); }
 uint64_t NuvioDVTrimUneditableCount(void) { return atomic_load(&sDVTrimUnavailable); }
 BOOL NuvioDVTrimIsEnabled(void) { return atomic_load(&sDVTrimEnabled); }
 
@@ -416,6 +419,7 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sDVTrimContrast100, 100);
     atomic_store(&sDVTrimBright100, 100);
     atomic_store(&sDVTrimEdits, 0);
+    atomic_store(&sDVTrimLastTargetCount, 0);
     atomic_store(&sDVTrimUnavailable, 0);
     atomic_store(&sDVTrimSlowFrames, 0);
     os_unfair_lock_lock(&sCallbackLock);

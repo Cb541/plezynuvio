@@ -191,6 +191,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var sourceColorMetadataReady = false
     private var sourceIsHDR = true
     private var sourceIsDolbyVision = false
+    private var configuredNativeP5Preview = false
     // Sticky once seen for this movie. Video filters can temporarily change
     // decoded color metadata, but the original DV file must NEVER be allowed
     // to fall into an expensive 4K CPU-copy color adjustment path.
@@ -474,6 +475,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         sourceColorMetadataReady = false
         sourceIsHDR = true
         sourceIsDolbyVision = false
+        configuredNativeP5Preview = false
         originalIsDolbyVision = false
         experimentalHDRColorBoost = false
         colorFilterActive = false
@@ -3033,6 +3035,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
+        if !configuredNativeP5Preview, (core?.doviProfile ?? 0) == 5 {
+            configuredNativeP5Preview = true
+            thumbs.setNativeDolbyVisionOnly(true)
+        }
         // DV profile information can arrive after the first frame, and an
         // experimental filter could temporarily alter output tags. As soon
         // as we ever detect DV in the source, latch it for the full movie

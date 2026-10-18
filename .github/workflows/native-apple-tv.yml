@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - standalone-native-tvos-player
+      - nuvio-brightness-base-targeted-fixes
     paths:
       - 'standalone_tvos/**'
       - '.github/workflows/native-apple-tv.yml'

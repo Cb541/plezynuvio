@@ -49,6 +49,7 @@ NSString *NuvioDVProbeAttachmentSummary(void);
 /// only, with the original attachment passed through on every error.
 void NuvioDVTrimSet(BOOL enabled, double saturation, double contrast, double brightness);
 uint64_t NuvioDVTrimEditedCount(void);
+int NuvioDVTrimLastTargetCount(void);
 uint64_t NuvioDVTrimUneditableCount(void);
 BOOL NuvioDVTrimIsEnabled(void);
 

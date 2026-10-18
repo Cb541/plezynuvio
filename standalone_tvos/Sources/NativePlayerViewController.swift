@@ -212,6 +212,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var colorFilterOperation = 0
     private var colorFilterTimer: Timer?
     private var colorFilterFailed = false
+    private var lastDVProbeUIUpdate = Date.distantPast
     private var panOriginSeconds: Double = 0
     // Detect actual turning of the touchpad pan path. A regular left/right
     // swipe has a steady heading; tracing a circle rotates that heading.
@@ -1259,7 +1260,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             && !requiresNativeDolbyVision
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
         if requiresNativeDolbyVision {
-            colorStatusLabel.text = "Dolby Vision uses native hardware playback.\nUse TV Color Depth / Contrast for DV."
+            // An experimental, read-only check for Dolby's post-decode
+            // metadata. Never present these numbers as functional picture
+            // controls: no RPU rewriting is active.
+            let sampled = NuvioDVProbeSampleCount()
+            let tagged = NuvioDVProbeTaggedSampleCount()
+            let frameBytes = NuvioDVProbeFrameMetadataBytes()
+            let sequenceBytes = NuvioDVProbeSequenceMetadataBytes()
+            if sampled == 0 {
+                colorStatusLabel.text = "DV RPU research: waiting for video samples…\nNative Dolby Vision is unchanged"
+            } else if tagged > 0 {
+                colorStatusLabel.text = "DV metadata probe: frame \(frameBytes) B · sequence \(sequenceBytes) B\nRead-only • trim adjustment not yet active"
+            } else {
+                colorStatusLabel.text = "DV metadata probe: no frame trim data exposed\nNative DV protected • no pixel processing"
+            }
         } else if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
         } else if colorFilterInFlight {
@@ -3041,6 +3055,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
+        if toolPanel == .picture && requiresNativeDolbyVision &&
+           Date().timeIntervalSince(lastDVProbeUIUpdate) >= 1.0 {
+            lastDVProbeUIUpdate = Date()
+            updatePictureLabels()
+        }
         if !configuredNativeP5Preview, (core?.doviProfile ?? 0) == 5 {
             configuredNativeP5Preview = true
             thumbs.setNativeDolbyVisionOnly(true)

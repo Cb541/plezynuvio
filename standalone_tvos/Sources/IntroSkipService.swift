@@ -16,7 +16,8 @@ struct IntroEpisodeDescriptor {
         var nameFromTitle: String?
         let patterns = [
             #"(?i)\bS(\d{1,2})[ ._-]*E(\d{1,3})\b"#,
-            #"(?i)\b(\d{1,2})x(\d{1,3})\b"#
+            #"(?i)\b(\d{1,2})x(\d{1,3})\b"#,
+            #"(?i)\bSeason[ ._-]*(\d{1,2})[ ._-]*Episode[ ._-]*(\d{1,3})\b"#
         ]
         for pattern in patterns {
             guard let regex = try? NSRegularExpression(pattern: pattern),

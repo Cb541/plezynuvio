@@ -56,12 +56,18 @@ fn identify_wrapper(data: &[u8]) -> Option<(usize, bool)> {
 }
 
 fn parse_container(data: &[u8], kind: RpuContainer) -> anyhow::Result<DoviRpu> {
-    let unwrapped = &data[kind.prefix..];
+    let base = &data[kind.prefix..];
     match kind.encoding {
-        RpuEncoding::Raw => DoviRpu::parse_rpu(unwrapped),
+        RpuEncoding::Raw => {
+            // Apple's 7C01 attachment may ALREADY be de-escaped. In that
+            // case parse_unspec62_nalu() would strip 00 00 03 sequences a
+            // second time and fail the CRC check. Remove only the NAL header.
+            let payload = if kind.nal_header { &base[2..] } else { base };
+            DoviRpu::parse_rpu(payload)
+        }
         RpuEncoding::EmulationPrevented => {
             // libdovi accepts both 7C01 HEVC NAL and 19-prefixed raw RPU.
-            DoviRpu::parse_unspec62_nalu(unwrapped)
+            DoviRpu::parse_unspec62_nalu(base)
         }
     }
 }
@@ -84,10 +90,7 @@ fn to_bytes(rpu: &DoviRpu, kind: RpuContainer, original: &[u8]) -> anyhow::Resul
     let mut output = Vec::with_capacity(kind.prefix + payload.len() + 2);
     output.extend_from_slice(&original[..kind.prefix]);
     if kind.nal_header && matches!(kind.encoding, RpuEncoding::Raw) {
-        // Raw parsing always receives 19-prefixed RPU bytes, i.e. the HEVC
-        // NAL header must be stripped and restored outside the parser.
-        // We prefer EPB parsing for NAL source, so skip raw here instead.
-        unreachable!("raw NAL must not be chosen");
+        output.extend_from_slice(&original[kind.prefix..kind.prefix + 2]);
     }
     output.extend_from_slice(&payload);
     Ok(output)
@@ -96,13 +99,10 @@ fn to_bytes(rpu: &DoviRpu, kind: RpuContainer, original: &[u8]) -> anyhow::Resul
 fn parse_exact_roundtrip(data: &[u8]) -> Result<(DoviRpu, RpuContainer), i32> {
     let (prefix, nal_header) = identify_wrapper(data).ok_or(-9)?;
     let mut parsed_any = false;
-    // On a true 7C01 HEVC NALU, the EPB-aware parser is mandatory; otherwise
-    // attempt BOTH forms because 19-prefixed payloads may also carry EPB.
-    let encodings: &[RpuEncoding] = if nal_header {
-        &[RpuEncoding::EmulationPrevented]
-    } else {
-        &[RpuEncoding::Raw, RpuEncoding::EmulationPrevented]
-    };
+    // Both a 7C01 NALU and a bare RPU can arrive pre-de-escaped in a Core
+    // Video attachment. Attempt both, accepting only byte-exact roundtrips.
+    let encodings: &[RpuEncoding] =
+        &[RpuEncoding::Raw, RpuEncoding::EmulationPrevented];
     for &encoding in encodings {
         let kind = RpuContainer { prefix, nal_header, encoding };
         if let Ok(rpu) = parse_container(data, kind) {

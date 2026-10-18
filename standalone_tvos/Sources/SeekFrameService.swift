@@ -63,6 +63,7 @@ final class SeekFrameService {
     private var aheadLastSeconds = 0.0
     private var previewTiming = ""
     private var aheadDisabled = false
+    private var nativeDolbyVisionOnly = false
     private var indexURL: URL?
     private var indexPlan = NuvioAheadPlan()
     private var indexSourceURL: URL?
@@ -111,7 +112,8 @@ final class SeekFrameService {
     }
 
     func prepare(url: URL) {
-        let identity = SHA256.hash(data: Data(url.absoluteString.utf8))
+        // Regenerate HDR/DV previews with corrected color handling.
+        let identity = SHA256.hash(data: Data(("preview-color-v2:" + url.absoluteString).utf8))
             .map { String(format: "%02x", $0) }.joined()
         let fm = FileManager.default
         let root = fm.urls(for: .applicationSupportDirectory,
@@ -138,6 +140,7 @@ final class SeekFrameService {
         aheadLastSeconds = 0
         previewTiming = ""
         aheadDisabled = false
+        nativeDolbyVisionOnly = false
         indexURL = nil
         indexPlan = NuvioAheadPlan()
         indexSourceURL = nil
@@ -471,6 +474,7 @@ final class SeekFrameService {
         aheadLastSeconds = 0
         previewTiming = ""
         aheadDisabled = false
+        nativeDolbyVisionOnly = false
         indexURL = nil
         indexPlan = NuvioAheadPlan()
         indexSourceURL = nil
@@ -518,6 +522,18 @@ final class SeekFrameService {
         lock.unlock()
     }
 
+    // P5 Dolby Vision IPTPQc2 cannot be decoded as a normal HDR10 base.
+    // Native rendered frames can still populate the disk thumbnail cache.
+    func setNativeDolbyVisionOnly(_ enabled: Bool) {
+        lock.lock()
+        nativeDolbyVisionOnly = enabled
+        if enabled {
+            indexURL = nil
+            if activeWasBackground { activeToken?.cancelled = true }
+        }
+        lock.unlock()
+    }
+
     /// Update the real playback anchor. The worker schedules its own next
     /// sample immediately after saving the previous one, even with chrome hidden
     /// or playback paused. The uncommitted scrub cursor is never used here.
@@ -527,7 +543,7 @@ final class SeekFrameService {
               duration.isFinite, duration > 2 else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard !indexingSuspended else { return }
+        guard !indexingSuspended && !nativeDolbyVisionOnly else { return }
         let position = Int(playback)
         if indexSourceURL != url {
             indexPlan = NuvioAheadPlan()

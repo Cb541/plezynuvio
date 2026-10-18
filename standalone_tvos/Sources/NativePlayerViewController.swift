@@ -212,7 +212,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var colorFilterOperation = 0
     private var colorFilterTimer: Timer?
     private var colorFilterFailed = false
-    private var lastDVProbeUIUpdate = Date.distantPast
     private var panOriginSeconds: Double = 0
     // Detect actual turning of the touchpad pan path. A regular left/right
     // swipe has a steady heading; tracing a circle rotates that heading.
@@ -1057,7 +1056,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         colorStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         colorStatusLabel.font = .systemFont(ofSize: 17, weight: .medium)
         colorStatusLabel.textColor = .white.withAlphaComponent(0.75)
-        colorStatusLabel.numberOfLines = 4
+        colorStatusLabel.numberOfLines = 2
         picturePanel.addSubview(colorStatusLabel)
         updatePictureLabels()
 
@@ -1260,22 +1259,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             && !requiresNativeDolbyVision
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
         if requiresNativeDolbyVision {
-            // An experimental, read-only check for Dolby's post-decode
-            // metadata. Never present these numbers as functional picture
-            // controls: no RPU rewriting is active.
-            let sampled = NuvioDVProbeSampleCount()
-            let tagged = NuvioDVProbeTaggedSampleCount()
-            let frameBytes = NuvioDVProbeFrameMetadataBytes()
-            let sequenceBytes = NuvioDVProbeSequenceMetadataBytes()
-            if sampled == 0 {
-                colorStatusLabel.text = "DV RPU research: waiting for video samples…\nNative Dolby Vision is unchanged"
-            } else if tagged > 0 {
-                // Show the exact attachment name, not just its byte count.
-                // A 243-byte blob is not necessarily an editable Dolby RPU.
-                colorStatusLabel.text = "DV attachment: \(NuvioDVProbeAttachmentSummary())\nFrame \(frameBytes) B · sequence \(sequenceBytes) B · read-only"
-            } else {
-                colorStatusLabel.text = "DV metadata probe: no frame trim data exposed\nNative DV protected • no pixel processing"
-            }
+            colorStatusLabel.text = "Dolby Vision uses native hardware playback.\nUse TV Color Depth / Contrast for DV."
         } else if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
         } else if colorFilterInFlight {
@@ -3057,11 +3041,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
-        if toolPanel == .picture && requiresNativeDolbyVision &&
-           Date().timeIntervalSince(lastDVProbeUIUpdate) >= 1.0 {
-            lastDVProbeUIUpdate = Date()
-            updatePictureLabels()
-        }
         if !configuredNativeP5Preview, (core?.doviProfile ?? 0) == 5 {
             configuredNativeP5Preview = true
             thumbs.setNativeDolbyVisionOnly(true)

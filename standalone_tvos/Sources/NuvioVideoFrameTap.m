@@ -145,7 +145,26 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
                 CGFloat scale = MIN(1.0, 720.0 / MAX(1.0, longer));
                 CIImage *small = [input imageByApplyingTransform:
                     CGAffineTransformMakeScale(scale, scale)];
-                CGColorSpaceRef srgb = CGColorSpaceCreateDeviceRGB();
+                // The AVSampleBuffer renderer can expose native PQ/HLG
+                // buffers. Explicitly tone map the *thumbnail copy* to SDR;
+                // the real video buffer above is never changed.
+                CFTypeRef transfer = CVBufferGetAttachment(retained,
+                    kCVImageBufferTransferFunctionKey, NULL);
+                BOOL hdrTransfer = transfer &&
+                    (CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ) ||
+                     CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG));
+                if (hdrTransfer) {
+                    CIFilter *tone = [CIFilter filterWithName:@"CIToneMapHeadroom"];
+                    if (tone && [tone.inputKeys containsObject:@"inputTargetHeadroom"]) {
+                        [tone setValue:small forKey:kCIInputImageKey];
+                        [tone setValue:@(8.0f) forKey:@"inputSourceHeadroom"];
+                        [tone setValue:@(1.0f) forKey:@"inputTargetHeadroom"];
+                        if (tone.outputImage) small = tone.outputImage;
+                    }
+                }
+                // A concrete SDR destination also converts the image's
+                // tagged color primaries rather than treating PQ as DeviceRGB.
+                CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
                 cg = [ci createCGImage:small fromRect:small.extent
                                   format:kCIFormatRGBA8 colorSpace:srgb];
                 CGColorSpaceRelease(srgb);

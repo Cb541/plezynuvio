@@ -191,6 +191,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var sourceColorMetadataReady = false
     private var sourceIsHDR = true
     private var sourceIsDolbyVision = false
+    private var configuredNativeP5Preview = false
     // Sticky once seen for this movie. Video filters can temporarily change
     // decoded color metadata, but the original DV file must NEVER be allowed
     // to fall into an expensive 4K CPU-copy color adjustment path.
@@ -289,6 +290,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var videoDiskCacheBytes: Double?
     private var lastVideoDiskCacheSampleAt: Date?
     private var videoDiskWriteRateMBps: Double?
+    private var lastRangeCacheBytesWritten: UInt64?
+    private var lastRangeCacheSampleAt: Date?
+    private var rangeCacheWriteRateMBps = 0.0
     private var frameTapInstalled = false
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
@@ -296,7 +300,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 575 // 548 × 1.05 ≈ 575
+    private let seekPreviewWidth: CGFloat = 604 // 575 × 1.05 ≈ 604
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -405,6 +409,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         videoDiskCacheBytes = nil
         lastVideoDiskCacheSampleAt = nil
         videoDiskWriteRateMBps = nil
+        lastRangeCacheBytesWritten = nil
+        lastRangeCacheSampleAt = nil
+        rangeCacheWriteRateMBps = 0
         cachedTimeline.frameSlots = []
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
@@ -474,6 +481,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         sourceColorMetadataReady = false
         sourceIsHDR = true
         sourceIsDolbyVision = false
+        configuredNativeP5Preview = false
         originalIsDolbyVision = false
         experimentalHDRColorBoost = false
         colorFilterActive = false
@@ -931,8 +939,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             ofSize: 15, weight: .medium)
         cacheRateLabel.textAlignment = .right
         cacheRateLabel.isUserInteractionEnabled = false
-        // Always visible at the lower right during playback, not only when
-        // the pause/seek panel is shown. No debug counters are displayed.
+        // This label is attached to the player controls' visibility.
+        // No persistent playback overlay or debug counters are displayed.
         cacheRateLabel.isHidden = true
         view.addSubview(cacheRateLabel)
 
@@ -1136,10 +1144,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
             filmStrip.heightAnchor.constraint(equalToConstant: 311),
             movableThumbnailX,
-            // Bottom edge at 65% down from top (previously 70%).
+            // Raise floating seek preview 3% of screen height, with
+            // unchanged window height and horizontal seek position tracking.
+            // Its lower edge moves from 65% to 62% down from the screen top.
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
-                multiplier: 0.65, constant: 0),
+                multiplier: 0.62, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -2064,6 +2074,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         toolbarFocused = false
         controlsVisible = false
         panel.isHidden = true
+        // The stats belong to the player controls, so hide synchronously
+        // when controls time out, Back dismisses, or a seek resumes.
+        cacheRateLabel.isHidden = true
         statusLabel.isHidden = true
         stopShowingThumbnail()
         updateToolbarFocus()
@@ -2639,6 +2652,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if thumbs.hasCachedFrameNear(second: slot) { return }
         guard lastPreviewRequestedBucket != slot else { return }
         lastPreviewRequestedBucket = slot
+        if core?.doviProfile == 5 {
+            // P5 has no HDR10-compatible base layer. The FFmpeg seek worker
+            // can't reproduce Dolby's IPTPQc2 + RPU color mapping. Ask the
+            // existing hardware decoder for a still, while paused, rather
+            // than cache a dark/magenta corrupted FFmpeg JPEG.
+            requestNativePreviewTarget(slot, serial: serial)
+            return
+        }
         thumbs.request(url: link.url, second: slot) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,
@@ -2673,6 +2694,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if #available(tvOS 17.4, *),
            let buffer = previewCore.videoLayer?.sampleBufferRenderer.displayedPixelBuffer() {
             let context = thumbnailImageContext
+            let isHDRPreview = sourceIsHDR || requiresNativeDolbyVision
             DispatchQueue.global(qos: .utility).async {
                 let frame = CIImage(cvPixelBuffer: buffer)
                 let longer = max(frame.extent.width, frame.extent.height)
@@ -2684,10 +2706,22 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     return
                 }
                 let scale = min(1, 720.0 / longer)
-                let reduced = frame.transformed(by: CGAffineTransform(
+                var reduced = frame.transformed(by: CGAffineTransform(
                     scaleX: scale, y: scale))
+                // Tone-map the tiny screenshot copy into a real SDR output.
+                // Neither the source CVPixelBuffer nor displayed DV frame
+                // is changed; this work runs off the playback thread.
+                if isHDRPreview, let tone = CIFilter(name: "CIToneMapHeadroom"),
+                   tone.inputKeys.contains("inputTargetHeadroom") {
+                    tone.setValue(reduced, forKey: kCIInputImageKey)
+                    tone.setValue(8.0, forKey: "inputSourceHeadroom")
+                    tone.setValue(1.0, forKey: "inputTargetHeadroom")
+                    if let result = tone.outputImage { reduced = result }
+                }
                 let image: UIImage?
-                if let cg = context.createCGImage(reduced, from: reduced.extent) {
+                let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+                if let cg = context.createCGImage(reduced, from: reduced.extent,
+                                                  format: .RGBA8, colorSpace: srgb) {
                     image = UIImage(cgImage: cg)
                 } else {
                     image = nil
@@ -2833,7 +2867,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if let image {
                 self.thumbs.cachePlaybackFrame(
                     image, second: desired, automatic: false)
-                let selected = max(0, (Int((self.targetSeconds ?? -1).rounded()) / 2) * 2)
+                let selected = max(0, (Int((self.targetSeconds ?? -1).rounded()) / 12) * 12)
                 if selected == desired {
                     self.frameViews.first?.image = image
                     self.lastPreviewImageSecond = desired
@@ -2964,7 +2998,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             progress.isHidden = true
             cachedTimeline.isHidden = true
             playbackPositionMarker.isHidden = true
-            cacheRateLabel.isHidden = core == nil
+            cacheRateLabel.isHidden = true
             currentLabel.isHidden = true
             endLabel.isHidden = true
             statusLabel.isHidden = true
@@ -2985,7 +3019,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         progress.isHidden = !showTimeline
         cachedTimeline.isHidden = !showTimeline
         playbackPositionMarker.isHidden = !showTimeline
-        cacheRateLabel.isHidden = core == nil
+        // Exactly mirror the controls container: stats can never float
+        // alone during playback, including after Back or auto-hide.
+        cacheRateLabel.isHidden = !hasPlayerControls
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
@@ -3007,6 +3043,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
+        if !configuredNativeP5Preview, (core?.doviProfile ?? 0) == 5 {
+            configuredNativeP5Preview = true
+            thumbs.setNativeDolbyVisionOnly(true)
+        }
         // DV profile information can arrive after the first frame, and an
         // experimental filter could temporarily alter output tags. As soon
         // as we ever detect DV in the source, latch it for the full movie
@@ -3072,8 +3112,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         } else {
             thumbs.pauseAheadIndex()
         }
-        // Update the disk-write rate and covered sections once a second.
-        // This measures saved JPEG bytes, not video download throughput.
+        // Sample the separate media-cache, sparse range-cache and JPEG disk
+        // writers once a second. Only actual writes count toward DISK MB/s.
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {
             lastCacheUIUpdate = Date()
             // This mpv property is the INPUT/network bytes per second,
@@ -3120,13 +3160,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let videoText = videoInputRateMbps.map {
                 String(format: "%.1f", $0)
             } ?? "—"
-            let diskText = videoDiskWriteRateMBps.map {
-                String(format: "%.1f", $0)
-            } ?? "—"
+            // The separate native sparse range cache writes compressed
+            // network video segments to .range files. Account for those real
+            // bytes as well as mpv's (optional) file cache and saved JPEGs.
+            let rangeBytes = nuvio_range_written_bytes()
+            let sampledAt = Date()
+            if let lastBytes = lastRangeCacheBytesWritten,
+               let previousAt = lastRangeCacheSampleAt {
+                let elapsed = sampledAt.timeIntervalSince(previousAt)
+                if elapsed > 0.25 {
+                    let growth = rangeBytes >= lastBytes
+                        ? rangeBytes - lastBytes : 0
+                    rangeCacheWriteRateMBps = Double(growth)
+                        / elapsed / 1_000_000
+                }
+            }
+            lastRangeCacheBytesWritten = rangeBytes
+            lastRangeCacheSampleAt = sampledAt
+            let stats = thumbs.cacheStats()
+            let diskRate = max(0, videoDiskWriteRateMBps ?? 0)
+                + max(0, stats.writeMBPerSecond)
+                + rangeCacheWriteRateMBps
+            let diskText = String(format: "%.3f", diskRate)
             cacheRateLabel.text = "VIDEO \(videoText) Mb/s  ·  DISK \(diskText) MB/s"
             // Keep cached-frame highlighting; omit all capture/decode/debug
             // counters from the user-facing playback overlay.
-            let stats = thumbs.cacheStats()
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots
             cachedTimeline.setNeedsDisplay()
@@ -3159,7 +3217,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let end = progress.convert(CGPoint(x: progress.bounds.maxX,
                                            y: progress.bounds.midY), to: view).x
         let timelineX = start + (end - start) * fraction
-        // At either extreme the large 575pt preview must not be cut off.
+        // At either extreme the large 604pt preview must not be cut off.
         let margin: CGFloat = 16
         let halfWidth = seekPreviewWidth / 2
         let minimum = halfWidth + margin

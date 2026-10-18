@@ -38,7 +38,12 @@ private final class PlayerToolGlyph: UIView {
     override func draw(_ rect: CGRect) {
         let context = UIGraphicsGetCurrentContext()
         context?.saveGState()
-        context?.translateBy(x: rect.midX - 20, y: rect.midY - 20)
+        // The paths below use a 40pt coordinate system. Scale their actual
+        // drawing coordinates when the glyph view shrinks so nothing is cut off.
+        let scale = min(rect.width, rect.height) / 40
+        context?.translateBy(x: rect.midX, y: rect.midY)
+        context?.scaleBy(x: scale, y: scale)
+        context?.translateBy(x: -20, y: -20)
         UIColor.white.setFill()
         UIColor.white.setStroke()
         switch kind {
@@ -300,7 +305,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 604 // 575 × 1.05 ≈ 604
+    private let seekPreviewWidth: CGFloat = 733 // Match the latest working IPA
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -961,10 +966,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         ] {
             let circle = UIView()
             circle.translatesAutoresizingMaskIntoConstraints = false
-            circle.layer.cornerRadius = 29
-            circle.clipsToBounds = true
+            circle.layer.cornerRadius = 16.5
+            // Glass highlights extend to the edge; don't mask the rim.
+            circle.clipsToBounds = false
             circle.isUserInteractionEnabled = false
-            addGlassBackdrop(to: circle, radius: 29)
+            addGlassBackdrop(to: circle, radius: 16.5)
             let glyph = PlayerToolGlyph(kind: kind)
             glyph.translatesAutoresizingMaskIntoConstraints = false
             glyph.accessibilityLabel = name
@@ -972,10 +978,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             NSLayoutConstraint.activate([
                 glyph.centerXAnchor.constraint(equalTo: circle.centerXAnchor),
                 glyph.centerYAnchor.constraint(equalTo: circle.centerYAnchor),
-                glyph.widthAnchor.constraint(equalToConstant: 40),
-                glyph.heightAnchor.constraint(equalToConstant: 40),
-                circle.widthAnchor.constraint(equalToConstant: 58),
-                circle.heightAnchor.constraint(equalToConstant: 58)
+                glyph.widthAnchor.constraint(equalToConstant: 22.5),
+                glyph.heightAnchor.constraint(equalToConstant: 22.5),
+                circle.widthAnchor.constraint(equalToConstant: 33),
+                circle.heightAnchor.constraint(equalToConstant: 33)
             ])
             toolbarButtons.append(glyph)
             toolbar.addArrangedSubview(circle)
@@ -1139,15 +1145,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             endLabel.widthAnchor.constraint(equalToConstant: 105),
             toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            // Increase the previous 548 × 296 preview by another 5%
-            // on both axes. Move its bottom edge up 5% of screen height.
+            // Use the tested 733 × 360 floating preview size from the latest IPA.
+            // Keep the preview above the timeline rather than full-screen.
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
-            filmStrip.heightAnchor.constraint(equalToConstant: 311),
+            filmStrip.heightAnchor.constraint(equalToConstant: 360),
             movableThumbnailX,
-            // Bottom edge at 65% down from top (previously 70%).
+            // Keep the most recent preview placement: 62% down from top.
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
-                multiplier: 0.65, constant: 0),
+                multiplier: 0.62, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -1211,7 +1217,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         background.translatesAutoresizingMaskIntoConstraints = false
         background.isUserInteractionEnabled = false
         background.layer.cornerRadius = radius
-        background.clipsToBounds = true
+        background.clipsToBounds = false
         target.insertSubview(background, at: 0)
         NSLayoutConstraint.activate([
             background.leadingAnchor.constraint(equalTo: target.leadingAnchor),
@@ -1703,7 +1709,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 }
             }
         case .menu:
-            if toolPanel != .none {
+            // Once the video has ended, Back should return to Nuvio's stream
+            // picker rather than leaving the standalone player on its idle view.
+            if link == nil {
+                returnToNuvio()
+            } else if toolPanel != .none {
                 closeToolPanel()
             } else if lockedSeekDirection != 0 {
                 finishLockedSeek(commit: false)
@@ -2142,6 +2152,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lastCacheLookupBucket = nil
         thumbs.cancel()
         currentPreviewSerial += 1
+    }
+
+    // Nuvio's registered URL scheme hands focus back to the originating app.
+    private let returnToNuvioURL = URL(string: "nuvio://return")
+    private var returningToNuvio = false
+
+    private func returnToNuvio() {
+        guard !returningToNuvio, let url = returnToNuvioURL else { return }
+        returningToNuvio = true
+        UIApplication.shared.open(url, options: [:]) { [weak self] opened in
+            self?.returningToNuvio = false
+            if !opened {
+                self?.statusLabel.text = "Choose a stream in Nuvio"
+            }
+        }
     }
 
     private func confirmExit() {

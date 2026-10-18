@@ -296,7 +296,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 575 // 548 × 1.05 ≈ 575
+    private let seekPreviewWidth: CGFloat = 604 // 575 × 1.05 ≈ 604
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -2964,7 +2964,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             progress.isHidden = true
             cachedTimeline.isHidden = true
             playbackPositionMarker.isHidden = true
-            cacheRateLabel.isHidden = core == nil
+            cacheRateLabel.isHidden = true
             currentLabel.isHidden = true
             endLabel.isHidden = true
             statusLabel.isHidden = true
@@ -2985,7 +2985,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         progress.isHidden = !showTimeline
         cachedTimeline.isHidden = !showTimeline
         playbackPositionMarker.isHidden = !showTimeline
-        cacheRateLabel.isHidden = core == nil
+        // Network/disk numbers belong to the paused or Down-opened control
+        // surface; never leave a persistent overlay during normal playback.
+        let showMetrics = core != nil && (!playing || toolbarFocused ||
+            toolPanel != .none || lockedSeekDirection != 0 ||
+            isTouchScrubbing || targetSeconds != nil)
+        cacheRateLabel.isHidden = !showMetrics
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
@@ -3120,13 +3125,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let videoText = videoInputRateMbps.map {
                 String(format: "%.1f", $0)
             } ?? "—"
-            let diskText = videoDiskWriteRateMBps.map {
-                String(format: "%.1f", $0)
-            } ?? "—"
+            // The mpv file-cache byte counter is optional. It can be absent
+            // even when the thumbnail disk writer is actively saving frames.
+            // Combine the measured video-cache growth when available with the
+            // thumbnail writer's recorded successful JPEG writes. Never
+            // report "nothing cached" just because mpv omits its counter.
+            let stats = thumbs.cacheStats()
+            let diskRate = max(0, videoDiskWriteRateMBps ?? 0)
+                + max(0, stats.writeMBPerSecond)
+            let diskText = String(format: "%.3f", diskRate)
             cacheRateLabel.text = "VIDEO \(videoText) Mb/s  ·  DISK \(diskText) MB/s"
             // Keep cached-frame highlighting; omit all capture/decode/debug
             // counters from the user-facing playback overlay.
-            let stats = thumbs.cacheStats()
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots
             cachedTimeline.setNeedsDisplay()
@@ -3159,7 +3169,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let end = progress.convert(CGPoint(x: progress.bounds.maxX,
                                            y: progress.bounds.midY), to: view).x
         let timelineX = start + (end - start) * fraction
-        // At either extreme the large 575pt preview must not be cut off.
+        // At either extreme the large 604pt preview must not be cut off.
         let margin: CGFloat = 16
         let halfWidth = seekPreviewWidth / 2
         let minimum = halfWidth + margin

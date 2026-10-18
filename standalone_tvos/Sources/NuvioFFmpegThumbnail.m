@@ -83,6 +83,78 @@ static int64_t nuvioCachedSeek(void *opaque, int64_t offset, int whence) {
     return nuvio_range_seek(input->ranges, offset, whence & ~AVSEEK_FORCE);
 }
 
+
+/*
+ * Thumbnail-only HDR-to-SDR conversion. The movie itself is always passed
+ * untouched to the native Dolby Vision / HDR presentation pipeline.
+ *
+ * sws_scale alone maps Rec.2020 PQ/HLG samples into ordinary RGB bytes without
+ * decoding their nonlinear HDR transfer function. That makes cached JPEGs
+ * look flat and grey. Convert HDR at 16 bits, apply its EOTF, convert linear
+ * BT.2020 to BT.709, and compress highlights before writing an SDR preview.
+ * Tiny lookup tables keep the work bounded to one 640px decoded thumbnail.
+ */
+static float nuvioHDRNits(float signal, enum AVColorTransferCharacteristic trc) {
+    if (trc == AVCOL_TRC_SMPTE2084) {
+        const float m1 = 2610.0f / 16384.0f;
+        const float m2 = 2523.0f / 32.0f;
+        const float c1 = 3424.0f / 4096.0f;
+        const float c2 = 2413.0f / 128.0f;
+        const float c3 = 2392.0f / 128.0f;
+        float p = powf(signal, 1.0f / m2);
+        float v = fmaxf(p - c1, 0.0f) / fmaxf(c2 - c3 * p, 1e-6f);
+        return 10000.0f * powf(v, 1.0f / m1);
+    }
+    // ITU-R BT.2100 HLG inverse OETF, with a restrained 1000-nit
+    // reference display for a consistent SDR still-image rendition.
+    float scene = signal <= 0.5f ? signal * signal / 3.0f
+        : (expf((signal - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f;
+    return 1000.0f * powf(fmaxf(scene, 0.0f), 1.2f);
+}
+
+static inline uint8_t nuvioTonePixel(float nits, const uint8_t *lut) {
+    int index = (int)fminf(4095.0f, fmaxf(0.0f, nits) + 0.5f);
+    return lut[index];
+}
+
+static void nuvioToneMapHDR(const uint16_t *source, int sourceStride,
+                            uint8_t *pixels, int width, int height,
+                            enum AVColorTransferCharacteristic trc,
+                            bool bt2020) {
+    float linear[4096];
+    uint8_t display[4096];
+    for (int i = 0; i < 4096; ++i) {
+        linear[i] = nuvioHDRNits((float)i / 4095.0f, trc);
+        float compressed = (float)i / ((float)i + 160.0f);
+        float srgb = compressed <= 0.0031308f ? compressed * 12.92f
+            : 1.055f * powf(compressed, 1.0f / 2.4f) - 0.055f;
+        display[i] = (uint8_t)lrintf(255.0f * fminf(1.0f, fmaxf(0.0f, srgb)));
+    }
+    for (int y = 0; y < height; ++y) {
+        const uint16_t *row = (const uint16_t *)((const uint8_t *)source
+                                                  + (size_t)y * sourceStride);
+        uint8_t *dst = pixels + (size_t)y * width * 4;
+        for (int x = 0; x < width; ++x) {
+            // AV_PIX_FMT_RGBA64LE is R, G, B, A in host-endian 16-bit words.
+            const uint16_t *sample = row + (size_t)x * 4;
+            float r = linear[sample[0] >> 4];
+            float g = linear[sample[1] >> 4];
+            float b = linear[sample[2] >> 4];
+            if (bt2020) {
+                // Rec.2020 D65 -> Rec.709 D65, in linear light.
+                float nr = 1.6605f * r - 0.5876f * g - 0.0728f * b;
+                float ng = -0.1246f * r + 1.1329f * g - 0.0083f * b;
+                float nb = -0.0182f * r - 0.1006f * g + 1.1187f * b;
+                r = nr; g = ng; b = nb;
+            }
+            dst[4*x + 0] = nuvioTonePixel(b, display);
+            dst[4*x + 1] = nuvioTonePixel(g, display);
+            dst[4*x + 2] = nuvioTonePixel(r, display);
+            dst[4*x + 3] = 255;
+        }
+    }
+}
+
 // Detect letterbox rows embedded into a decoded frame. scaleAspectFill
 // handles differing aspect ratios, but source-encoded black bars would
 // otherwise remain visible on a full-screen scrubbing preview. Crop only
@@ -98,7 +170,8 @@ static bool nuvioIsBlackBandRow(const uint8_t *pixels, int stride, int width, in
     return true;
 }
 
-static UIImage *nuvioMakeImage(AVFrame *frame) {
+static UIImage *nuvioMakeImage(AVFrame *frame,
+                               const AVCodecParameters *sourceParameters) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return nil;
 
     // A 640px preview comfortably fills the 432pt floating window, with
@@ -106,22 +179,50 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
     const int width = 640;
     const int height = MAX(2, (int)lrint((double)frame->height * width / frame->width) & ~1);
     if (height > 1200) return nil;
+    enum AVColorTransferCharacteristic trc = frame->color_trc;
+    if (trc == AVCOL_TRC_UNSPECIFIED && sourceParameters)
+        trc = sourceParameters->color_trc;
+    const bool hdr = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67;
+    enum AVColorPrimaries primaries = frame->color_primaries;
+    if (primaries == AVCOL_PRI_UNSPECIFIED && sourceParameters)
+        primaries = sourceParameters->color_primaries;
+    enum AVColorSpace matrix = frame->colorspace;
+    if (matrix == AVCOL_SPC_UNSPECIFIED && sourceParameters)
+        matrix = sourceParameters->color_space;
     const int stride = width * 4;
-    uint8_t *pixels = av_malloc((size_t)stride * height);
-    if (!pixels) return nil;
+    const int convertStride = width * (hdr ? 8 : 4);
+    uint8_t *converted = av_malloc((size_t)convertStride * height);
+    if (!converted) return nil;
     struct SwsContext *scale = sws_getContext(
         frame->width, frame->height, (enum AVPixelFormat)frame->format,
-        width, height, AV_PIX_FMT_BGRA, SWS_BILINEAR,
-        NULL, NULL, NULL
+        width, height, hdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_BGRA,
+        SWS_BILINEAR, NULL, NULL, NULL
     );
-    if (!scale) { av_free(pixels); return nil; }
-
-    uint8_t *dst[4] = { pixels, NULL, NULL, NULL };
-    int dstStride[4] = { stride, 0, 0, 0 };
+    if (!scale) { av_free(converted); return nil; }
+    if (hdr) {
+        const int *coefficients = sws_getCoefficients(
+            matrix == AVCOL_SPC_BT2020_NCL || matrix == AVCOL_SPC_BT2020_CL
+                ? SWS_CS_BT2020 : SWS_CS_ITU709);
+        sws_setColorspaceDetails(scale, coefficients,
+            frame->color_range == AVCOL_RANGE_JPEG ? 1 : 0,
+            sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16, 1 << 16);
+    }
+    uint8_t *dst[4] = { converted, NULL, NULL, NULL };
+    int dstStride[4] = { convertStride, 0, 0, 0 };
     int rows = sws_scale(scale, (const uint8_t *const *)frame->data,
                          frame->linesize, 0, frame->height, dst, dstStride);
     sws_freeContext(scale);
-    if (rows <= 0) { av_free(pixels); return nil; }
+    if (rows <= 0) { av_free(converted); return nil; }
+
+    uint8_t *pixels = converted;
+    if (hdr) {
+        pixels = av_malloc((size_t)stride * height);
+        if (!pixels) { av_free(converted); return nil; }
+        nuvioToneMapHDR((const uint16_t *)converted, convertStride,
+                        pixels, width, height, trc,
+                        primaries == AVCOL_PRI_BT2020);
+        av_free(converted);
+    }
 
     int top = 0;
     while (top < height / 3 && nuvioIsBlackBandRow(pixels, stride, width, top)) ++top;
@@ -160,7 +261,8 @@ static UIImage *nuvioMakeImage(AVFrame *frame) {
 // could accumulate in an autorelease pool and trigger tvOS jetsam.
 static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBase,
                                double acceptableDistance,
-                               double *bestDistance, UIImage **bestImage) {
+                               double *bestDistance, UIImage **bestImage,
+                               const AVCodecParameters *sourceParameters) {
     if (!frame) return false;
     int64_t pts = frame->best_effort_timestamp;
     double distance = pts == AV_NOPTS_VALUE ? DBL_MAX :
@@ -175,7 +277,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     // candidate instead of retaining them for the full decode session.
     UIImage *candidate = nil;
     @autoreleasepool {
-        candidate = nuvioMakeImage(frame);
+        candidate = nuvioMakeImage(frame, sourceParameters);
     }
     if (candidate) {
         *bestImage = candidate;
@@ -523,7 +625,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                            avcodec_receive_frame(_decoder, _frame) == 0) {
                         bool closeEnough = nuvioConsiderFrame(_frame, target,
                             stream->time_base, acceptableDistance,
-                            &bestSeconds, &image);
+                            &bestSeconds, &image, stream->codecpar);
                         av_frame_unref(_frame);
                         if (closeEnough) break;
                     }
@@ -539,7 +641,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                        avcodec_receive_frame(_decoder, _frame) == 0) {
                     bool closeEnough = nuvioConsiderFrame(_frame, target,
                         stream->time_base, acceptableDistance,
-                            &bestSeconds, &image);
+                            &bestSeconds, &image, stream->codecpar);
                     av_frame_unref(_frame);
                     if (closeEnough) goto finished;
                 }
@@ -555,7 +657,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                 avcodec_send_packet(_decoder, NULL);
                 while (!token.cancelled && avcodec_receive_frame(_decoder, _frame) == 0) {
                     bool closeEnough = nuvioConsiderFrame(_frame, target,
-                        stream->time_base, acceptableDistance, &bestSeconds, &image);
+                        stream->time_base, acceptableDistance, &bestSeconds, &image, stream->codecpar);
                     av_frame_unref(_frame);
                     if (closeEnough) goto finished;
                 }

@@ -24,15 +24,51 @@ fn adjust_saturation(base: u16, factor: f32) -> u16 {
     (f32::from(base) + change).round().clamp(0.0, 4095.0) as u16
 }
 
-fn to_bytes(rpu: &DoviRpu, has_nal: bool) -> anyhow::Result<Vec<u8>> {
-    if has_nal { rpu.write_hevc_unspec62_nalu() } else { rpu.write_rpu() }
+/// Apple may attach either the standalone RPU payload, an HEVC UNSPEC62
+/// NALU (with emulation-prevention bytes), or a payload with a leading
+/// Annex-B/short prefix. libdovi's parse_rpu() strips these wrappers, while
+/// write_rpu() intentionally does NOT put them back. Comparing those two
+/// representations caused spurious "not byte-exact" (-3) errors.
+#[derive(Clone, Copy)]
+enum RpuContainer { Payload { prefix: usize }, HevcNal }
+
+fn container_for(data: &[u8]) -> Option<RpuContainer> {
+    match data.get(..5)? {
+        [0, 0, 0, 1, 25] => Some(RpuContainer::Payload { prefix: 4 }),
+        [0, 0, 1, 25, 8] => Some(RpuContainer::Payload { prefix: 3 }),
+        [0, 1, 25, 8, 9] => Some(RpuContainer::Payload { prefix: 2 }),
+        [124, 1, 25, 8, 9] => Some(RpuContainer::HevcNal),
+        [1, 25, 8, 9, _] => Some(RpuContainer::Payload { prefix: 1 }),
+        [25, 8, 9, _, _] => Some(RpuContainer::Payload { prefix: 0 }),
+        _ => None,
+    }
+}
+
+fn parse_container(data: &[u8], kind: RpuContainer) -> anyhow::Result<DoviRpu> {
+    match kind {
+        RpuContainer::HevcNal => DoviRpu::parse_unspec62_nalu(data),
+        RpuContainer::Payload { .. } => DoviRpu::parse_rpu(data),
+    }
+}
+
+fn to_bytes(rpu: &DoviRpu, kind: RpuContainer, original: &[u8]) -> anyhow::Result<Vec<u8>> {
+    match kind {
+        RpuContainer::HevcNal => rpu.write_hevc_unspec62_nalu(),
+        RpuContainer::Payload { prefix } => {
+            let payload = rpu.write_rpu()?;
+            let mut output = Vec::with_capacity(prefix + payload.len());
+            output.extend_from_slice(&original[..prefix]);
+            output.extend_from_slice(&payload);
+            Ok(output)
+        }
+    }
 }
 
 /// Returns 0 on any unsafe edit. status: positive = number of existing
 /// saturation trim targets edited, -1 invalid, -2 no suitable target,
-/// -3 non-identical round trip, -4 reparse failed, -5 RPU parse failed,
-/// -6 trim blocks present but none in supported range, -7 no DM metadata,
-/// -8 serialization failed.
+/// -3 non-identical round trip (after preserving the original wrapper),
+/// -4 edited reparse failed, -5 RPU parse failed, -6 trim values out of range,
+/// -7 no DM metadata, -8 serialization failed, -9 unsupported RPU wrapper.
 /// Contrast and brightness are intentionally disabled pending safe validation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
@@ -52,11 +88,15 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
     if (saturation - 1.0).abs() < 0.001 { return 0; }
 
     let data = unsafe { slice::from_raw_parts(input, input_len) };
-    let parsed = DoviRpu::parse_rpu(data)
-        .map(|r| (r, false))
-        .or_else(|_| DoviRpu::parse_unspec62_nalu(data).map(|r| (r, true)));
-    let (mut rpu, has_nal) = match parsed {
-        Ok(v) => v,
+    let kind = match container_for(data) {
+        Some(k) => k,
+        None => {
+            if !status.is_null() { unsafe { *status = -9; } }
+            return 0;
+        }
+    };
+    let mut rpu = match parse_container(data, kind) {
+        Ok(r) => r,
         Err(_) => {
             if !status.is_null() { unsafe { *status = -5; } }
             return 0;
@@ -66,7 +106,7 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
     // A valid parse alone isn't enough: ensure libdovi reproduces the exact
     // original bytes before allowing a metadata write. This also detects
     // unusual/unknown payload representations and already-modified blobs.
-    match to_bytes(&rpu, has_nal) {
+    match to_bytes(&rpu, kind, data) {
         Ok(bytes) if bytes == data => (),
         _ => {
             if !status.is_null() { unsafe { *status = -3; } }
@@ -127,7 +167,7 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
         return 0;
     }
     rpu.modified = true;
-    let bytes = match to_bytes(&rpu, has_nal) {
+    let bytes = match to_bytes(&rpu, kind, data) {
         Ok(b) => b,
         Err(_) => {
             if !status.is_null() { unsafe { *status = -8; } }
@@ -141,11 +181,7 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
 
     // Reparse the new blob, including its recalculated CRC, before replacing
     // the metadata attachment. On failure, the caller retains the original.
-    let valid = if has_nal {
-        DoviRpu::parse_unspec62_nalu(&bytes).is_ok()
-    } else {
-        DoviRpu::parse_rpu(&bytes).is_ok()
-    };
+    let valid = parse_container(&bytes, kind).is_ok();
     if !valid {
         if !status.is_null() { unsafe { *status = -4; } }
         return 0;

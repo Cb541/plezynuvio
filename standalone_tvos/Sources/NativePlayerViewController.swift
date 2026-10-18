@@ -117,6 +117,11 @@ private final class CachedTimelineOverlay: UIView {
 final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIGestureRecognizerDelegate {
     private var core: MpvPlayerCore?
     private let thumbs = SeekFrameService()
+    private let introSkipService = IntroSkipService()
+    private let skipIntroButton = UIButton(type: .system)
+    private var introTimeRange: IntroTimeRange?
+    private var introSkipConsumed = false
+    private var introLookupGeneration = 0
     private var pendingLink: NativeStreamLink?
     private var hasAppeared = false
     private var playbackGeneration = 0
@@ -300,7 +305,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 604 // 575 × 1.05 ≈ 604
+    private let seekPreviewWidth: CGFloat = 634 // 604 × 1.05 ≈ 634
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -416,6 +421,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
         cacheRateLabel.text = "VIDEO — Mb/s  ·  DISK — MB/s"
+        // A new episode must not inherit another episode's skip timestamps.
+        introLookupGeneration += 1
+        introTimeRange = nil
+        introSkipConsumed = false
+        skipIntroButton.isHidden = true
         explicitChromeHidden = false
         lastCaptureDuration = 0
         backgroundCaptureFailures = 0
@@ -461,6 +471,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
         link = media
+        if let episode = media.introEpisode {
+            let requestGeneration = introLookupGeneration
+            introSkipService.resolve(episode) { [weak self] result in
+                guard let self, self.introLookupGeneration == requestGeneration,
+                      self.link?.url == media.url else { return }
+                self.introTimeRange = result
+                self.updateIntroSkipVisibility()
+            }
+        }
         frameViews.first?.image = nil
         previewStatusLabel.isHidden = true
         previewLoadingLabel.isHidden = true
@@ -944,6 +963,30 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cacheRateLabel.isHidden = true
         view.addSubview(cacheRateLabel)
 
+        // Netflix-style prompt driven by verified episode intro timestamps.
+        // RemoteSurface stays the sole Siri Remote input receiver, so this
+        // surface is visual only. Select invokes a single seek while shown.
+        skipIntroButton.translatesAutoresizingMaskIntoConstraints = false
+        skipIntroButton.setTitle("Skip Intro   ▶", for: .normal)
+        skipIntroButton.titleLabel?.font = .systemFont(ofSize: 25, weight: .semibold)
+        skipIntroButton.setTitleColor(.white, for: .normal)
+        skipIntroButton.backgroundColor = UIColor.black.withAlphaComponent(0.72)
+        skipIntroButton.layer.cornerRadius = 14
+        skipIntroButton.layer.borderWidth = 1
+        skipIntroButton.layer.borderColor = UIColor.white.withAlphaComponent(0.65).cgColor
+        skipIntroButton.isUserInteractionEnabled = false
+        skipIntroButton.isHidden = true
+        skipIntroButton.accessibilityLabel = "Skip Intro. Press Select."
+        view.addSubview(skipIntroButton)
+        NSLayoutConstraint.activate([
+            skipIntroButton.trailingAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
+            skipIntroButton.bottomAnchor.constraint(
+                equalTo: panel.topAnchor, constant: -90),
+            skipIntroButton.widthAnchor.constraint(equalToConstant: 260),
+            skipIntroButton.heightAnchor.constraint(equalToConstant: 60)
+        ])
+
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.axis = .horizontal
         toolbar.alignment = .center
@@ -1142,7 +1185,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // Increase the previous 548 × 296 preview by another 5%
             // on both axes. Move its bottom edge up 5% of screen height.
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
-            filmStrip.heightAnchor.constraint(equalToConstant: 311),
+            filmStrip.heightAnchor.constraint(equalToConstant: 327),
             movableThumbnailX,
             // Raise floating seek preview 3% of screen height, with
             // unchanged window height and horizontal seek position tracking.
@@ -1677,6 +1720,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 resumeAfterLockedSeek = false
                 // A single center click accepts the thumbnail and starts playback.
                 commitSeek(resumeAfter: true, closeChrome: true)
+            } else if canSkipIntroNow {
+                skipCurrentIntro()
             } else if toolbarFocused {
                 explicitChromeHidden = false
                 openToolbarSelection()
@@ -1884,6 +1929,38 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             cancelUncommittedScrub()
             showPanel()
         }
+    }
+
+    // The intro button is only available inside a trusted community segment.
+    // We never guess a fixed intro length (many shows have cold opens).
+    private var canSkipIntroNow: Bool {
+        guard let range = introTimeRange, !introSkipConsumed,
+              core != nil, !waitingForFirstFrame,
+              !displayNegotiationPending, !isPreparingPlayback,
+              !previewIsVisible, !isTouchScrubbing, targetSeconds == nil,
+              lockedSeekDirection == 0, toolPanel == .none,
+              !toolbarFocused else { return false }
+        return range.contains(currentSeconds, duration: totalSeconds)
+    }
+
+    private func updateIntroSkipVisibility() {
+        skipIntroButton.isHidden = !canSkipIntroNow
+    }
+
+    private func skipCurrentIntro() {
+        guard canSkipIntroNow, let range = introTimeRange,
+              let playingCore = core else { return }
+        // Keep the existing pause/play state. The playback decoder performs
+        // an ordinary absolute seek; no thumbnails or secondary codec needed.
+        introSkipConsumed = true
+        let destination = min(totalSeconds > 0 ? totalSeconds : 86_400,
+                              range.end + 0.25)
+        currentSeconds = destination
+        committedSeekTarget = destination
+        committedSeekDate = Date()
+        skipIntroButton.isHidden = true
+        playingCore.command(["seek", String(format: "%.3f", destination), "absolute"])
+        refreshLabels()
     }
 
     private func silentSkip(_ direction: Int) {
@@ -2976,6 +3053,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         core?.dispose()
         core = nil
         link = nil
+        introLookupGeneration += 1
+        introTimeRange = nil
+        introSkipConsumed = false
+        skipIntroButton.isHidden = true
         targetSeconds = nil
         committedSeekTarget = nil
         committedSeekDate = nil
@@ -3080,6 +3161,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
+        updateIntroSkipVisibility()
         // Feed the active media timestamp into the renderer's decoded-frame
         // tap. Conversion runs on a private GPU queue and JPEGs write on the
         // existing serial cache writer. Nothing seeks or opens another codec.

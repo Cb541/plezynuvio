@@ -1289,7 +1289,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 } else if rpuFrames == 0 {
                     colorStatusLabel.text = "DV test ON · \(inspected) intercepted frames\n0 Dolby RPU attachments found"
                 } else if targets == 0 {
-                    colorStatusLabel.text = "DV edits 0 · skipped \(skipped) · RPU \(rpuFrames)\nReason: \(reason) (code \(NuvioDVTrimLastStatus()))"
+                    let code = NuvioDVTrimLastStatus()
+                    let prefix = String(format: "%016llX", NuvioDVTrimRPUHeader8())
+                    colorStatusLabel.text = "DV edits 0 · skipped \(skipped) · RPU \(rpuFrames)\nReason: \(reason) (code \(code))\n\(code == -5 || code == -9 ? "RPU prefix: \(prefix)" : "")"
                 } else {
                     colorStatusLabel.text = "DV edits \(edited) · skipped \(skipped)\n\(targets) target trim(s) · \(reason)"
                 }

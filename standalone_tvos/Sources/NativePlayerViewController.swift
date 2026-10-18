@@ -296,7 +296,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 522
+    private let seekPreviewWidth: CGFloat = 548 // 522 × 1.05 = 548.1
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -997,8 +997,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // also trims source-encoded black letterboxing.
         preview.backgroundColor = .black
         preview.layer.cornerRadius = 16
-        preview.layer.borderColor = UIColor.white.withAlphaComponent(0.38).cgColor
-        preview.layer.borderWidth = 1
+        // Clean edge: no white stroke around the floating thumbnail.
+        preview.layer.borderWidth = 0
         preview.clipsToBounds = true
         preview.translatesAutoresizingMaskIntoConstraints = false
         frameViews.append(preview)
@@ -1138,11 +1138,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             endLabel.widthAnchor.constraint(equalToConstant: 105),
             toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            // 15% larger overall, plus another 5% horizontal extension.
-            // Width: 432 × 1.15 × 1.05 ≈ 522; height: 245 × 1.15 ≈ 282.
-            // Keep the bottom edge at 30% above screen bottom.
+            // Another 5% wider and 5% taller than the previous 522 × 282
+            // floating preview. Keep the same bottom-edge screen position.
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
-            filmStrip.heightAnchor.constraint(equalToConstant: 282),
+            filmStrip.heightAnchor.constraint(equalToConstant: 296),
             movableThumbnailX,
             // The BOTTOM EDGE of the thumbnail is 30% UP from screen
             // bottom (70% down from top). The picture extends ABOVE
@@ -3153,7 +3152,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let end = progress.convert(CGPoint(x: progress.bounds.maxX,
                                            y: progress.bounds.midY), to: view).x
         let timelineX = start + (end - start) * fraction
-        // At either extreme the large 522pt preview must not be cut off.
+        // At either extreme the large 548pt preview must not be cut off.
         let margin: CGFloat = 16
         let halfWidth = seekPreviewWidth / 2
         let minimum = halfWidth + margin

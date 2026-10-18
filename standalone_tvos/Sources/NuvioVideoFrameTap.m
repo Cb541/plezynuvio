@@ -44,6 +44,79 @@ static atomic_uint_fast64_t sDVProbeSamples;
 static atomic_uint_fast64_t sDVProbeTaggedSamples;
 static atomic_uint_fast64_t sDVProbeFrameBytes;
 static atomic_uint_fast64_t sDVProbeSequenceBytes;
+
+// External Rust libdovi adapter, statically linked into this experimental IPA.
+extern size_t nuvio_dv_adjust_rpu(const uint8_t *, size_t, uint8_t *, size_t,
+                                  float, float, float, int32_t *);
+static atomic_bool sDVTrimEnabled;
+static atomic_int sDVTrimSat100;
+static atomic_int sDVTrimContrast100;
+static atomic_int sDVTrimBright100;
+static atomic_uint_fast64_t sDVTrimEdits;
+static atomic_uint_fast64_t sDVTrimUnavailable;
+static atomic_uint_fast64_t sDVTrimSlowFrames;
+
+// Strict opt-in. Only edit the RPU attachment (not pixel buffer contents)
+// before Apple's original enqueueSampleBuffer call sees this frame.
+static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
+    if (!atomic_load_explicit(&sDVTrimEnabled, memory_order_relaxed) || !sample)
+        return;
+    CVImageBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
+    if (!buffer) return;
+    CFDictionaryRef attrs = CVBufferCopyAttachments(buffer, kCVAttachmentMode_ShouldPropagate);
+    if (!attrs) return;
+    NSDictionary *values = (__bridge NSDictionary *)attrs;
+    for (id key in values) {
+        NSString *name = [[key description] lowercaseString];
+        if (![name containsString:@"dolbyvisionrpu"]) continue;
+        id value = values[key];
+        if (![value isKindOfClass:[NSData class]]) break;
+        NSData *original = (NSData *)value;
+        if (original.length < 8 || original.length > 4096) break;
+        uint8_t output[8192];
+        int32_t status = -1;
+        CFTimeInterval started = CACurrentMediaTime();
+        size_t length = nuvio_dv_adjust_rpu(
+            original.bytes, original.length, output, sizeof(output),
+            atomic_load(&sDVTrimSat100) / 100.0f,
+            atomic_load(&sDVTrimContrast100) / 100.0f,
+            atomic_load(&sDVTrimBright100) / 100.0f,
+            &status);
+        if (length > 0 && status == 1) {
+            CFDataRef changed = CFDataCreate(kCFAllocatorDefault, output, (CFIndex)length);
+            if (changed) {
+                CVBufferSetAttachment(buffer, (__bridge CFStringRef)key, changed,
+                    kCVAttachmentMode_ShouldPropagate);
+                CFRelease(changed);
+                atomic_fetch_add(&sDVTrimEdits, 1);
+            }
+        } else {
+            atomic_fetch_add(&sDVTrimUnavailable, 1);
+        }
+        // Fail safe if parsing or serialization is consistently too slow.
+        if (CACurrentMediaTime() - started > 0.005) {
+            if (atomic_fetch_add(&sDVTrimSlowFrames, 1) >= 5)
+                atomic_store(&sDVTrimEnabled, false);
+        }
+        break;
+    }
+    CFRelease(attrs);
+}
+
+void NuvioDVTrimSet(BOOL enabled, double saturation, double contrast, double brightness) {
+    int sat = (int)lrint(fmax(70, fmin(150, saturation * 100)));
+    int con = (int)lrint(fmax(70, fmin(150, contrast * 100)));
+    int bri = (int)lrint(fmax(70, fmin(150, brightness * 100)));
+    atomic_store(&sDVTrimSat100, sat);
+    atomic_store(&sDVTrimContrast100, con);
+    atomic_store(&sDVTrimBright100, bri);
+    if (!enabled) atomic_store(&sDVTrimSlowFrames, 0);
+    atomic_store(&sDVTrimEnabled, enabled && (sat != 100 || con != 100 || bri != 100));
+}
+uint64_t NuvioDVTrimEditedCount(void) { return atomic_load(&sDVTrimEdits); }
+uint64_t NuvioDVTrimUneditableCount(void) { return atomic_load(&sDVTrimUnavailable); }
+BOOL NuvioDVTrimIsEnabled(void) { return atomic_load(&sDVTrimEnabled); }
+
 static os_unfair_lock sDVProbeSummaryLock = OS_UNFAIR_LOCK_INIT;
 static NSString *sDVProbeSummary = @"No matching metadata key";
 
@@ -266,6 +339,7 @@ static void nuvio_renderer_enqueue(id receiver, SEL selector,
                                     CMSampleBufferRef sample)
 {
     // Apple's original method always runs. Never block/drop playback frames.
+    nuvio_maybe_adjust_dv(sample);
     ((void (*)(id, SEL, CMSampleBufferRef))sOriginalRendererEnqueue)(
         receiver, selector, sample);
     nuvio_process_sample(receiver, sample, false);
@@ -274,6 +348,7 @@ static void nuvio_renderer_enqueue(id receiver, SEL selector,
 static void nuvio_layer_enqueue(id receiver, SEL selector,
                                  CMSampleBufferRef sample)
 {
+    nuvio_maybe_adjust_dv(sample);
     ((void (*)(id, SEL, CMSampleBufferRef))sOriginalLayerEnqueue)(
         receiver, selector, sample);
     nuvio_process_sample(receiver, sample, true);
@@ -329,6 +404,13 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
         return NO;
 
     NuvioFrameTapStop();
+    atomic_store(&sDVTrimEnabled, false);
+    atomic_store(&sDVTrimSat100, 100);
+    atomic_store(&sDVTrimContrast100, 100);
+    atomic_store(&sDVTrimBright100, 100);
+    atomic_store(&sDVTrimEdits, 0);
+    atomic_store(&sDVTrimUnavailable, 0);
+    atomic_store(&sDVTrimSlowFrames, 0);
     os_unfair_lock_lock(&sCallbackLock);
     sCallback = [callback copy];
     os_unfair_lock_unlock(&sCallbackLock);
@@ -405,6 +487,7 @@ void NuvioFrameTapSetPaused(BOOL paused)
 
 void NuvioFrameTapStop(void)
 {
+    atomic_store(&sDVTrimEnabled, false);
     atomic_store_explicit(&sTargetRenderer, 0, memory_order_release);
     atomic_store_explicit(&sTargetLayer, 0, memory_order_release);
     atomic_store(&sIsPaused, true);

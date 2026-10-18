@@ -171,6 +171,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // Restore its earlier play state only when the target is committed/cancelled.
     private var resumeAfterLockedSeek = false
     private var holdActivationTimer: Timer?
+    // Holding an arrow while a touchpad thumbnail preview is already open
+    // should scrub that preview only, never switch into locked transport.
+    private var previewArrowPress = false
+    private var previewArrowHoldStarted = false
+    private var previewArrowRepeatTimer: Timer?
     private var explicitChromeHidden = false
 
     private var targetSeconds: Double?
@@ -378,6 +383,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // Turn off the old renderer hook before its core is disposed.
         NuvioFrameTapStop()
         frameTapInstalled = false
+        stopPreviewArrowHold()
         heldDirection = 0
         lockedSeekDirection = 0
         lockedSpeedIndex = 0
@@ -1569,8 +1575,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             } else if toolPanel == .none {
                 if targetSeconds != nil || previewIsVisible || lockedSeekDirection != 0 {
                     // Preview takes priority over toolbar focus. A short click
-                    // steps its playhead; a long hold still enters the existing
-                    // locked fast-forward/rewind transport.
+                    // steps its playhead; holding scrubs its preview without
+                    // entering the separate locked FF/RW transport.
                     beginDirectionalSeek(direction)
                 } else if toolbarFocused {
                     toolbarIndex = (toolbarIndex + direction + toolbarButtons.count) % toolbarButtons.count
@@ -1668,20 +1674,46 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         guard key == .leftArrow || key == .rightArrow else { return }
         let direction = key == .rightArrow ? 1 : -1
         guard heldDirection == direction else { return }
+        let wasPreviewPress = previewArrowPress
+        let wasPreviewHold = previewArrowHoldStarted
+        stopPreviewArrowHold()
         heldDirection = 0
         holdActivationTimer?.invalidate()
         holdActivationTimer = nil
-        // A real hold locks the transport even after release. The next
-        // left/right click changes speed without closing the thumbnail.
+        // The original hold-to-lock transport is unchanged outside preview.
+        // Releasing a preview hold merely stops its repeat timer. Releasing
+        // a short preview click steps one frame position (no movie seek).
         if lockedSeekDirection == 0 {
-            if targetSeconds != nil || previewIsVisible {
-                // A click in thumbnail mode moves ONLY the preview playhead.
-                // Never issue an uncommitted seek to the actual movie.
-                stepSeek(direction, commitAfterIdle: false)
+            if wasPreviewPress {
+                if !wasPreviewHold { stepSeek(direction, commitAfterIdle: false) }
             } else {
                 silentSkip(direction)
             }
         }
+    }
+
+    private func stopPreviewArrowHold() {
+        previewArrowRepeatTimer?.invalidate()
+        previewArrowRepeatTimer = nil
+        if previewArrowPress {
+            holdActivationTimer?.invalidate()
+            holdActivationTimer = nil
+            heldDirection = 0
+        }
+        previewArrowPress = false
+        previewArrowHoldStarted = false
+    }
+
+    private func advanceHeldThumbnail(_ direction: Int) {
+        guard previewArrowPress, previewArrowHoldStarted,
+              heldDirection == direction, lockedSeekDirection == 0,
+              targetSeconds != nil, core != nil else {
+            stopPreviewArrowHold()
+            return
+        }
+        // Reuse the manual click's 15-second preview step. The repeated
+        // UI updates never seek mpv; only Select commits to actual playback.
+        stepSeek(direction, commitAfterIdle: false)
     }
 
     private func beginDirectionalSeek(_ direction: Int) {
@@ -1700,8 +1732,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 lockedSeekDirection = direction
                 lockedSpeedIndex = 0
             }
-            // Each click moves the preview immediately, as well as raising
-            // the locked fast-forward/rewind rate.
+            // Preserve the pre-existing locked FF/RW click and speed behavior
+            // after a hold initiated outside the thumbnail menu.
             let base = targetSeconds ?? currentSeconds
             let bound = totalSeconds > 0 ? totalSeconds : 86_400
             targetSeconds = max(0, min(bound,
@@ -1711,6 +1743,29 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             showPanel()
             return
         }
+        if targetSeconds != nil && previewIsVisible {
+            // In the existing thumbnail menu, a hold repeats preview steps
+            // ONLY while physically held. Never call engageLockedSeek here.
+            previewArrowPress = true
+            previewArrowHoldStarted = false
+            holdActivationTimer?.invalidate()
+            holdActivationTimer = Timer.scheduledTimer(
+                withTimeInterval: 0.47, repeats: false) { [weak self] _ in
+                guard let self, self.previewArrowPress,
+                      self.heldDirection == direction,
+                      self.targetSeconds != nil, self.lockedSeekDirection == 0 else { return }
+                self.holdActivationTimer = nil
+                self.previewArrowHoldStarted = true
+                self.advanceHeldThumbnail(direction)
+                self.previewArrowRepeatTimer?.invalidate()
+                self.previewArrowRepeatTimer = Timer.scheduledTimer(
+                    withTimeInterval: 0.20, repeats: true) { [weak self] _ in
+                    self?.advanceHeldThumbnail(direction)
+                }
+            }
+            return
+        }
+        // No preview open: preserve the original hold-to-lock feature.
         holdActivationTimer?.invalidate()
         holdActivationTimer = Timer.scheduledTimer(withTimeInterval: 0.47, repeats: false) {
             [weak self] _ in
@@ -1973,6 +2028,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func cancelUncommittedScrub() {
+        stopPreviewArrowHold()
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         targetSeconds = nil
@@ -1992,6 +2048,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func stopShowingThumbnail(restoreMain: Bool = true,
                                       resumeAfterRestore: Bool = false) {
+        stopPreviewArrowHold()
         mainFramePreviewGeneration += 1
         mainFramePreviewBusy = false
         mainFramePreviewAwaitingSeek = false
@@ -2353,6 +2410,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func commitSeek(resumeAfter: Bool = false,
                             retainPreview: Bool = false,
                             closeChrome: Bool = false) {
+        stopPreviewArrowHold()
         seekCommitTimer?.invalidate()
         seekCommitTimer = nil
         guard let seconds = targetSeconds, let seekCore = core else { return }
@@ -2762,6 +2820,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func leavePlayback() {
+        stopPreviewArrowHold()
         NuvioFrameTapStop()
         frameTapInstalled = false
         playbackGeneration += 1

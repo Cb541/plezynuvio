@@ -2,12 +2,21 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #define BLOCK_SIZE (1024 * 1024)
+
+// Actual bytes written by the preview seek decoder's sparse video range
+// cache, independent of mpv's disk-cache statistics and thumbnail JPEGs.
+static atomic_uint_fast64_t sDiskBytesWritten = 0;
+uint64_t nuvio_range_written_bytes(void) {
+    return atomic_load_explicit(&sDiskBytesWritten, memory_order_relaxed);
+}
+
 struct NuvioRangeCache {
     char *directory;
     int64_t size, position;
@@ -73,7 +82,12 @@ static int fill(NuvioRangeCache *c, const char *path, int64_t start, int expecte
         int n = c->read(c->opaque, buffer, count);
         if (n <= 0) { error = n < 0 ? n : -EIO; break; }
         if (n > count) { error = -EIO; break; }
-        if (fwrite(buffer, 1, n, f) != (size_t)n) {
+        size_t written = fwrite(buffer, 1, n, f);
+        if (written > 0) {
+            atomic_fetch_add_explicit(&sDiskBytesWritten,
+                (uint64_t)written, memory_order_relaxed);
+        }
+        if (written != (size_t)n) {
             error = -EIO; c->diskFailed = 1; break;
         }
         total += n;

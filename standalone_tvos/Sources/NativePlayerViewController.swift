@@ -183,10 +183,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var totalSeconds: Double = 0
     private var zoom: CGFloat = 1
     private var verticalStretch: CGFloat = 1
-    // Saturation/contrast are real SDR-only lavfi processing. Default
-    // neutral values leave the proven hardware/DV pipeline untouched.
+    // Saturation, contrast and brightness share the existing SDR-only
+    // lutyuv filter. The neutral values preserve native HDR / DV playback.
     private var colorSaturation = 1.0
     private var colorContrast = 1.0
+    private var colorBrightness = 1.0
     private var sourceColorMetadataReady = false
     private var sourceIsHDR = true
     private var sourceIsDolbyVision = false
@@ -304,6 +305,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let stretchLabel = UILabel()
     private let saturationLabel = UILabel()
     private let contrastLabel = UILabel()
+    private let brightnessLabel = UILabel()
     private let hdrBoostLabel = UILabel()
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
@@ -467,6 +469,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             .map { min(1.50, max(0.60, $0)) } ?? 1.0
         colorContrast = (UserDefaults.standard.object(forKey: "Nuvio.ColorContrast") as? Double)
             .map { min(1.40, max(0.70, $0)) } ?? 1.0
+        colorBrightness = (UserDefaults.standard.object(forKey: "Nuvio.ColorBrightness") as? Double)
+            .map { min(1.50, max(0.70, $0)) } ?? 1.0
         sourceColorMetadataReady = false
         sourceIsHDR = true
         sourceIsDolbyVision = false
@@ -1035,7 +1039,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
         addGlassBackdrop(to: picturePanel, radius: 18)
-        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, hdrBoostLabel] {
+        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, brightnessLabel, hdrBoostLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
             label.textColor = .white
@@ -1095,7 +1099,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             statusLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.85),
             panel.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
             panel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
-            panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -2),
+            // Bring the entire bottom transport row close to the screen edge.
+            // Unlike the floating seek thumbnail, only this control container
+            // moves; its internal arrangement and seek behavior stay unchanged.
+            panel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
             panel.heightAnchor.constraint(equalToConstant: 54),
             currentLabel.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 4),
             currentLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
@@ -1153,7 +1160,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             contrastLabel.topAnchor.constraint(equalTo: saturationLabel.bottomAnchor, constant: 15),
             contrastLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             contrastLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            hdrBoostLabel.topAnchor.constraint(equalTo: contrastLabel.bottomAnchor, constant: 15),
+            brightnessLabel.topAnchor.constraint(equalTo: contrastLabel.bottomAnchor, constant: 15),
+            brightnessLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            brightnessLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            hdrBoostLabel.topAnchor.constraint(equalTo: brightnessLabel.bottomAnchor, constant: 15),
             hdrBoostLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             hdrBoostLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
             colorStatusLabel.topAnchor.constraint(equalTo: hdrBoostLabel.bottomAnchor, constant: 15),
@@ -1219,9 +1229,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
         saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
+        brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
         hdrBoostLabel.text = requiresNativeDolbyVision
             ? "   Dolby Vision: native (smooth)"
-            : "\(selectedPictureControl == 4 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
+            : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
         let available = sourceColorMetadataReady && !requiresNativeDolbyVision
@@ -1233,9 +1244,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         contrastLabel.textColor = available
             ? (selectedPictureControl == 3 ? .white : .lightGray)
             : .gray
+        brightnessLabel.textColor = available
+            ? (selectedPictureControl == 4 ? .white : .lightGray)
+            : .gray
         hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
             && !requiresNativeDolbyVision
-            ? (selectedPictureControl == 4 ? .white : .lightGray) : .gray
+            ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
         if requiresNativeDolbyVision {
             colorStatusLabel.text = "Dolby Vision uses native hardware playback.\nUse TV Color Depth / Contrast for DV."
         } else if !sourceColorMetadataReady {
@@ -1286,7 +1300,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 4 where sourceColorMetadataReady && sourceIsHDR && !requiresNativeDolbyVision:
+        case 4 where sourceColorMetadataReady && !requiresNativeDolbyVision
+            && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
+            // A small luma-plane offset lifts a dark SDR picture without
+            // changing the video geometry or invoking a second filter path.
+            colorBrightness = min(1.50, max(0.70,
+                (colorBrightness * 100 + Double(direction) * 5).rounded() / 100))
+            UserDefaults.standard.set(colorBrightness, forKey: "Nuvio.ColorBrightness")
+            colorEffectRequestedForVideo = true
+            scheduleColorFilterUpdate()
+        case 5 where sourceColorMetadataReady && sourceIsHDR && !requiresNativeDolbyVision:
             // HDR10 remains a per-movie experiment. Dolby Vision MUST NOT
             // use this path; copying its 4K 10-bit frames caused extreme lag.
             experimentalHDRColorBoost = direction > 0
@@ -1314,11 +1337,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         verticalStretch = 1
         colorSaturation = 1.0
         colorContrast = 1.0
+        colorBrightness = 1.0
         experimentalHDRColorBoost = false
         colorEffectRequestedForVideo = false
         colorFilterFailed = false
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorSaturation")
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorContrast")
+        UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorBrightness")
         applyPictureTransform()
         scheduleColorFilterUpdate()
         updatePictureLabels()
@@ -1390,6 +1415,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let generation = playbackGeneration
         let nonneutral = abs(colorSaturation - 1.0) > 0.001
             || abs(colorContrast - 1.0) > 0.001
+            || abs(colorBrightness - 1.0) > 0.001
         let enabled = nonneutral && colorEffectRequestedForVideo
             && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
@@ -1471,13 +1497,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // used by previous builds. The supported 'lutyuv' filter is enabled
         // by --enable-filter=lut*. Apply contrast to the Y plane and
         // saturation to U/V around the bit-depth-correct neutral midpoint.
+        // Brightness adds a modest luma offset in native sample units.
         // This expression works on both 8-bit (128) and 10-bit (512) YUV;
         // no hardcoded pixel depth or conversion to 8-bit is required.
         // IMPORTANT: HDR/Dolby Vision may still lose dynamic metadata when
         // video pixels are filtered. HDR stays explicit opt-in.
+        let lumaLift = (colorBrightness - 1.0) * 0.35
         let spec = String(format:
-            "@nuvio-color:lavfi=[lutyuv=y=(val-(maxval+1)/2)*%.2f+(maxval+1)/2:u=(val-(maxval+1)/2)*%.2f+(maxval+1)/2:v=(val-(maxval+1)/2)*%.2f+(maxval+1)/2]",
-            colorContrast, colorSaturation, colorSaturation)
+            "@nuvio-color:lavfi=[lutyuv=y=(val-(maxval+1)/2)*%.2f+(maxval+1)/2+(maxval+1)*%.4f:u=(val-(maxval+1)/2)*%.2f+(maxval+1)/2:v=(val-(maxval+1)/2)*%.2f+(maxval+1)/2]",
+            colorContrast, lumaLift, colorSaturation, colorSaturation)
         colorFilterInFlight = true
         colorFilterVerified = false
         updatePictureLabels()
@@ -1612,7 +1640,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .downArrow:
             if toolPanel == .picture {
-                selectedPictureControl = (selectedPictureControl + 1) % 5
+                selectedPictureControl = (selectedPictureControl + 1) % 6
                 updatePictureLabels()
                 showPanel()
             } else if toolPanel == .audio || toolPanel == .subtitles {

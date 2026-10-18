@@ -1280,7 +1280,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let edited = NuvioDVTrimEditedCount()
             let skipped = NuvioDVTrimUneditableCount()
             if dvTrimEnabled {
-                colorStatusLabel.text = "DV SAT-ONLY TEST: edited \(edited) · skipped \(skipped)\n\(NuvioDVTrimIsEnabled() ? "one subtle trim target" : "neutral/fail-safe off") · contrast/brightness locked"
+                let targets = NuvioDVTrimLastTargetCount()
+                colorStatusLabel.text = "DV SAT TEST: edited \(edited) · skipped \(skipped)\n\(NuvioDVTrimIsEnabled() ? "\(targets) target trims changed" : "neutral/fail-safe off") · contrast/brightness locked"
             } else if sampled == 0 {
                 colorStatusLabel.text = "DV RPU: awaiting samples\nTurn test ON then adjust a value"
             } else if tagged > 0 {
@@ -1327,9 +1328,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
             applyPictureTransform()
         case 2 where requiresNativeDolbyVision && dvTrimEnabled:
-            // One conservative, independently verifiable saturation trim.
-            // 95–105% test range; no more aggressive multi-target edits.
-            dvTrimSaturation = min(1.05, max(0.95,
+            // Saturation gain only, consistently across pre-existing target
+            // trims; 80–125% with a neutral 100% center.
+            dvTrimSaturation = min(1.25, max(0.80,
                 (dvTrimSaturation * 100 + Double(direction) * 5).rounded() / 100))
             updateExperimentalDVTrims()
         case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision

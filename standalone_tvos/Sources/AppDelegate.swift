@@ -92,12 +92,22 @@ struct NativeStreamLink {
             }
             return nil
         }
-        introEpisode = IntroEpisodeDescriptor(
-            title: title,
-            showName: firstValue(["show", "series", "series_title", "show_title"]),
-            imdbID: firstValue(["imdb_id", "imdb", "imdbid"]),
-            season: firstValue(["season", "season_number"]).flatMap(Int.init),
-            episode: firstValue(["episode", "episode_number"]).flatMap(Int.init)
+        let series = firstValue(["show", "series", "series_title", "show_title"])
+        let imdb = firstValue(["imdb_id", "imdb", "imdbid"])
+        let season = firstValue(["season", "season_number"]).flatMap(Int.init)
+        let episode = firstValue(["episode", "episode_number"]).flatMap(Int.init)
+        let titleIdentity = IntroEpisodeDescriptor(
+            title: title, showName: series,
+            imdbID: imdb, season: season, episode: episode
+        )
+        // Some callers use a plain show title but preserve S01E02 in the
+        // media filename. Inspect the local URL path only; never send the
+        // debrid URL, bearer-like query string, or path to IntroDB/TVmaze.
+        let filename = video.lastPathComponent.removingPercentEncoding
+            ?? video.lastPathComponent
+        introEpisode = titleIdentity ?? IntroEpisodeDescriptor(
+            title: filename, showName: series ?? title,
+            imdbID: imdb, season: season, episode: episode
         )
         if let value = components.queryItems?.first(where: { $0.name == "sub" })?.value,
            let subtitleURL = URL(string: value),

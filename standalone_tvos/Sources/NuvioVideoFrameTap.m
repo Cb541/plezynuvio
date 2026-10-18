@@ -126,24 +126,38 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
         return;
     }
     CVPixelBufferRef retained = (CVPixelBufferRef)imageBuffer;
-    // Read-only research: Apple's public post-decode metadata keys may be
-    // absent for DV profiles 5, 7, or 8.1, or may carry opaque data. Neither
-    // case authorizes guessing at an RPU layout or modifying the buffer.
+    // tvOS does not expose the macOS-only post-decode processing metadata
+    // constants (the tvOS SDK explicitly marks them unavailable). Instead,
+    // inspect available *public* Core Video attachment dictionaries for
+    // possible RPU/Dolby metadata, once per sampled playback buffer.
+    // This is read-only and never modifies the video or its metadata.
     atomic_fetch_add_explicit(&sDVProbeSamples, 1, memory_order_relaxed);
-    if (@available(tvOS 26.0, *)) {
-        CFTypeRef frameInfo = CVBufferGetAttachment(retained,
-            kCVImageBufferPostDecodeProcessingFrameMetadataKey, NULL);
-        CFTypeRef sequenceInfo = CVBufferGetAttachment(retained,
-            kCVImageBufferPostDecodeProcessingSequenceMetadataKey, NULL);
-        size_t fbytes = frameInfo && CFGetTypeID(frameInfo) == CFDataGetTypeID()
-            ? (size_t)CFDataGetLength((CFDataRef)frameInfo) : 0;
-        size_t sbytes = sequenceInfo && CFGetTypeID(sequenceInfo) == CFDataGetTypeID()
-            ? (size_t)CFDataGetLength((CFDataRef)sequenceInfo) : 0;
-        atomic_store_explicit(&sDVProbeFrameBytes, fbytes, memory_order_relaxed);
-        atomic_store_explicit(&sDVProbeSequenceBytes, sbytes, memory_order_relaxed);
-        if (fbytes > 0 || sbytes > 0)
-            atomic_fetch_add_explicit(&sDVProbeTaggedSamples, 1, memory_order_relaxed);
+    CFDictionaryRef attachments = CVBufferCopyAttachments(retained,
+        kCVAttachmentMode_ShouldPropagate);
+    uint64_t frameBytes = 0, sequenceBytes = 0;
+    if (attachments) {
+        NSDictionary *all = (__bridge NSDictionary *)attachments;
+        for (id key in all) {
+            NSString *label = [[key description] lowercaseString];
+            if ([label containsString:@"dolby"] ||
+                [label containsString:@"rpu"] ||
+                [label containsString:@"postdecode"] ||
+                [label containsString:@"metadata"]) {
+                id value = all[key];
+                uint64_t bytes = [value isKindOfClass:[NSData class]]
+                    ? (uint64_t)[(NSData *)value length] : 0;
+                if ([label containsString:@"sequence"])
+                    sequenceBytes += bytes;
+                else
+                    frameBytes += bytes;
+            }
+        }
+        CFRelease(attachments);
     }
+    atomic_store_explicit(&sDVProbeFrameBytes, frameBytes, memory_order_relaxed);
+    atomic_store_explicit(&sDVProbeSequenceBytes, sequenceBytes, memory_order_relaxed);
+    if (frameBytes || sequenceBytes)
+        atomic_fetch_add_explicit(&sDVProbeTaggedSamples, 1, memory_order_relaxed);
     CVPixelBufferRetain(retained);
     uint64_t generation = atomic_load(&sGeneration);
     atomic_store(&sLastSlot, slot);

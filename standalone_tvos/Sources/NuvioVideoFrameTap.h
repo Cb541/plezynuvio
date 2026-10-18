@@ -45,4 +45,11 @@ uint64_t NuvioDVProbeTaggedSampleCount(void);
 /// Exact public attachment keys/types seen by the read-only probe.
 NSString *NuvioDVProbeAttachmentSummary(void);
 
+/// Experimental RPU trim editing, OFF by default. Updates existing metadata
+/// only, with the original attachment passed through on every error.
+void NuvioDVTrimSet(BOOL enabled, double saturation, double contrast, double brightness);
+uint64_t NuvioDVTrimEditedCount(void);
+uint64_t NuvioDVTrimUneditableCount(void);
+BOOL NuvioDVTrimIsEnabled(void);
+
 NS_ASSUME_NONNULL_END

@@ -38,7 +38,12 @@ private final class PlayerToolGlyph: UIView {
     override func draw(_ rect: CGRect) {
         let context = UIGraphicsGetCurrentContext()
         context?.saveGState()
-        context?.translateBy(x: rect.midX - 20, y: rect.midY - 20)
+        // Original vector paths use a 40pt canvas. Scale that canvas into
+        // the actual icon view, rather than cropping the full-size paths.
+        let glyphScale = min(rect.width, rect.height) / 40
+        context?.translateBy(x: rect.midX, y: rect.midY)
+        context?.scaleBy(x: glyphScale, y: glyphScale)
+        context?.translateBy(x: -20, y: -20)
         UIColor.white.setFill()
         UIColor.white.setStroke()
         switch kind {
@@ -309,7 +314,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 634 // 604 × 1.05 ≈ 634
+    private let seekPreviewWidth: CGFloat = 733 // Matches latest working IPA
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -1010,10 +1015,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         ] {
             let circle = UIView()
             circle.translatesAutoresizingMaskIntoConstraints = false
-            circle.layer.cornerRadius = 29
-            circle.clipsToBounds = true
+            circle.layer.cornerRadius = 16.5
+            circle.clipsToBounds = false // Don't crop the glass highlight rim
             circle.isUserInteractionEnabled = false
-            addGlassBackdrop(to: circle, radius: 29)
+            addGlassBackdrop(to: circle, radius: 16.5)
             let glyph = PlayerToolGlyph(kind: kind)
             glyph.translatesAutoresizingMaskIntoConstraints = false
             glyph.accessibilityLabel = name
@@ -1021,10 +1026,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             NSLayoutConstraint.activate([
                 glyph.centerXAnchor.constraint(equalTo: circle.centerXAnchor),
                 glyph.centerYAnchor.constraint(equalTo: circle.centerYAnchor),
-                glyph.widthAnchor.constraint(equalToConstant: 40),
-                glyph.heightAnchor.constraint(equalToConstant: 40),
-                circle.widthAnchor.constraint(equalToConstant: 58),
-                circle.heightAnchor.constraint(equalToConstant: 58)
+                glyph.widthAnchor.constraint(equalToConstant: 22.5),
+                glyph.heightAnchor.constraint(equalToConstant: 22.5),
+                circle.widthAnchor.constraint(equalToConstant: 33),
+                circle.heightAnchor.constraint(equalToConstant: 33)
             ])
             toolbarButtons.append(glyph)
             toolbar.addArrangedSubview(circle)
@@ -1191,7 +1196,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             // Increase the previous 548 × 296 preview by another 5%
             // on both axes. Move its bottom edge up 5% of screen height.
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
-            filmStrip.heightAnchor.constraint(equalToConstant: 327),
+            filmStrip.heightAnchor.constraint(equalToConstant: 360),
             movableThumbnailX,
             // Raise floating seek preview 3% of screen height, with
             // unchanged window height and horizontal seek position tracking.
@@ -1262,7 +1267,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         background.translatesAutoresizingMaskIntoConstraints = false
         background.isUserInteractionEnabled = false
         background.layer.cornerRadius = radius
-        background.clipsToBounds = true
+        background.clipsToBounds = false
         target.insertSubview(background, at: 0)
         NSLayoutConstraint.activate([
             background.leadingAnchor.constraint(equalTo: target.leadingAnchor),
@@ -1840,12 +1845,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 lockedSeekDirection = direction
                 lockedSpeedIndex = 0
             }
-            // Preserve the pre-existing locked FF/RW click and speed behavior
-            // after a hold initiated outside the thumbnail menu.
-            let base = targetSeconds ?? currentSeconds
-            let bound = totalSeconds > 0 ? totalSeconds : 86_400
-            targetSeconds = max(0, min(bound,
-                base + Double(direction) * lockedClickSteps[lockedSpeedIndex]))
+            // Move only between actually saved thumbnail marks. The white
+            // marks are the exact disk/RAM frames shown on the timeline.
+            if let mark = adjacentCachedWhiteMark(from: targetSeconds ?? currentSeconds,
+                                                  direction: direction) {
+                targetSeconds = mark
+            }
             scheduleFrames()
             refreshLabels()
             showPanel()
@@ -2594,11 +2599,30 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         showPanel()
     }
 
+    /// Use the precise timestamps of successfully saved thumbnail frames.
+    /// This matches the real white ticks, skipping missing 12-second slots.
+    private func adjacentCachedWhiteMark(from seconds: Double,
+                                         direction: Int) -> Double? {
+        guard seconds.isFinite else { return nil }
+        let available = cachedTimeline.frameSlots.filter {
+            $0 >= 0 && (totalSeconds <= 0 || Double($0) <= totalSeconds)
+        }
+        if direction > 0 {
+            return available.filter { Double($0) > seconds + 0.001 }
+                .min().map(Double.init)
+        } else if direction < 0 {
+            return available.filter { Double($0) < seconds - 0.001 }
+                .max().map(Double.init)
+        }
+        return nil
+    }
+
     private func stepSeek(_ direction: Int, commitAfterIdle: Bool) {
         guard core != nil else { return }
         let base = targetSeconds ?? max(0, currentSeconds)
-        let bound = totalSeconds > 0 ? totalSeconds : 86_400
-        targetSeconds = max(0, min(bound, base + Double(direction) * 15))
+        guard let mark = adjacentCachedWhiteMark(from: base,
+                                                  direction: direction) else { return }
+        targetSeconds = mark
         scheduleFrames()
         refreshLabels()
         showPanel()

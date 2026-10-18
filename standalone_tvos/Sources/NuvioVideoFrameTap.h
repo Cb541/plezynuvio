@@ -34,15 +34,4 @@ uint64_t NuvioFrameTapMatchedCount(void);
 uint64_t NuvioFrameTapMissingPixelCount(void);
 uint64_t NuvioFrameTapConvertFailureCount(void);
 
-/// Read-only DV research probe. Checks whether native decoded pixel buffers
-/// carry Apple's per-frame/sequence post-decode HDR metadata. A positive
-/// result does not by itself imply a writable or interpretable Dolby RPU.
-/// These never modify the image buffer or metadata.
-uint64_t NuvioDVProbeSampleCount(void);
-uint64_t NuvioDVProbeFrameMetadataBytes(void);
-uint64_t NuvioDVProbeSequenceMetadataBytes(void);
-uint64_t NuvioDVProbeTaggedSampleCount(void);
-/// Exact public attachment keys/types seen by the read-only probe.
-NSString *NuvioDVProbeAttachmentSummary(void);
-
 NS_ASSUME_NONNULL_END

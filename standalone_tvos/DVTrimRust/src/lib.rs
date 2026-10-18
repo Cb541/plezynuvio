@@ -30,7 +30,9 @@ fn to_bytes(rpu: &DoviRpu, has_nal: bool) -> anyhow::Result<Vec<u8>> {
 
 /// Returns 0 on any unsafe edit. status: positive = number of existing
 /// saturation trim targets edited, -1 invalid, -2 no suitable target,
-/// -3 non-identical round trip, -4 reparse failed.
+/// -3 non-identical round trip, -4 reparse failed, -5 RPU parse failed,
+/// -6 trim blocks present but none in supported range, -7 no DM metadata,
+/// -8 serialization failed.
 /// Contrast and brightness are intentionally disabled pending safe validation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
@@ -53,7 +55,13 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
     let parsed = DoviRpu::parse_rpu(data)
         .map(|r| (r, false))
         .or_else(|_| DoviRpu::parse_unspec62_nalu(data).map(|r| (r, true)));
-    let (mut rpu, has_nal) = match parsed { Ok(v) => v, Err(_) => return 0 };
+    let (mut rpu, has_nal) = match parsed {
+        Ok(v) => v,
+        Err(_) => {
+            if !status.is_null() { unsafe { *status = -5; } }
+            return 0;
+        }
+    };
 
     // A valid parse alone isn't enough: ensure libdovi reproduces the exact
     // original bytes before allowing a metadata write. This also detects
@@ -72,11 +80,15 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
     // Crucially, no new target blocks are invented, no L1/3 mapping metadata
     // is modified, and CMv2.9 isn't edited when CMv4.0 has been changed.
     let mut edited_targets: i32 = 0;
+    let mut candidate_targets: i32 = 0;
+    let mut eligible_targets: i32 = 0;
     if let Some(dm) = rpu.vdr_dm_data.as_mut() {
         if let Some(DmData::V40(ref mut cm40)) = dm.cmv40_metadata {
             for block in cm40.blocks_mut() {
                 if let ExtMetadataBlock::Level8(level) = block {
+                    candidate_targets += 1;
                     if is_valid_trim(level.trim_saturation_gain) {
+                        eligible_targets += 1;
                         let original = level.trim_saturation_gain;
                         let adjusted = adjust_saturation(original, saturation);
                         if original != adjusted {
@@ -91,7 +103,9 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
             if let Some(DmData::V29(ref mut cm29)) = dm.cmv29_metadata {
                 for block in cm29.blocks_mut() {
                     if let ExtMetadataBlock::Level2(level) = block {
+                        candidate_targets += 1;
                         if is_valid_trim(level.trim_saturation_gain) {
+                            eligible_targets += 1;
                             let original = level.trim_saturation_gain;
                             let adjusted = adjust_saturation(original, saturation);
                             if original != adjusted {
@@ -105,12 +119,25 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
         }
     }
     if edited_targets == 0 {
-        if !status.is_null() { unsafe { *status = -2; } }
+        let diagnostic = if rpu.vdr_dm_data.is_none() { -7 }
+            else if candidate_targets == 0 { -2 }
+            else if eligible_targets == 0 { -6 }
+            else { -1 };
+        if !status.is_null() { unsafe { *status = diagnostic; } }
         return 0;
     }
     rpu.modified = true;
-    let bytes = match to_bytes(&rpu, has_nal) { Ok(b) => b, Err(_) => return 0 };
-    if bytes.len() > output_cap || bytes.is_empty() { return 0; }
+    let bytes = match to_bytes(&rpu, has_nal) {
+        Ok(b) => b,
+        Err(_) => {
+            if !status.is_null() { unsafe { *status = -8; } }
+            return 0;
+        }
+    };
+    if bytes.len() > output_cap || bytes.is_empty() {
+        if !status.is_null() { unsafe { *status = -8; } }
+        return 0;
+    }
 
     // Reparse the new blob, including its recalculated CRC, before replacing
     // the metadata attachment. On failure, the caller retains the original.

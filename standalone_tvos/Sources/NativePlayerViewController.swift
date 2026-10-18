@@ -2373,7 +2373,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let fps = Double(values["Frame rate"] ?? "").map { String(format: "%.3f fps", $0) } ?? "Unknown"
             // DV is reported separately; the HDR line identifies the transfer
             // standard for non-DV HDR10/PQ and HLG files as well.
-            let dvProfile = Int(values["Dolby Vision"] ?? "") ?? core.doviProfile
+            let dvProfile = Int(values["Dolby Vision"] ?? "") ?? Int(core.doviProfile)
             let dv = dvProfile == 7 ? "Profile 7 → 8.1"
                 : (dvProfile > 0 ? "Profile \(dvProfile)" : "No")
             let gamma = (values["HDR transfer"] ?? "").lowercased()

@@ -188,6 +188,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var colorSaturation = 1.0
     private var colorContrast = 1.0
     private var colorBrightness = 1.0
+    private var dvTrimSaturation = 1.0
+    private var dvTrimContrast = 1.0
+    private var dvTrimBrightness = 1.0
+    private var dvTrimEnabled = false
     private var sourceColorMetadataReady = false
     private var sourceIsHDR = true
     private var sourceIsDolbyVision = false
@@ -479,6 +483,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             .map { min(1.40, max(0.70, $0)) } ?? 1.0
         colorBrightness = (UserDefaults.standard.object(forKey: "Nuvio.ColorBrightness") as? Double)
             .map { min(1.50, max(0.70, $0)) } ?? 1.0
+        dvTrimEnabled = false
+        dvTrimSaturation = 1
+        dvTrimContrast = 1
+        dvTrimBrightness = 1
+        NuvioDVTrimSet(false, 1, 1, 1)
         sourceColorMetadataReady = false
         sourceIsHDR = true
         sourceIsDolbyVision = false
@@ -1236,17 +1245,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func updatePictureLabels() {
         zoomLabel.text = "\(selectedPictureControl == 0 ? "▶ " : "   ")Zoom: \(Int(zoom * 100))%"
         stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
-        saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
-        contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
-        brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
+        let sat = requiresNativeDolbyVision ? dvTrimSaturation : colorSaturation
+        let con = requiresNativeDolbyVision ? dvTrimContrast : colorContrast
+        let bri = requiresNativeDolbyVision ? dvTrimBrightness : colorBrightness
+        saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((sat * 100).rounded()))%"
+        contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((con * 100).rounded()))%"
+        brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((bri * 100).rounded()))%"
         hdrBoostLabel.text = requiresNativeDolbyVision
-            ? "   Dolby Vision: native (smooth)"
+            ? "\(selectedPictureControl == 5 ? "▶ " : "   ")DV RPU trims (test): \(dvTrimEnabled ? "ON" : "OFF")"
             : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
-        let available = sourceColorMetadataReady && !requiresNativeDolbyVision
-            && (!sourceIsHDR || experimentalHDRColorBoost)
-            && !colorFilterFailed
+        let available = requiresNativeDolbyVision
+            ? dvTrimEnabled
+            : (sourceColorMetadataReady && (!sourceIsHDR || experimentalHDRColorBoost)
+               && !colorFilterFailed)
         saturationLabel.textColor = available
             ? (selectedPictureControl == 2 ? .white : .lightGray)
             : .gray
@@ -1256,8 +1269,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         brightnessLabel.textColor = available
             ? (selectedPictureControl == 4 ? .white : .lightGray)
             : .gray
-        hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
-            && !requiresNativeDolbyVision
+        hdrBoostLabel.textColor = requiresNativeDolbyVision
+            || (sourceColorMetadataReady && sourceIsHDR)
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
         if requiresNativeDolbyVision {
             // An experimental, read-only check for Dolby's post-decode
@@ -1267,14 +1280,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let tagged = NuvioDVProbeTaggedSampleCount()
             let frameBytes = NuvioDVProbeFrameMetadataBytes()
             let sequenceBytes = NuvioDVProbeSequenceMetadataBytes()
-            if sampled == 0 {
-                colorStatusLabel.text = "DV RPU research: waiting for video samples…\nNative Dolby Vision is unchanged"
+            let edited = NuvioDVTrimEditedCount()
+            let skipped = NuvioDVTrimUneditableCount()
+            if dvTrimEnabled {
+                colorStatusLabel.text = "EXPERIMENTAL DV: edited \(edited) · passthrough \(skipped)\n\(NuvioDVTrimIsEnabled() ? "RPU editor active" : "neutral/fail-safe disabled") · native video untouched"
+            } else if sampled == 0 {
+                colorStatusLabel.text = "DV RPU: awaiting samples\nTurn test ON then adjust a value"
             } else if tagged > 0 {
-                // Show the exact attachment name, not just its byte count.
-                // A 243-byte blob is not necessarily an editable Dolby RPU.
-                colorStatusLabel.text = "DV attachment: \(NuvioDVProbeAttachmentSummary())\nFrame \(frameBytes) B · sequence \(sequenceBytes) B · read-only"
+                colorStatusLabel.text = "DV RPU: \(frameBytes) B per frame\nTest OFF · original metadata"
             } else {
-                colorStatusLabel.text = "DV metadata probe: no frame trim data exposed\nNative DV protected • no pixel processing"
+                colorStatusLabel.text = "DV RPU unavailable\nNative Dolby Vision protected"
             }
         } else if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
@@ -1302,6 +1317,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         CATransaction.commit()
     }
 
+    private func updateExperimentalDVTrims() {
+        NuvioDVTrimSet(dvTrimEnabled, dvTrimSaturation, dvTrimContrast, dvTrimBrightness)
+    }
+
     private func changePictureValue(_ direction: Int) {
         switch selectedPictureControl {
         case 0:
@@ -1310,6 +1329,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         case 1:
             verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
             applyPictureTransform()
+        case 2 where requiresNativeDolbyVision:
+            dvTrimSaturation = min(1.50, max(0.70,
+                (dvTrimSaturation * 100 + Double(direction) * 5).rounded() / 100))
+            updateExperimentalDVTrims()
         case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorSaturation = min(1.50, max(0.60,
@@ -1317,6 +1340,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
+        case 3 where requiresNativeDolbyVision:
+            dvTrimContrast = min(1.50, max(0.70,
+                (dvTrimContrast * 100 + Double(direction) * 5).rounded() / 100))
+            updateExperimentalDVTrims()
         case 3 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
@@ -1324,6 +1351,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
+        case 4 where requiresNativeDolbyVision:
+            dvTrimBrightness = min(1.50, max(0.70,
+                (dvTrimBrightness * 100 + Double(direction) * 5).rounded() / 100))
+            updateExperimentalDVTrims()
         case 4 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             // A small luma-plane offset lifts a dark SDR picture without
@@ -1333,6 +1364,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorBrightness, forKey: "Nuvio.ColorBrightness")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
+        case 5 where requiresNativeDolbyVision:
+            dvTrimEnabled = direction > 0
+            updateExperimentalDVTrims()
         case 5 where sourceColorMetadataReady && sourceIsHDR && !requiresNativeDolbyVision:
             // HDR10 remains a per-movie experiment. Dolby Vision MUST NOT
             // use this path; copying its 4K 10-bit frames caused extreme lag.
@@ -1362,6 +1396,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         colorSaturation = 1.0
         colorContrast = 1.0
         colorBrightness = 1.0
+        dvTrimSaturation = 1
+        dvTrimContrast = 1
+        dvTrimBrightness = 1
+        dvTrimEnabled = false
+        NuvioDVTrimSet(false, 1, 1, 1)
         experimentalHDRColorBoost = false
         colorEffectRequestedForVideo = false
         colorFilterFailed = false

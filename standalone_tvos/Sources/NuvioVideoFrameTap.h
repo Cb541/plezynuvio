@@ -58,6 +58,8 @@ BOOL NuvioDVTrimIsEnabled(void);
 uint64_t NuvioDVTrimInterceptedFrames(void);
 uint64_t NuvioDVTrimRPUFrames(void);
 int NuvioDVTrimLastStatus(void);
+/// First eight RPU attachment bytes, for diagnosing unsupported Apple wrappers.
+uint64_t NuvioDVTrimRPUHeader8(void);
 NSString *NuvioDVTrimLastFailureReason(void);
 
 NS_ASSUME_NONNULL_END

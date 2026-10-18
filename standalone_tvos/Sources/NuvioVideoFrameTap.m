@@ -61,6 +61,13 @@ static atomic_uint_fast64_t sDVTrimSlowFrames;
 static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
     if (!atomic_load_explicit(&sDVTrimEnabled, memory_order_relaxed) || !sample)
         return;
+    // AVSampleBufferDisplayLayer may forward the same sample to its internal
+    // video renderer. Tag the *sample*, not a reusable CVPixelBuffer, so this
+    // metadata is never adjusted twice.
+    CFStringRef marker = CFSTR("com.cb541.nuvio.dvtrim.frame.processed");
+    if (CMGetAttachment(sample, marker, NULL)) return;
+    CMSetAttachment(sample, marker, kCFBooleanTrue,
+                    kCMAttachmentMode_ShouldNotPropagate);
     CVImageBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
     if (!buffer) return;
     CFDictionaryRef attrs = CVBufferCopyAttachments(buffer, kCVAttachmentMode_ShouldPropagate);

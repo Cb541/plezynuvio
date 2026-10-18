@@ -286,17 +286,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // Actual media-network rate, independent of JPEG thumbnail writes.
     private var videoInputRateMbps: Double?
     private var videoDiskCacheBytes: Double?
+    private var lastVideoDiskCacheSampleAt: Date?
+    private var videoDiskWriteRateMBps: Double?
     private var frameTapInstalled = false
-    // Playback frames and downloaded compressed bytes are separate caches.
-    // Keep a brief on-screen diagnostic until thumbnails are persisted.
-    private let thumbnailCacheHealthLabel = UILabel()
     private let currentLabel = UILabel()
     private let endLabel = UILabel()
     private let filmStrip = UIStackView()
     // The floating preview tracks the played/scrubbed fraction of the
     // *actual laid-out* progress bar, not the width of the full screen.
     // Constrain the entire window inside the screen at timeline endpoints.
-    private let seekPreviewWidth: CGFloat = 548 // 522 × 1.05 = 548.1
+    private let seekPreviewWidth: CGFloat = 575 // 548 × 1.05 ≈ 575
     private var thumbnailCenterXConstraint: NSLayoutConstraint?
     private var frameViews: [UIImageView] = []
     private let instructionsLabel = UILabel()
@@ -402,12 +401,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lastCacheUIUpdate = .distantPast
         videoInputRateMbps = nil
         videoDiskCacheBytes = nil
+        lastVideoDiskCacheSampleAt = nil
+        videoDiskWriteRateMBps = nil
         cachedTimeline.frameSlots = []
         cachedTimeline.durationSeconds = 0
         cachedTimeline.setNeedsDisplay()
-        cacheRateLabel.text = "VIDEO — Mb/s · 0 previews"
-        thumbnailCacheHealthLabel.text = ""
-        thumbnailCacheHealthLabel.isHidden = true
+        cacheRateLabel.text = "VIDEO — Mb/s  ·  DISK — MB/s"
         explicitChromeHidden = false
         lastCaptureDuration = 0
         backgroundCaptureFailures = 0
@@ -922,24 +921,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // current playhead remains discernible even on a fully cached bar.
         panel.addSubview(playbackPositionMarker)
         cacheRateLabel.translatesAutoresizingMaskIntoConstraints = false
-        cacheRateLabel.text = "VIDEO — Mb/s · 0 previews"
+        cacheRateLabel.text = "VIDEO — Mb/s  ·  DISK — MB/s"
         cacheRateLabel.textColor = UIColor.white.withAlphaComponent(0.88)
         cacheRateLabel.font = .monospacedDigitSystemFont(
             ofSize: 15, weight: .medium)
         cacheRateLabel.textAlignment = .right
         cacheRateLabel.isUserInteractionEnabled = false
-        panel.addSubview(cacheRateLabel)
-
-        thumbnailCacheHealthLabel.translatesAutoresizingMaskIntoConstraints = false
-        thumbnailCacheHealthLabel.font = .monospacedDigitSystemFont(
-            ofSize: 12, weight: .regular)
-        thumbnailCacheHealthLabel.textColor = UIColor.white.withAlphaComponent(0.74)
-        thumbnailCacheHealthLabel.textAlignment = .right
-        thumbnailCacheHealthLabel.numberOfLines = 2
-        thumbnailCacheHealthLabel.text = ""
-        thumbnailCacheHealthLabel.isUserInteractionEnabled = false
-        thumbnailCacheHealthLabel.isHidden = true
-        panel.addSubview(thumbnailCacheHealthLabel)
+        // Always visible at the lower right during playback, not only when
+        // the pause/seek panel is shown. No debug counters are displayed.
+        cacheRateLabel.isHidden = true
+        view.addSubview(cacheRateLabel)
 
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.axis = .horizontal
@@ -1074,7 +1065,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         trackTitle.textColor = .white
         rows.addArrangedSubview(trackTitle)
         trackTitle.heightAnchor.constraint(equalToConstant: 40).isActive = true
-        for _ in 0..<7 {
+        for _ in 0..<8 {
             let label = UILabel()
             label.font = .systemFont(ofSize: 19)
             label.textColor = .white
@@ -1123,32 +1114,25 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             playbackPositionMarker.widthAnchor.constraint(equalToConstant: 6),
             playbackPositionMarker.heightAnchor.constraint(equalToConstant: 17),
             movablePlayheadX,
-            cacheRateLabel.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
-            cacheRateLabel.bottomAnchor.constraint(equalTo: progress.topAnchor, constant: -5),
-            cacheRateLabel.widthAnchor.constraint(equalToConstant: 390),
-            cacheRateLabel.heightAnchor.constraint(equalToConstant: 18),
-            thumbnailCacheHealthLabel.trailingAnchor.constraint(
-                equalTo: cacheRateLabel.trailingAnchor),
-            thumbnailCacheHealthLabel.bottomAnchor.constraint(
-                equalTo: cacheRateLabel.topAnchor, constant: -2),
-            thumbnailCacheHealthLabel.widthAnchor.constraint(equalToConstant: 700),
-            thumbnailCacheHealthLabel.heightAnchor.constraint(equalToConstant: 32),
+            cacheRateLabel.trailingAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
+            cacheRateLabel.bottomAnchor.constraint(equalTo: panel.topAnchor, constant: -6),
+            cacheRateLabel.widthAnchor.constraint(equalToConstant: 485),
+            cacheRateLabel.heightAnchor.constraint(equalToConstant: 20),
             endLabel.trailingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: -17),
             endLabel.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
             endLabel.widthAnchor.constraint(equalToConstant: 105),
             toolbar.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
             toolbar.centerYAnchor.constraint(equalTo: panel.centerYAnchor),
-            // Another 5% wider and 5% taller than the previous 522 × 282
-            // floating preview. Keep the same bottom-edge screen position.
+            // Increase the previous 548 × 296 preview by another 5%
+            // on both axes. Move its bottom edge up 5% of screen height.
             filmStrip.widthAnchor.constraint(equalToConstant: seekPreviewWidth),
-            filmStrip.heightAnchor.constraint(equalToConstant: 296),
+            filmStrip.heightAnchor.constraint(equalToConstant: 311),
             movableThumbnailX,
-            // The BOTTOM EDGE of the thumbnail is 30% UP from screen
-            // bottom (70% down from top). The picture extends ABOVE
-            // this line while following the playback progress horizontally.
+            // Bottom edge at 65% down from top (previously 70%).
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
-                multiplier: 0.70, constant: 0),
+                multiplier: 0.65, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
             previewStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -1188,6 +1172,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // tools and picture menus. It's non-interactive, so the Siri Remote
         // surface beneath it continues to receive presses and gestures.
         view.bringSubviewToFront(panel)
+        view.bringSubviewToFront(cacheRateLabel)
         view.bringSubviewToFront(seekTimeLabel)
         view.bringSubviewToFront(previewStatusLabel)
         view.bringSubviewToFront(picturePanel)
@@ -2365,6 +2350,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             ("Frame rate", "container-fps"),
             ("Audio codec", "audio-codec-name"),
             ("Dolby Vision", "current-tracks/video/dolby-vision-profile"),
+            ("HDR transfer", "video-params/gamma"),
+            ("HDR primaries", "video-params/primaries"),
             ("Video bitrate", "video-bitrate")
         ]
         var values = [String: String]()
@@ -2384,17 +2371,41 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let width = values["Width"] ?? "?"
             let height = values["Height"] ?? "?"
             let fps = Double(values["Frame rate"] ?? "").map { String(format: "%.3f fps", $0) } ?? "Unknown"
-            let dv = Int(values["Dolby Vision"] ?? "").map {
-                $0 == 7 ? "Profile 7 → 8.1" : ($0 > 0 ? "Profile \($0)" : "No")
-            } ?? "Unknown"
+            // DV is reported separately; the HDR line identifies the transfer
+            // standard for non-DV HDR10/PQ and HLG files as well.
+            let dvProfile = Int(values["Dolby Vision"] ?? "") ?? core.doviProfile
+            let dv = dvProfile == 7 ? "Profile 7 → 8.1"
+                : (dvProfile > 0 ? "Profile \(dvProfile)" : "No")
+            let gamma = (values["HDR transfer"] ?? "").lowercased()
+            let primaries = (values["HDR primaries"] ?? "").lowercased()
+            let hdr: String
+            if gamma.contains("arib") || gamma.contains("hlg") {
+                hdr = "HLG" + (primaries.contains("2020") ? " · BT.2020" : "")
+            } else if gamma.contains("smpte2084") || gamma.contains("pq") {
+                hdr = dvProfile > 0 ? "PQ (Dolby Vision)" : "HDR10 / PQ"
+            } else if dvProfile > 0 {
+                hdr = "Dolby Vision (HDR)"
+            } else if self.sourceColorMetadataReady && self.sourceIsHDR {
+                hdr = "HDR (transfer unknown)"
+            } else {
+                hdr = gamma.isEmpty ? "Unknown" : "SDR"
+            }
+            let bitrate: String
+            if let bps = Double(values["Video bitrate"] ?? ""),
+               bps.isFinite, bps > 0 {
+                bitrate = String(format: "%.2f Mbps", bps / 1_000_000)
+            } else {
+                bitrate = "Unknown"
+            }
             self.infoRows = [
                 "Video   " + (values["Video codec"] ?? "Unknown"),
                 "Size    " + width + " × " + height,
                 "Rate    " + fps,
                 "DV      " + dv,
+                "HDR     " + hdr,
                 "Format  " + (values["Video format"] ?? "Unknown"),
                 "Audio   " + (values["Audio codec"] ?? "Unknown"),
-                "Bitrate " + (values["Video bitrate"] ?? "Unknown") + " bps"
+                "Bitrate " + bitrate
             ]
             self.renderTrackPanel()
         }
@@ -2925,8 +2936,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             progress.isHidden = true
             cachedTimeline.isHidden = true
             playbackPositionMarker.isHidden = true
-            cacheRateLabel.isHidden = true
-            thumbnailCacheHealthLabel.isHidden = true
+            cacheRateLabel.isHidden = core == nil
             currentLabel.isHidden = true
             endLabel.isHidden = true
             statusLabel.isHidden = true
@@ -2947,10 +2957,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         progress.isHidden = !showTimeline
         cachedTimeline.isHidden = !showTimeline
         playbackPositionMarker.isHidden = !showTimeline
-        cacheRateLabel.isHidden = !showTimeline
-        // Temporary diagnostic: distinguish automatic capture from active
-        // seeking even when preview thumbnails have already been cached.
-        thumbnailCacheHealthLabel.isHidden = !showTimeline
+        cacheRateLabel.isHidden = core == nil
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
         statusLabel.isHidden = core != nil && playing && !waitingForFirstFrame
@@ -3063,63 +3070,35 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                           self.core === playingCore,
                           self.playbackGeneration == expectedGeneration else { return }
                     if case .success(let raw) = result,
-                       let raw, let bytes = Double(raw) {
-                        self.videoDiskCacheBytes = max(0, bytes)
+                       let raw, let bytes = Double(raw), bytes.isFinite {
+                        let now = Date()
+                        let size = max(0, bytes)
+                        // The disk-cache byte count is sampled each second.
+                        // Its positive growth gives measured disk fill MB/s,
+                        // distinct from network INPUT Mb/s and preview JPEGs.
+                        if let previous = self.videoDiskCacheBytes,
+                           let previousAt = self.lastVideoDiskCacheSampleAt {
+                            let elapsed = now.timeIntervalSince(previousAt)
+                            if elapsed > 0.25 {
+                                self.videoDiskWriteRateMBps = max(0, size - previous)
+                                    / elapsed / 1_000_000
+                            }
+                        }
+                        self.videoDiskCacheBytes = size
+                        self.lastVideoDiskCacheSampleAt = now
                     }
                 }
             }
+            let videoText = videoInputRateMbps.map {
+                String(format: "%.1f", $0)
+            } ?? "—"
+            let diskText = videoDiskWriteRateMBps.map {
+                String(format: "%.1f", $0)
+            } ?? "—"
+            cacheRateLabel.text = "VIDEO \(videoText) Mb/s  ·  DISK \(diskText) MB/s"
+            // Keep cached-frame highlighting; omit all capture/decode/debug
+            // counters from the user-facing playback overlay.
             let stats = thumbs.cacheStats()
-            if let rate = videoInputRateMbps {
-                if let total = videoDiskCacheBytes {
-                    cacheRateLabel.text = String(
-                        format: "VIDEO %.0f Mb/s · %.1f GB · %d previews",
-                        rate, total / 1_000_000_000, stats.frameCount)
-                } else {
-                    cacheRateLabel.text = String(
-                        format: "VIDEO %.0f Mb/s · %d previews",
-                        rate, stats.frameCount)
-                }
-            } else {
-                cacheRateLabel.text = String(
-                    format: "VIDEO — Mb/s · %d previews",
-                    stats.frameCount)
-            }
-            // Show capture pipeline health only while no JPEG has been
-            // persisted. I = images converted, C = callbacks delivered,
-            // R = images handed to cache, J = JPEG encodes, X = failures.
-            // This avoids conflating a 2-GB compressed-video buffer with
-            // zero generated seek previews.
-            // AUTO advances only when the video renderer captures frames
-            // without opening the seeking interface; SEEK tracks frames
-            // generated by swiping, scrubbing, or paused seek preview.
-            // Show both during verification of automatic thumbnail caching.
-            thumbnailCacheHealthLabel.isHidden = cacheRateLabel.isHidden
-            // AHEAD = independently decoded FUTURE, unplayed positions.
-            // AUTO = video frames collected during normal playback.
-            // SEEK = positions decoded on demand with the Siri Remote.
-            if stats.failedWrites > 0 {
-                thumbnailCacheHealthLabel.text = String(
-                    format: "AHEAD:%d AUTO:%d SEEK:%d · %d RAM · %@",
-                    stats.aheadCapturedSlots, stats.autoCapturedSlots,
-                    stats.seekCapturedSlots, stats.ramOnlyFrames,
-                    String(stats.storageError.prefix(12)))
-            } else if stats.aheadCapturedSlots == 0 {
-                thumbnailCacheHealthLabel.text = String(
-                    format: "AHEAD:0 tried:%d failed:%d%@ · AUTO:%d SEEK:%d",
-                    stats.aheadAttempts, stats.aheadFailures,
-                    stats.aheadDisabled ? " OFF" : "",
-                    stats.autoCapturedSlots, stats.seekCapturedSlots)
-            } else {
-                thumbnailCacheHealthLabel.text = String(
-                    format: "FUTURE:%d disk · furthest +%dm · AHEAD:%d · AUTO:%d SEEK:%d",
-                    stats.futureDiskFrames, stats.furthestAheadSeconds / 60,
-                    stats.aheadCapturedSlots, stats.autoCapturedSlots,
-                    stats.seekCapturedSlots)
-            }
-            if !stats.previewTiming.isEmpty {
-                thumbnailCacheHealthLabel.text = (thumbnailCacheHealthLabel.text ?? "")
-                    + "\n" + stats.previewTiming
-            }
             cachedTimeline.durationSeconds = totalSeconds
             cachedTimeline.frameSlots = stats.slots
             cachedTimeline.setNeedsDisplay()
@@ -3152,7 +3131,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let end = progress.convert(CGPoint(x: progress.bounds.maxX,
                                            y: progress.bounds.midY), to: view).x
         let timelineX = start + (end - start) * fraction
-        // At either extreme the large 548pt preview must not be cut off.
+        // At either extreme the large 575pt preview must not be cut off.
         let margin: CGFloat = 16
         let halfWidth = seekPreviewWidth / 2
         let minimum = halfWidth + margin

@@ -1,8 +1,9 @@
 //! Conservative Dolby Vision RPU experiment, intentionally saturation-only.
 //! The previous iteration changed L2 and L8 trims for *all* target displays
 //! and introduced large, uncalibrated offset/slope changes. That was unsafe.
-//! This version requires a byte-exact metadata round trip and modifies at
-//! most one existing saturation trim, leaving tone mapping fully untouched.
+//! This version requires a byte-exact metadata round trip and modifies
+//! saturation *only*, consistently across the existing mapped display
+//! targets, leaving tone mapping and color transforms fully untouched.
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use dolby_vision::rpu::extension_metadata::{DmData, WithExtMetadataBlocks};
 use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlock;
@@ -14,10 +15,12 @@ fn is_valid_trim(value: u16) -> bool {
 }
 
 fn adjust_saturation(base: u16, factor: f32) -> u16 {
-    // At a 5% slider step, change the encoded metadata by only ~10 units
-    // (about 0.5% of the centered 2048 range), not an uncalibrated 25+.
-    let clamped = factor.clamp(0.90, 1.10);
-    let change = (clamped - 1.0) * 2048.0 * 0.10;
+    // Dolby's nominal neutral is 2048 in 12-bit trim units. The earlier
+    // 0.10 gain made a 5% UI step only ~10 units, effectively invisible.
+    // Use the proportional range instead: 105% -> +102 units, 125% -> +512.
+    // This remains saturation-only and does not touch tone-mapping controls.
+    let clamped = factor.clamp(0.80, 1.25);
+    let change = (clamped - 1.0) * 2048.0;
     (f32::from(base) + change).round().clamp(0.0, 4095.0) as u16
 }
 
@@ -25,8 +28,9 @@ fn to_bytes(rpu: &DoviRpu, has_nal: bool) -> anyhow::Result<Vec<u8>> {
     if has_nal { rpu.write_hevc_unspec62_nalu() } else { rpu.write_rpu() }
 }
 
-/// Returns 0 on any unsafe edit. status: 1 applied, -1 invalid,
-/// -2 no suitable target, -3 non-identical round trip, -4 reparse failed.
+/// Returns 0 on any unsafe edit. status: positive = number of existing
+/// saturation trim targets edited, -1 invalid, -2 no suitable target,
+/// -3 non-identical round trip, -4 reparse failed.
 /// Contrast and brightness are intentionally disabled pending safe validation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
@@ -62,43 +66,45 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
         }
     }
 
-    let mut changed = false;
+    // All *existing* targets receive the same saturation gain change.
+    // A TV can select a different target based on the display's luminance,
+    // so editing a single 600/1000-nit block often has no visible effect.
+    // Crucially, no new target blocks are invented, no L1/3 mapping metadata
+    // is modified, and CMv2.9 isn't edited when CMv4.0 has been changed.
+    let mut edited_targets: i32 = 0;
     if let Some(dm) = rpu.vdr_dm_data.as_mut() {
-        // Prefer exactly one 1000-nit CMv4.0 target (common HDR TV class).
-        // Never edit all targets or both CM2.9 and CM4 at once.
         if let Some(DmData::V40(ref mut cm40)) = dm.cmv40_metadata {
-            let blocks = cm40.blocks_mut();
-            if let Some(level) = blocks.iter_mut().find_map(|block| {
+            for block in cm40.blocks_mut() {
                 if let ExtMetadataBlock::Level8(level) = block {
-                    if (level.trim_target_nits() == 1000 || level.trim_target_nits() == 600)
-                        && is_valid_trim(level.trim_saturation_gain) {
-                        return Some(level);
+                    if is_valid_trim(level.trim_saturation_gain) {
+                        let original = level.trim_saturation_gain;
+                        let adjusted = adjust_saturation(original, saturation);
+                        if original != adjusted {
+                            level.trim_saturation_gain = adjusted;
+                            edited_targets += 1;
+                        }
                     }
                 }
-                None
-            }) {
-                level.trim_saturation_gain = adjust_saturation(level.trim_saturation_gain, saturation);
-                changed = true;
             }
         }
-
-        // Older CM2.9 metadata: change a single existing target only when
-        // the RPU has no suitable CM4 target.
-        if !changed {
+        if edited_targets == 0 {
             if let Some(DmData::V29(ref mut cm29)) = dm.cmv29_metadata {
                 for block in cm29.blocks_mut() {
                     if let ExtMetadataBlock::Level2(level) = block {
                         if is_valid_trim(level.trim_saturation_gain) {
-                            level.trim_saturation_gain = adjust_saturation(level.trim_saturation_gain, saturation);
-                            changed = true;
-                            break;
+                            let original = level.trim_saturation_gain;
+                            let adjusted = adjust_saturation(original, saturation);
+                            if original != adjusted {
+                                level.trim_saturation_gain = adjusted;
+                                edited_targets += 1;
+                            }
                         }
                     }
                 }
             }
         }
     }
-    if !changed {
+    if edited_targets == 0 {
         if !status.is_null() { unsafe { *status = -2; } }
         return 0;
     }
@@ -119,6 +125,6 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
     }
 
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()); }
-    if !status.is_null() { unsafe { *status = 1; } }
+    if !status.is_null() { unsafe { *status = edited_targets; } }
     bytes.len()
 }

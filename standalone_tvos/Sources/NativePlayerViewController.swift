@@ -1782,12 +1782,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 lockedSeekDirection = direction
                 lockedSpeedIndex = 0
             }
-            // Preserve the pre-existing locked FF/RW click and speed behavior
-            // after a hold initiated outside the thumbnail menu.
-            let base = targetSeconds ?? currentSeconds
-            let bound = totalSeconds > 0 ? totalSeconds : 86_400
-            targetSeconds = max(0, min(bound,
-                base + Double(direction) * lockedClickSteps[lockedSpeedIndex]))
+            // In visible thumbnail seeking, the arrows visit the NEXT actual
+            // white cache marker, even if some 12s slots have not been saved.
+            // Hold acceleration itself is left untouched.
+            if let mark = adjacentCachedWhiteMark(from: targetSeconds ?? currentSeconds,
+                                                  direction: direction) {
+                targetSeconds = mark
+            }
             scheduleFrames()
             refreshLabels()
             showPanel()
@@ -2466,11 +2467,36 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         showPanel()
     }
 
+    /// Navigate the actual white cache indicators, not a hypothetical
+    /// 12-second grid. This is the same list painted by CachedTimelineOverlay.
+    /// The list may contain gaps or out-of-order entries because disk writes
+    /// and background thumbnail generation complete asynchronously.
+    private func adjacentCachedWhiteMark(from seconds: Double,
+                                         direction: Int) -> Double? {
+        guard seconds.isFinite else { return nil }
+        let validSlots = cachedTimeline.frameSlots.filter { slot in
+            slot >= 0 && (totalSeconds <= 0 || Double(slot) <= totalSeconds)
+        }
+        if direction > 0 {
+            return validSlots.filter { Double($0) > seconds + 0.001 }
+                .min().map(Double.init)
+        } else if direction < 0 {
+            return validSlots.filter { Double($0) < seconds - 0.001 }
+                .max().map(Double.init)
+        }
+        return nil
+    }
+
     private func stepSeek(_ direction: Int, commitAfterIdle: Bool) {
         guard core != nil else { return }
         let base = targetSeconds ?? max(0, currentSeconds)
-        let bound = totalSeconds > 0 ? totalSeconds : 86_400
-        targetSeconds = max(0, min(bound, base + Double(direction) * 15))
+        // A white indent means this precise saved frame exists. Skip gaps;
+        // if no further white indent exists, leave the preview where it is.
+        guard let mark = adjacentCachedWhiteMark(from: base,
+                                                  direction: direction) else {
+            return
+        }
+        targetSeconds = mark
         scheduleFrames()
         refreshLabels()
         showPanel()

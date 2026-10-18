@@ -8,7 +8,9 @@
 #include <Libavformat/avformat.h>
 #include <Libavcodec/avcodec.h>
 #include <Libavcodec/codec_par.h>
+#include <Libavcodec/packet.h>
 #include <Libavutil/avutil.h>
+#include <Libavutil/dovi_meta.h>
 #include <Libavutil/imgutils.h>
 #include <Libswscale/swscale.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -112,6 +114,21 @@ static float nuvioHDRNits(float signal, enum AVColorTransferCharacteristic trc) 
     return 1000.0f * powf(fmaxf(scene, 0.0f), 1.2f);
 }
 
+// Unlike HDR10-compatible Dolby Vision, Profile 5's IPTPQc2 base layer
+// requires Dolby's RPU color mapping. Rendering it through ordinary YUV/PQ
+// creates purple/green distortion. Do not save such frames as corrupt JPEGs.
+static bool nuvioNeedsNativeDVPreview(const AVCodecParameters *params) {
+    if (!params) return false;
+    const AVPacketSideData *dovi = av_packet_side_data_get(
+        params->coded_side_data, params->nb_coded_side_data,
+        AV_PKT_DATA_DOVI_CONF);
+    if (!dovi || dovi->size < sizeof(AVDOVIDecoderConfigurationRecord))
+        return false;
+    const AVDOVIDecoderConfigurationRecord *config =
+        (const AVDOVIDecoderConfigurationRecord *)dovi->data;
+    return config->dv_profile == 5;
+}
+
 static inline uint8_t nuvioTonePixel(float nits, const uint8_t *lut) {
     int index = (int)fminf(4095.0f, fmaxf(0.0f, nits) + 0.5f);
     return lut[index];
@@ -125,7 +142,9 @@ static void nuvioToneMapHDR(const uint16_t *source, int sourceStride,
     uint8_t display[4096];
     for (int i = 0; i < 4096; ++i) {
         linear[i] = nuvioHDRNits((float)i / 4095.0f, trc);
-        float compressed = (float)i / ((float)i + 160.0f);
+        // A gentler 90-nit shoulder keeps shadow/mid-tone detail visible on
+        // the SDR seek thumbnail without raising the active DV/HDR movie.
+        float compressed = (float)i / ((float)i + 90.0f);
         float srgb = compressed <= 0.0031308f ? compressed * 12.92f
             : 1.055f * powf(compressed, 1.0f / 2.4f) - 0.055f;
         display[i] = (uint8_t)lrintf(255.0f * fminf(1.0f, fmaxf(0.0f, srgb)));
@@ -173,6 +192,7 @@ static bool nuvioIsBlackBandRow(const uint8_t *pixels, int stride, int width, in
 static UIImage *nuvioMakeImage(AVFrame *frame,
                                const AVCodecParameters *sourceParameters) {
     if (!frame || frame->width <= 0 || frame->height <= 0) return nil;
+    if (nuvioNeedsNativeDVPreview(sourceParameters)) return nil;
 
     // A 640px preview comfortably fills the 432pt floating window, with
     // much lower scaling/retained-image cost than 800px frames.

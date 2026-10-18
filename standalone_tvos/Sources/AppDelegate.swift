@@ -72,6 +72,9 @@ struct NativeStreamLink {
     // Optional episode metadata from the caller. Existing handoffs carrying
     // only url/title/sub remain fully compatible.
     let introEpisode: IntroEpisodeDescriptor?
+    /// Optional x-callback into the Nuvio app that originated playback.
+    /// Only Nuvio tvOS URL schemes may be launched on Back.
+    let returnToNuvioURL: URL?
 
     init?(link: URL) {
         guard link.scheme?.lowercased() == "nuvio-player",
@@ -92,6 +95,17 @@ struct NativeStreamLink {
             }
             return nil
         }
+        // Prefer an explicit return callback so Nuvio can restore an
+        // external-playback session instead of simply reopening its shell.
+        // Do not accept http(s), signed media URLs, or arbitrary schemes
+        // as the destination of the Siri Remote Back button.
+        let callbackNames = ["x-success", "x-callback", "return_url", "return", "callback"]
+        returnToNuvioURL = callbackNames
+            .compactMap { query[$0].flatMap(URL.init(string:)) }
+            .first { url in
+                ["nuvio-tv", "nuvio", "com.nuvio.app.tv"]
+                    .contains(url.scheme?.lowercased() ?? "")
+            }
         let series = firstValue(["show", "series", "series_title", "show_title"])
         let imdb = firstValue(["imdb_id", "imdb", "imdbid"])
         let season = firstValue(["season", "season_number"]).flatMap(Int.init)

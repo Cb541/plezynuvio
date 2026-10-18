@@ -2243,7 +2243,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // callback URL (when provided) so it can restore playback state.
         // Opening a different tvOS app is supported; there is no public API
         // for arbitrary "previous app" switching.
-        let fallbacks = ["nuvio-tv://", "nuvio://", "com.nuvio.app.tv://"]
+        let fallbacks = ["nuvio-tv://return", "nuvio://return", "com.nuvio.app.tv://return"]
             .compactMap(URL.init(string:))
         let destinations = (lastNuvioReturnURL.map { [$0] } ?? []) + fallbacks
         tryOpenNuvio(destinations, at: 0)

@@ -1252,23 +1252,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((con * 100).rounded()))%"
         brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((bri * 100).rounded()))%"
         hdrBoostLabel.text = requiresNativeDolbyVision
-            ? "\(selectedPictureControl == 5 ? "▶ " : "   ")DV RPU trims (test): \(dvTrimEnabled ? "ON" : "OFF")"
+            ? "\(selectedPictureControl == 5 ? "▶ " : "   ")DV safe saturation test: \(dvTrimEnabled ? "ON" : "OFF")"
             : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
-        let available = requiresNativeDolbyVision
-            ? dvTrimEnabled
-            : (sourceColorMetadataReady && (!sourceIsHDR || experimentalHDRColorBoost)
-               && !colorFilterFailed)
-        saturationLabel.textColor = available
-            ? (selectedPictureControl == 2 ? .white : .lightGray)
-            : .gray
-        contrastLabel.textColor = available
-            ? (selectedPictureControl == 3 ? .white : .lightGray)
-            : .gray
-        brightnessLabel.textColor = available
-            ? (selectedPictureControl == 4 ? .white : .lightGray)
-            : .gray
+        let sdrHdrAvailable = sourceColorMetadataReady && !requiresNativeDolbyVision
+            && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed
+        saturationLabel.textColor = (sdrHdrAvailable || (requiresNativeDolbyVision && dvTrimEnabled))
+            ? (selectedPictureControl == 2 ? .white : .lightGray) : .gray
+        // v2 DV test isolates saturation; contrast/brightness edits are
+        // disabled until metadata target mapping can be calibrated safely.
+        contrastLabel.textColor = sdrHdrAvailable
+            ? (selectedPictureControl == 3 ? .white : .lightGray) : .gray
+        brightnessLabel.textColor = sdrHdrAvailable
+            ? (selectedPictureControl == 4 ? .white : .lightGray) : .gray
         hdrBoostLabel.textColor = requiresNativeDolbyVision
             || (sourceColorMetadataReady && sourceIsHDR)
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
@@ -1283,11 +1280,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let edited = NuvioDVTrimEditedCount()
             let skipped = NuvioDVTrimUneditableCount()
             if dvTrimEnabled {
-                colorStatusLabel.text = "EXPERIMENTAL DV: edited \(edited) · passthrough \(skipped)\n\(NuvioDVTrimIsEnabled() ? "RPU editor active" : "neutral/fail-safe disabled") · native video untouched"
+                colorStatusLabel.text = "DV SAT-ONLY TEST: edited \(edited) · skipped \(skipped)\n\(NuvioDVTrimIsEnabled() ? "one subtle trim target" : "neutral/fail-safe off") · contrast/brightness locked"
             } else if sampled == 0 {
                 colorStatusLabel.text = "DV RPU: awaiting samples\nTurn test ON then adjust a value"
             } else if tagged > 0 {
-                colorStatusLabel.text = "DV RPU: \(frameBytes) B per frame\nTest OFF · original metadata"
+                colorStatusLabel.text = "DV RPU: \(frameBytes) B per frame\nOriginal metadata · safer saturation test available"
             } else {
                 colorStatusLabel.text = "DV RPU unavailable\nNative Dolby Vision protected"
             }
@@ -1329,8 +1326,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         case 1:
             verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
             applyPictureTransform()
-        case 2 where requiresNativeDolbyVision:
-            dvTrimSaturation = min(1.50, max(0.70,
+        case 2 where requiresNativeDolbyVision && dvTrimEnabled:
+            // One conservative, independently verifiable saturation trim.
+            // 95–105% test range; no more aggressive multi-target edits.
+            dvTrimSaturation = min(1.05, max(0.95,
                 (dvTrimSaturation * 100 + Double(direction) * 5).rounded() / 100))
             updateExperimentalDVTrims()
         case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
@@ -1340,10 +1339,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 3 where requiresNativeDolbyVision:
-            dvTrimContrast = min(1.50, max(0.70,
-                (dvTrimContrast * 100 + Double(direction) * 5).rounded() / 100))
-            updateExperimentalDVTrims()
         case 3 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
@@ -1351,10 +1346,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 4 where requiresNativeDolbyVision:
-            dvTrimBrightness = min(1.50, max(0.70,
-                (dvTrimBrightness * 100 + Double(direction) * 5).rounded() / 100))
-            updateExperimentalDVTrims()
         case 4 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             // A small luma-plane offset lifts a dark SDR picture without
@@ -1366,6 +1357,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             scheduleColorFilterUpdate()
         case 5 where requiresNativeDolbyVision:
             dvTrimEnabled = direction > 0
+            if !dvTrimEnabled {
+                dvTrimSaturation = 1
+                dvTrimContrast = 1
+                dvTrimBrightness = 1
+            }
             updateExperimentalDVTrims()
         case 5 where sourceColorMetadataReady && sourceIsHDR && !requiresNativeDolbyVision:
             // HDR10 remains a per-movie experiment. Dolby Vision MUST NOT

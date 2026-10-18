@@ -2639,6 +2639,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if thumbs.hasCachedFrameNear(second: slot) { return }
         guard lastPreviewRequestedBucket != slot else { return }
         lastPreviewRequestedBucket = slot
+        if core?.doviProfile == 5 {
+            // P5 has no HDR10-compatible base layer. The FFmpeg seek worker
+            // can't reproduce Dolby's IPTPQc2 + RPU color mapping. Ask the
+            // existing hardware decoder for a still, while paused, rather
+            // than cache a dark/magenta corrupted FFmpeg JPEG.
+            requestNativePreviewTarget(slot, serial: serial)
+            return
+        }
         thumbs.request(url: link.url, second: slot) { [weak self] image in
             guard let self, self.previewIsVisible,
                   self.currentPreviewSerial == serial,
@@ -2673,6 +2681,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if #available(tvOS 17.4, *),
            let buffer = previewCore.videoLayer?.sampleBufferRenderer.displayedPixelBuffer() {
             let context = thumbnailImageContext
+            let isHDRPreview = sourceIsHDR || requiresNativeDolbyVision
             DispatchQueue.global(qos: .utility).async {
                 let frame = CIImage(cvPixelBuffer: buffer)
                 let longer = max(frame.extent.width, frame.extent.height)
@@ -2684,10 +2693,22 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     return
                 }
                 let scale = min(1, 720.0 / longer)
-                let reduced = frame.transformed(by: CGAffineTransform(
+                var reduced = frame.transformed(by: CGAffineTransform(
                     scaleX: scale, y: scale))
+                // Tone-map the tiny screenshot copy into a real SDR output.
+                // Neither the source CVPixelBuffer nor displayed DV frame
+                // is changed; this work runs off the playback thread.
+                if isHDRPreview, let tone = CIFilter(name: "CIToneMapHeadroom"),
+                   tone.inputKeys.contains("inputTargetHeadroom") {
+                    tone.setValue(reduced, forKey: kCIInputImageKey)
+                    tone.setValue(8.0, forKey: "inputSourceHeadroom")
+                    tone.setValue(1.0, forKey: "inputTargetHeadroom")
+                    if let result = tone.outputImage { reduced = result }
+                }
                 let image: UIImage?
-                if let cg = context.createCGImage(reduced, from: reduced.extent) {
+                let srgb = CGColorSpace(name: CGColorSpace.sRGB)!
+                if let cg = context.createCGImage(reduced, from: reduced.extent,
+                                                  format: .RGBA8, colorSpace: srgb) {
                     image = UIImage(cgImage: cg)
                 } else {
                     image = nil
@@ -2833,7 +2854,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if let image {
                 self.thumbs.cachePlaybackFrame(
                     image, second: desired, automatic: false)
-                let selected = max(0, (Int((self.targetSeconds ?? -1).rounded()) / 2) * 2)
+                let selected = max(0, (Int((self.targetSeconds ?? -1).rounded()) / 12) * 12)
                 if selected == desired {
                     self.frameViews.first?.image = image
                     self.lastPreviewImageSecond = desired

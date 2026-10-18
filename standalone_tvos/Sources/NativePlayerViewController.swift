@@ -136,6 +136,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         UserDefaults.standard.bool(forKey: persistentSubtitlesKey)
     }
     private var link: NativeStreamLink?
+    // Persist the return callback after leavePlayback() clears the stream.
+    // The idle Back button can still return to the originating Nuvio screen.
+    private var lastNuvioReturnURL: URL?
+    private var returningToNuvio = false
     private var clock: Timer?
     private var repeatTimer: Timer?
     private var thumbTimer: Timer?
@@ -471,6 +475,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
         link = media
+        lastNuvioReturnURL = media.returnToNuvioURL
+        returningToNuvio = false
         if let episode = media.introEpisode {
             let requestGeneration = introLookupGeneration
             introSkipService.resolve(episode) { [weak self] result in
@@ -1750,7 +1756,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 }
             }
         case .menu:
-            if toolPanel != .none {
+            // On the idle "Choose a stream in Nuvio" screen, Back returns
+            // to Nuvio rather than calling the in-video exit confirmation.
+            // All existing Back behavior during playback remains unchanged.
+            if core == nil && link == nil && !isPreparingPlayback {
+                returnToNuvio()
+            } else if toolPanel != .none {
                 closeToolPanel()
             } else if lockedSeekDirection != 0 {
                 finishLockedSeek(commit: false)
@@ -2223,6 +2234,41 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         lastCacheLookupBucket = nil
         thumbs.cancel()
         currentPreviewSerial += 1
+    }
+
+    private func returnToNuvio() {
+        guard !returningToNuvio else { return }
+        returningToNuvio = true
+        // NuvioTVOS registers these custom URL schemes. First use a caller's
+        // callback URL (when provided) so it can restore playback state.
+        // Opening a different tvOS app is supported; there is no public API
+        // for arbitrary "previous app" switching.
+        let fallbacks = ["nuvio-tv://", "nuvio://", "com.nuvio.app.tv://"]
+            .compactMap(URL.init(string:))
+        let destinations = (lastNuvioReturnURL.map { [$0] } ?? []) + fallbacks
+        tryOpenNuvio(destinations, at: 0)
+    }
+
+    private func tryOpenNuvio(_ destinations: [URL], at index: Int) {
+        guard index < destinations.count else {
+            returningToNuvio = false
+            statusLabel.text = "Could not reopen Nuvio. Check that Nuvio is installed."
+            statusLabel.isHidden = false
+            return
+        }
+        // Avoid canOpenURL because a sideloaded app may not declare Nuvio in
+        // LSApplicationQueriesSchemes; open's completion is authoritative.
+        UIApplication.shared.open(destinations[index], options: [:]) {
+            [weak self] opened in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if opened {
+                    self.returningToNuvio = false
+                } else {
+                    self.tryOpenNuvio(destinations, at: index + 1)
+                }
+            }
+        }
     }
 
     private func confirmExit() {

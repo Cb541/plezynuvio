@@ -24,44 +24,97 @@ fn adjust_saturation(base: u16, factor: f32) -> u16 {
     (f32::from(base) + change).round().clamp(0.0, 4095.0) as u16
 }
 
-/// Apple may attach either the standalone RPU payload, an HEVC UNSPEC62
-/// NALU (with emulation-prevention bytes), or a payload with a leading
-/// Annex-B/short prefix. libdovi's parse_rpu() strips these wrappers, while
-/// write_rpu() intentionally does NOT put them back. Comparing those two
-/// representations caused spurious "not byte-exact" (-3) errors.
+/// Apple's Core Video attachment can contain a raw RPU, a prefixed RPU,
+/// or the same payload with HEVC emulation-prevention bytes. A plain
+/// parse_rpu() does not remove EPB (00 00 03), whereas parse_unspec62_nalu()
+/// does. Both forms may start with 0x19 after their optional wrapper.
+///
+/// Earlier v5 assumed EPB only for 7C01 NAL headers, rejecting perfectly
+/// valid prefixed RPU blobs with code -5. Do NOT select a parser based solely
+/// on the prefix: select it by successfully parsing AND reproducing the exact
+/// original wrapper and bytes. Never drop the CRC round-trip guard.
 #[derive(Clone, Copy)]
-enum RpuContainer { Payload { prefix: usize }, HevcNal }
+enum RpuEncoding { Raw, EmulationPrevented }
 
-fn container_for(data: &[u8]) -> Option<RpuContainer> {
-    match data.get(..5)? {
-        [0, 0, 0, 1, 25] => Some(RpuContainer::Payload { prefix: 4 }),
-        [0, 0, 1, 25, 8] => Some(RpuContainer::Payload { prefix: 3 }),
-        [0, 1, 25, 8, 9] => Some(RpuContainer::Payload { prefix: 2 }),
-        [124, 1, 25, 8, 9] => Some(RpuContainer::HevcNal),
-        [1, 25, 8, 9, _] => Some(RpuContainer::Payload { prefix: 1 }),
-        [25, 8, 9, _, _] => Some(RpuContainer::Payload { prefix: 0 }),
-        _ => None,
-    }
+#[derive(Clone, Copy)]
+struct RpuContainer {
+    prefix: usize,
+    nal_header: bool,
+    encoding: RpuEncoding,
+}
+
+fn identify_wrapper(data: &[u8]) -> Option<(usize, bool)> {
+    if data.starts_with(&[0, 0, 0, 1, 124, 1, 25]) { return Some((4, true)); }
+    if data.starts_with(&[0, 0, 1, 124, 1, 25]) { return Some((3, true)); }
+    if data.starts_with(&[124, 1, 25]) { return Some((0, true)); }
+    if data.starts_with(&[0, 0, 0, 1, 25]) { return Some((4, false)); }
+    if data.starts_with(&[0, 0, 1, 25]) { return Some((3, false)); }
+    if data.starts_with(&[0, 1, 25]) { return Some((2, false)); }
+    if data.starts_with(&[1, 25]) { return Some((1, false)); }
+    if data.starts_with(&[25]) { return Some((0, false)); }
+    None
 }
 
 fn parse_container(data: &[u8], kind: RpuContainer) -> anyhow::Result<DoviRpu> {
-    match kind {
-        RpuContainer::HevcNal => DoviRpu::parse_unspec62_nalu(data),
-        RpuContainer::Payload { .. } => DoviRpu::parse_rpu(data),
+    let unwrapped = &data[kind.prefix..];
+    match kind.encoding {
+        RpuEncoding::Raw => DoviRpu::parse_rpu(unwrapped),
+        RpuEncoding::EmulationPrevented => {
+            // libdovi accepts both 7C01 HEVC NAL and 19-prefixed raw RPU.
+            DoviRpu::parse_unspec62_nalu(unwrapped)
+        }
     }
 }
 
 fn to_bytes(rpu: &DoviRpu, kind: RpuContainer, original: &[u8]) -> anyhow::Result<Vec<u8>> {
-    match kind {
-        RpuContainer::HevcNal => rpu.write_hevc_unspec62_nalu(),
-        RpuContainer::Payload { prefix } => {
-            let payload = rpu.write_rpu()?;
-            let mut output = Vec::with_capacity(prefix + payload.len());
-            output.extend_from_slice(&original[..prefix]);
-            output.extend_from_slice(&payload);
-            Ok(output)
+    let payload = match kind.encoding {
+        RpuEncoding::Raw => rpu.write_rpu()?,
+        RpuEncoding::EmulationPrevented => {
+            // Generates 7C01 + EPB-protected payload. If Apple provided only
+            // the 19-prefixed payload, remove the generated NAL header.
+            let nal = rpu.write_hevc_unspec62_nalu()?;
+            if kind.nal_header {
+                nal
+            } else {
+                nal[2..].to_vec()
+            }
+        }
+    };
+    // Reconstruct the original Annex-B, short, or bare container unchanged.
+    let mut output = Vec::with_capacity(kind.prefix + payload.len() + 2);
+    output.extend_from_slice(&original[..kind.prefix]);
+    if kind.nal_header && matches!(kind.encoding, RpuEncoding::Raw) {
+        // Raw parsing always receives 19-prefixed RPU bytes, i.e. the HEVC
+        // NAL header must be stripped and restored outside the parser.
+        // We prefer EPB parsing for NAL source, so skip raw here instead.
+        unreachable!("raw NAL must not be chosen");
+    }
+    output.extend_from_slice(&payload);
+    Ok(output)
+}
+
+fn parse_exact_roundtrip(data: &[u8]) -> Result<(DoviRpu, RpuContainer), i32> {
+    let (prefix, nal_header) = identify_wrapper(data).ok_or(-9)?;
+    let mut parsed_any = false;
+    // On a true 7C01 HEVC NALU, the EPB-aware parser is mandatory; otherwise
+    // attempt BOTH forms because 19-prefixed payloads may also carry EPB.
+    let encodings: &[RpuEncoding] = if nal_header {
+        &[RpuEncoding::EmulationPrevented]
+    } else {
+        &[RpuEncoding::Raw, RpuEncoding::EmulationPrevented]
+    };
+    for &encoding in encodings {
+        let kind = RpuContainer { prefix, nal_header, encoding };
+        if let Ok(rpu) = parse_container(data, kind) {
+            parsed_any = true;
+            if let Ok(roundtrip) = to_bytes(&rpu, kind, data) {
+                if roundtrip == data {
+                    return Ok((rpu, kind));
+                }
+            }
         }
     }
+    Err(if parsed_any { -3 } else { -5 })
 }
 
 /// Returns 0 on any unsafe edit. status: positive = number of existing
@@ -88,31 +141,13 @@ pub unsafe extern "C" fn nuvio_dv_adjust_rpu(
     if (saturation - 1.0).abs() < 0.001 { return 0; }
 
     let data = unsafe { slice::from_raw_parts(input, input_len) };
-    let kind = match container_for(data) {
-        Some(k) => k,
-        None => {
-            if !status.is_null() { unsafe { *status = -9; } }
+    let (mut rpu, kind) = match parse_exact_roundtrip(data) {
+        Ok(pair) => pair,
+        Err(code) => {
+            if !status.is_null() { unsafe { *status = code; } }
             return 0;
         }
     };
-    let mut rpu = match parse_container(data, kind) {
-        Ok(r) => r,
-        Err(_) => {
-            if !status.is_null() { unsafe { *status = -5; } }
-            return 0;
-        }
-    };
-
-    // A valid parse alone isn't enough: ensure libdovi reproduces the exact
-    // original bytes before allowing a metadata write. This also detects
-    // unusual/unknown payload representations and already-modified blobs.
-    match to_bytes(&rpu, kind, data) {
-        Ok(bytes) if bytes == data => (),
-        _ => {
-            if !status.is_null() { unsafe { *status = -3; } }
-            return 0;
-        }
-    }
 
     // All *existing* targets receive the same saturation gain change.
     // A TV can select a different target based on the display's luminance,

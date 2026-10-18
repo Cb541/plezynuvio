@@ -42,5 +42,7 @@ uint64_t NuvioDVProbeSampleCount(void);
 uint64_t NuvioDVProbeFrameMetadataBytes(void);
 uint64_t NuvioDVProbeSequenceMetadataBytes(void);
 uint64_t NuvioDVProbeTaggedSampleCount(void);
+/// Exact public attachment keys/types seen by the read-only probe.
+NSString *NuvioDVProbeAttachmentSummary(void);
 
 NS_ASSUME_NONNULL_END

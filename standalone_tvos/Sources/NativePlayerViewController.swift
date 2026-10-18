@@ -277,6 +277,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let statusLabel = UILabel()
     private let progress = UIProgressView(progressViewStyle: .default)
     private let cachedTimeline = CachedTimelineOverlay()
+    // Compact vertical playhead: slightly taller than the 5-point track.
+    // Its center tracks the selected thumbnail or current playback position.
+    private let playbackPositionMarker = UIView()
+    private var playbackMarkerXConstraint: NSLayoutConstraint?
     private let cacheRateLabel = UILabel()
     private var lastCacheUIUpdate = Date.distantPast
     // Actual media-network rate, independent of JPEG thumbnail writes.
@@ -910,6 +914,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         cachedTimeline.layer.cornerRadius = 2
         cachedTimeline.clipsToBounds = true
         panel.addSubview(cachedTimeline)
+        playbackPositionMarker.translatesAutoresizingMaskIntoConstraints = false
+        playbackPositionMarker.backgroundColor = UIColor.white
+        playbackPositionMarker.layer.cornerRadius = 3
+        playbackPositionMarker.isUserInteractionEnabled = false
+        // Draw over the progress fill and white cached sections so the
+        // current playhead remains discernible even on a fully cached bar.
+        panel.addSubview(playbackPositionMarker)
         cacheRateLabel.translatesAutoresizingMaskIntoConstraints = false
         cacheRateLabel.text = "VIDEO — Mb/s · 0 previews"
         cacheRateLabel.textColor = UIColor.white.withAlphaComponent(0.88)
@@ -1077,6 +1088,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             equalTo: view.leadingAnchor, constant: view.bounds.midX)
         thumbnailCenterXConstraint = movableThumbnailX
 
+        let movablePlayheadX = playbackPositionMarker.centerXAnchor.constraint(
+            equalTo: progress.leadingAnchor)
+        playbackMarkerXConstraint = movablePlayheadX
         NSLayoutConstraint.activate([
             remote.topAnchor.constraint(equalTo: view.topAnchor),
             remote.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -1103,6 +1117,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             cachedTimeline.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
             cachedTimeline.centerYAnchor.constraint(equalTo: progress.centerYAnchor),
             cachedTimeline.heightAnchor.constraint(equalTo: progress.heightAnchor),
+            // A 6 x 17-point white pill extends 6 points above and below
+            // the 5-point timeline without becoming a tall divider.
+            playbackPositionMarker.centerYAnchor.constraint(equalTo: progress.centerYAnchor),
+            playbackPositionMarker.widthAnchor.constraint(equalToConstant: 6),
+            playbackPositionMarker.heightAnchor.constraint(equalToConstant: 17),
+            movablePlayheadX,
             cacheRateLabel.trailingAnchor.constraint(equalTo: progress.trailingAnchor),
             cacheRateLabel.bottomAnchor.constraint(equalTo: progress.topAnchor, constant: -5),
             cacheRateLabel.widthAnchor.constraint(equalToConstant: 390),
@@ -2905,6 +2925,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             panel.isHidden = true
             progress.isHidden = true
             cachedTimeline.isHidden = true
+            playbackPositionMarker.isHidden = true
             cacheRateLabel.isHidden = true
             thumbnailCacheHealthLabel.isHidden = true
             currentLabel.isHidden = true
@@ -2926,6 +2947,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         panel.isHidden = !hasPlayerControls
         progress.isHidden = !showTimeline
         cachedTimeline.isHidden = !showTimeline
+        playbackPositionMarker.isHidden = !showTimeline
         cacheRateLabel.isHidden = !showTimeline
         // Temporary diagnostic: distinguish automatic capture from active
         // seeking even when preview thumbnails have already been cached.
@@ -3120,6 +3142,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         } else {
             fraction = 0
         }
+        // Place the vertical playhead directly on the real progress track,
+        // including during thumbnail scrubs. Unlike the large preview image,
+        // this narrow indicator does not need endpoint clamping.
+        playbackMarkerXConstraint?.constant = progress.bounds.width * fraction
         // Convert points from the actual progress track to controller space.
         // A 0% seek sits at the track's start; 100% at its end.
         let start = progress.convert(CGPoint(x: progress.bounds.minX,

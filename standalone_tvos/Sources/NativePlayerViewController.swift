@@ -1057,7 +1057,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         colorStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         colorStatusLabel.font = .systemFont(ofSize: 17, weight: .medium)
         colorStatusLabel.textColor = .white.withAlphaComponent(0.75)
-        colorStatusLabel.numberOfLines = 2
+        colorStatusLabel.numberOfLines = 4
         picturePanel.addSubview(colorStatusLabel)
         updatePictureLabels()
 
@@ -1270,7 +1270,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if sampled == 0 {
                 colorStatusLabel.text = "DV RPU research: waiting for video samples…\nNative Dolby Vision is unchanged"
             } else if tagged > 0 {
-                colorStatusLabel.text = "DV metadata probe: frame \(frameBytes) B · sequence \(sequenceBytes) B\nRead-only • trim adjustment not yet active"
+                // Show the exact attachment name, not just its byte count.
+                // A 243-byte blob is not necessarily an editable Dolby RPU.
+                colorStatusLabel.text = "DV attachment: \(NuvioDVProbeAttachmentSummary())\nFrame \(frameBytes) B · sequence \(sequenceBytes) B · read-only"
             } else {
                 colorStatusLabel.text = "DV metadata probe: no frame trim data exposed\nNative DV protected • no pixel processing"
             }

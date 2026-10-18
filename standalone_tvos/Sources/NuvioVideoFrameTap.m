@@ -58,6 +58,7 @@ static atomic_uint_fast64_t sDVTrimUnavailable;
 static atomic_uint_fast64_t sDVTrimInterceptedFrames;
 static atomic_uint_fast64_t sDVTrimRPUFrames;
 static atomic_int sDVTrimLastStatus;
+static atomic_uint_fast64_t sDVTrimRPUHeader8;
 static atomic_uint_fast64_t sDVTrimSlowFrames;
 
 // Strict opt-in. Only edit the RPU attachment (not pixel buffer contents)
@@ -85,6 +86,14 @@ static void nuvio_maybe_adjust_dv(CMSampleBufferRef sample) {
         id value = values[key];
         if (![value isKindOfClass:[NSData class]]) break;
         NSData *original = (NSData *)value;
+        const uint8_t *header = original.bytes;
+        uint64_t prefix = 0;
+        for (NSUInteger i = 0; i < MIN((NSUInteger)8, original.length); i++)
+            prefix = (prefix << 8) | header[i];
+        // Store the first eight bytes without copying or exposing any full
+        // Dolby metadata payload. Safe even if the input cannot be parsed.
+        if (original.length < 8) prefix <<= (8 - original.length) * 8;
+        atomic_store_explicit(&sDVTrimRPUHeader8, prefix, memory_order_relaxed);
         atomic_fetch_add_explicit(&sDVTrimRPUFrames, 1,
                                   memory_order_relaxed);
         if (original.length < 8 || original.length > 4096) {
@@ -139,6 +148,7 @@ uint64_t NuvioDVTrimUneditableCount(void) { return atomic_load(&sDVTrimUnavailab
 uint64_t NuvioDVTrimInterceptedFrames(void) { return atomic_load(&sDVTrimInterceptedFrames); }
 uint64_t NuvioDVTrimRPUFrames(void) { return atomic_load(&sDVTrimRPUFrames); }
 int NuvioDVTrimLastStatus(void) { return atomic_load(&sDVTrimLastStatus); }
+uint64_t NuvioDVTrimRPUHeader8(void) { return atomic_load(&sDVTrimRPUHeader8); }
 BOOL NuvioDVTrimIsEnabled(void) { return atomic_load(&sDVTrimEnabled); }
 NSString *NuvioDVTrimLastFailureReason(void) {
     switch (atomic_load(&sDVTrimLastStatus)) {
@@ -453,6 +463,7 @@ BOOL NuvioFrameTapStart(AVSampleBufferDisplayLayer *layer,
     atomic_store(&sDVTrimInterceptedFrames, 0);
     atomic_store(&sDVTrimRPUFrames, 0);
     atomic_store(&sDVTrimLastStatus, 0);
+    atomic_store(&sDVTrimRPUHeader8, 0);
     atomic_store(&sDVTrimSlowFrames, 0);
     os_unfair_lock_lock(&sCallbackLock);
     sCallback = [callback copy];

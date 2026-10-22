@@ -768,6 +768,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 } else {
                     self.lastConfirmedPauseAt = Date()
                 }
+                // Pause observations arrive asynchronously from mpv.
+                // Force the stats overlay off on RESUME, even if the old
+                // controls/hide timer have not been refreshed yet.
+                if self.playing {
+                    self.cacheRateLabel.isHidden = true
+                }
             default: break
             }
         }
@@ -2083,6 +2089,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         toolbarFocused = false
         controlsVisible = false
         panel.isHidden = true
+        cacheRateLabel.isHidden = true
         statusLabel.isHidden = true
         stopShowingThumbnail()
         updateToolbarFocus()
@@ -3079,11 +3086,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         progress.isHidden = !showTimeline
         cachedTimeline.isHidden = !showTimeline
         playbackPositionMarker.isHidden = !showTimeline
-        // Network/disk numbers belong to the paused or Down-opened control
-        // surface; never leave a persistent overlay during normal playback.
-        let showMetrics = core != nil && (!playing || toolbarFocused ||
-            toolPanel != .none || lockedSeekDirection != 0 ||
-            isTouchScrubbing || targetSeconds != nil)
+        // Video/disk telemetry is a PAUSED-player control only.
+        // Never show it during unpaused playback, including when Down,
+        // toolbar focus, or an open menu makes controls temporarily visible.
+        let showMetrics = core != nil && !playing && hasPlayerControls
         cacheRateLabel.isHidden = !showMetrics
         currentLabel.isHidden = !showTimeline
         endLabel.isHidden = !showTimeline
@@ -3246,6 +3252,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 + rangeCacheWriteRateMBps
             let diskText = String(format: "%.3f", diskRate)
             cacheRateLabel.text = "VIDEO \(videoText) Mb/s  ·  DISK \(diskText) MB/s"
+            // Metrics polling continues for accuracy while the label remains
+            // hidden. Prevent a stale visible label after an async resume.
+            if playing || explicitChromeHidden || !controlsVisible {
+                cacheRateLabel.isHidden = true
+            }
             // Keep cached-frame highlighting; omit all capture/decode/debug
             // counters from the user-facing playback overlay.
             cachedTimeline.durationSeconds = totalSeconds

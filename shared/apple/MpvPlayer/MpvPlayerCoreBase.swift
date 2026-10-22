@@ -1030,6 +1030,39 @@ class MpvPlayerCoreBase: NSObject {
         // needed for PiP, which tvOS does not have.
         checkError(mpv_set_option_string(mpv, "avfoundation-presentation", "host"))
         checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))
+        // High-throughput, disk-backed *VIDEO* read-ahead for the standalone
+        // Apple TV player. This caches encoded media packets using mpv's own
+        // demuxer, completely separately from the tiny JPEG seek previews.
+        // No additional decoder, request, or stream is created here.
+        //
+        // The disk file is temporary and reclaimed by mpv when the media
+        // closes. A large time horizon allows download ahead at the
+        // provider's supported speed; 256 MiB bounds packet metadata RAM
+        // while the payload can grow with available device storage.
+        if Bundle.main.bundleIdentifier == "com.cb541.nuvionativeplayer" {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory,
+            in: .userDomainMask)[0].appendingPathComponent(
+                "NuvioMediaReadAhead", isDirectory: true)
+        do {
+          try FileManager.default.createDirectory(
+            at: cacheDir, withIntermediateDirectories: true)
+          checkError(mpv_set_option_string(mpv, "demuxer-cache-dir",
+                                           cacheDir.path))
+          checkError(mpv_set_option_string(mpv, "cache", "yes"))
+          checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
+          checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "256MiB"))
+          checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "128MiB"))
+          checkError(mpv_set_option_string(mpv, "cache-secs", "21600"))
+          // The temporary file must never be stranded after an app crash.
+          checkError(mpv_set_option_string(mpv, "demuxer-cache-unlink-files",
+                                           "immediate"))
+          NSLog("[NuvioMediaCache] Disk-backed video read-ahead enabled")
+        } catch {
+          // Failure to provision the disk cache must never prevent playback.
+          NSLog("[NuvioMediaCache] Cache directory unavailable: %@",
+                String(describing: error))
+        }
+        }
       #else
         checkError(mpv_set_option_string(mpv, "avfoundation-composite-osd", "no"))
         checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))

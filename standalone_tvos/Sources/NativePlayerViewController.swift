@@ -318,6 +318,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let hdrBoostLabel = UILabel()
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
+    // Extra-light translucent glass behind the timestamp and spinner.
+    // The blur has its own reduced opacity so text stays readable while
+    // the movie remains visible through the capsule.
+    private let seekTimeGlass = UIView()
+    private let seekTimeGlassBlur = UIVisualEffectView(
+        effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+    private let seekTimeGlassStack = UIStackView()
     private let seekTimeLabel = UILabel()
     // Compact, native loading spinner beside the scrub timestamp.
     // Only active for a thumbnail slot not yet cached.
@@ -466,7 +473,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewHideTimer?.invalidate()
         previewIsVisible = false
         filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
+        seekTimeGlass.alpha = 0
         link = media
         frameViews.first?.image = nil
         seekPreviewSpinner.stopAnimating()
@@ -1034,19 +1041,65 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             previewLoadingLabel.centerYAnchor.constraint(equalTo: preview.centerYAnchor)
         ])
         filmStrip.alpha = 0
+        seekTimeGlass.translatesAutoresizingMaskIntoConstraints = false
+        seekTimeGlass.alpha = 0
+        seekTimeGlass.backgroundColor = .clear
+        seekTimeGlass.isUserInteractionEnabled = false
+        seekTimeGlass.layer.cornerRadius = 17
+        seekTimeGlass.layer.cornerCurve = .continuous
+        seekTimeGlass.clipsToBounds = true
+        seekTimeGlass.layer.borderWidth = 0.5
+        seekTimeGlass.layer.borderColor =
+            UIColor.white.withAlphaComponent(0.09).cgColor
+        view.addSubview(seekTimeGlass)
+
+        // Keep the material extremely light: only the BACKGROUND has
+        // reduced opacity, not the timestamp or spinner. This makes the
+        // actual movie visible behind the controls while seeking.
+        seekTimeGlassBlur.translatesAutoresizingMaskIntoConstraints = false
+        seekTimeGlassBlur.alpha = 0.58
+        seekTimeGlassBlur.isUserInteractionEnabled = false
+        seekTimeGlass.addSubview(seekTimeGlassBlur)
+
+        seekTimeGlassStack.translatesAutoresizingMaskIntoConstraints = false
+        seekTimeGlassStack.axis = .horizontal
+        seekTimeGlassStack.alignment = .center
+        seekTimeGlassStack.spacing = 8
+        seekTimeGlassStack.distribution = .fill
+        seekTimeGlass.addSubview(seekTimeGlassStack)
+
         seekTimeLabel.translatesAutoresizingMaskIntoConstraints = false
         seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
-        seekTimeLabel.textColor = .white
+        seekTimeLabel.textColor = UIColor.white.withAlphaComponent(0.93)
         seekTimeLabel.textAlignment = .center
-        seekTimeLabel.alpha = 0
-        view.addSubview(seekTimeLabel)
+        seekTimeLabel.setContentCompressionResistancePriority(
+            .required, for: .horizontal)
+        seekTimeGlassStack.addArrangedSubview(seekTimeLabel)
+
         seekPreviewSpinner.translatesAutoresizingMaskIntoConstraints = false
-        seekPreviewSpinner.color = .white.withAlphaComponent(0.85)
+        seekPreviewSpinner.color = .white.withAlphaComponent(0.80)
         seekPreviewSpinner.hidesWhenStopped = true
         seekPreviewSpinner.stopAnimating()
         seekPreviewSpinner.isUserInteractionEnabled = false
         seekPreviewSpinner.accessibilityLabel = "Loading seek thumbnail"
-        view.addSubview(seekPreviewSpinner)
+        seekTimeGlassStack.addArrangedSubview(seekPreviewSpinner)
+        NSLayoutConstraint.activate([
+            seekTimeGlassBlur.leadingAnchor.constraint(
+                equalTo: seekTimeGlass.leadingAnchor),
+            seekTimeGlassBlur.trailingAnchor.constraint(
+                equalTo: seekTimeGlass.trailingAnchor),
+            seekTimeGlassBlur.topAnchor.constraint(equalTo: seekTimeGlass.topAnchor),
+            seekTimeGlassBlur.bottomAnchor.constraint(
+                equalTo: seekTimeGlass.bottomAnchor),
+            seekTimeGlassStack.leadingAnchor.constraint(
+                equalTo: seekTimeGlass.leadingAnchor, constant: 12),
+            seekTimeGlassStack.trailingAnchor.constraint(
+                equalTo: seekTimeGlass.trailingAnchor, constant: -12),
+            seekTimeGlassStack.topAnchor.constraint(
+                equalTo: seekTimeGlass.topAnchor, constant: 6),
+            seekTimeGlassStack.bottomAnchor.constraint(
+                equalTo: seekTimeGlass.bottomAnchor, constant: -6)
+        ])
         // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
         picturePanel.backgroundColor = .clear
@@ -1156,11 +1209,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
                 multiplier: 0.62, constant: 0),
-            seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
-            seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
-            seekPreviewSpinner.leadingAnchor.constraint(
-                equalTo: seekTimeLabel.trailingAnchor, constant: 10),
-            seekPreviewSpinner.centerYAnchor.constraint(equalTo: seekTimeLabel.centerYAnchor),
+            seekTimeGlass.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
+            seekTimeGlass.bottomAnchor.constraint(
+                equalTo: filmStrip.topAnchor, constant: -10),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
             picturePanel.widthAnchor.constraint(equalToConstant: 535),
@@ -1199,8 +1250,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // surface beneath it continues to receive presses and gestures.
         view.bringSubviewToFront(panel)
         view.bringSubviewToFront(cacheRateLabel)
-        view.bringSubviewToFront(seekTimeLabel)
-        view.bringSubviewToFront(seekPreviewSpinner)
+        view.bringSubviewToFront(seekTimeGlass)
         view.bringSubviewToFront(picturePanel)
         view.bringSubviewToFront(trackPanel)
         view.bringSubviewToFront(statusLabel)
@@ -2146,7 +2196,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewHideTimer = nil
         previewIsVisible = false
         filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
+        seekTimeGlass.alpha = 0
         seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
         // Keep one previous image in memory across seek sessions for this
@@ -2625,7 +2675,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewIsVisible = true
         filmStrip.alpha = 1
         previewLoadingLabel.isHidden = true
-        seekTimeLabel.alpha = 1
+        seekTimeGlass.alpha = 1
         previewHideTimer?.invalidate()
         previewHideTimer = nil
         // Preserve the last successfully generated image across distant seeks.
@@ -3053,7 +3103,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         statusLabel.text = "Choose a stream from Nuvio"
         titleLabel.text = ""
         filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
+        seekTimeGlass.alpha = 0
         seekPreviewSpinner.stopAnimating()
         showPanel()
     }

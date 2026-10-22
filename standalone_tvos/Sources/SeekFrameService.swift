@@ -244,6 +244,16 @@ final class SeekFrameService {
         return compressed.flatMap(UIImage.init(data:))
     }
 
+    /// True only if the requested exact 12-second slot has already
+    /// been generated or saved on disk. A neighbouring slot does not count.
+    func hasCachedFrame(second: Int) -> Bool {
+        let slot = bucket(second)
+        if hotImages.object(forKey: key(slot)) != nil { return true }
+        lock.lock()
+        defer { lock.unlock() }
+        return cachedSlots.contains(slot) || compressedFrames[slot] != nil
+    }
+
     /// Nearby cached stills are usable for fast scrub previews without
     /// performing a costly native seek or starting another decoder.
     /// Disk reads are left to lookupCached on its dedicated diskReader queue.
@@ -641,9 +651,18 @@ final class SeekFrameService {
                 // Keyframes first, two slice threads at most; fetched ranges
                 // live on disk. No second hardware renderer is created.
                 if aheadDecoder == nil { aheadDecoder = NuvioThumbnailDecoder() }
-                decoded = aheadDecoder?.keyframeThumbnail(
-                    for: job.url, second: Int64(job.second),
-                    timeoutSeconds: 12.0, token: token)
+                if job.prefetch {
+                    decoded = aheadDecoder?.keyframeThumbnail(
+                        for: job.url, second: Int64(job.second),
+                        timeoutSeconds: 12.0, token: token)
+                } else {
+                    // Foreground-only progressive sparse reads return the
+                    // first bytes immediately; background indexing keeps
+                    // its original completed-block cache semantics.
+                    decoded = aheadDecoder?.foregroundKeyframeThumbnail(
+                        for: job.url, second: Int64(job.second),
+                        timeoutSeconds: 12.0, token: token)
+                }
             } else {
                 decoded = appleFallback(url: job.url, second: job.second)
             }

@@ -319,6 +319,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
     private let seekTimeLabel = UILabel()
+    // Compact, native loading spinner beside the scrub timestamp.
+    // Only active for a thumbnail slot not yet cached.
+    private let seekPreviewSpinner = UIActivityIndicatorView(style: .medium)
     private let previewLoadingLabel = UILabel()
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
@@ -466,6 +469,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.alpha = 0
         link = media
         frameViews.first?.image = nil
+        seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
         titleLabel.text = ""
         idleLabel.isHidden = true
@@ -1036,6 +1040,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.textAlignment = .center
         seekTimeLabel.alpha = 0
         view.addSubview(seekTimeLabel)
+        seekPreviewSpinner.translatesAutoresizingMaskIntoConstraints = false
+        seekPreviewSpinner.color = .white.withAlphaComponent(0.85)
+        seekPreviewSpinner.hidesWhenStopped = true
+        seekPreviewSpinner.stopAnimating()
+        seekPreviewSpinner.isUserInteractionEnabled = false
+        seekPreviewSpinner.accessibilityLabel = "Loading seek thumbnail"
+        view.addSubview(seekPreviewSpinner)
         // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
         picturePanel.backgroundColor = .clear
@@ -1147,6 +1158,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 multiplier: 0.62, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
+            seekPreviewSpinner.leadingAnchor.constraint(
+                equalTo: seekTimeLabel.trailingAnchor, constant: 10),
+            seekPreviewSpinner.centerYAnchor.constraint(equalTo: seekTimeLabel.centerYAnchor),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
             picturePanel.widthAnchor.constraint(equalToConstant: 535),
@@ -1186,6 +1200,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         view.bringSubviewToFront(panel)
         view.bringSubviewToFront(cacheRateLabel)
         view.bringSubviewToFront(seekTimeLabel)
+        view.bringSubviewToFront(seekPreviewSpinner)
         view.bringSubviewToFront(picturePanel)
         view.bringSubviewToFront(trackPanel)
         view.bringSubviewToFront(statusLabel)
@@ -2132,6 +2147,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewIsVisible = false
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
+        seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
         // Keep one previous image in memory across seek sessions for this
         // movie. New media still clears it in the open/start path.
@@ -2618,11 +2634,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // The preview grid stays at twelve seconds inside the fast-forward
         // menu too. Moving the cursor within a cell must not decode more frames.
         let slot = max(0, (Int(seconds.rounded()) / 12) * 12)
+        // Only uncached positions need an animated loading indicator.
+        // Keep displaying the last good thumbnail underneath meanwhile.
+        if thumbs.hasCachedFrame(second: slot) {
+            seekPreviewSpinner.stopAnimating()
+        } else {
+            seekPreviewSpinner.startAnimating()
+        }
         if lastCacheLookupBucket != slot {
             lastCacheLookupBucket = slot
             if let hot = thumbs.cachedImage(second: slot) {
                 frameViews.first?.image = hot
                 lastPreviewImageSecond = slot
+                seekPreviewSpinner.stopAnimating()
             } else {
                 let serial = currentPreviewSerial
                 thumbs.lookupCached(second: slot) { [weak self] image, foundSlot, exact in
@@ -2637,6 +2661,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     if exact, let image, let foundSlot {
                         self.frameViews.first?.image = image
                         self.lastPreviewImageSecond = foundSlot
+                        self.seekPreviewSpinner.stopAnimating()
                     }
                 }
             }
@@ -2677,6 +2702,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             frameViews.first?.image = cached
             lastPreviewImageSecond = slot
             lastPreviewRequestedBucket = slot
+            seekPreviewSpinner.stopAnimating()
             return
         }
         // An exact disk hit is loaded asynchronously by scheduleFrames.
@@ -2698,6 +2724,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                   self.link?.url == link.url,
                   let current = self.targetSeconds,
                   max(0, (Int(current.rounded()) / 12) * 12) == slot else { return }
+            self.seekPreviewSpinner.stopAnimating()
             if let image {
                 self.frameViews.first?.image = image
                 self.lastPreviewImageSecond = slot
@@ -2821,7 +2848,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func requestNativePreviewTarget(_ second: Int, serial: Int) {
         guard serial == currentPreviewSerial, previewIsVisible, targetSeconds != nil,
               core?.isPaused == true, !mainFramePreviewUnsupported,
-              !waitingForFirstFrame, !displayNegotiationPending else { return }
+              !waitingForFirstFrame, !displayNegotiationPending else {
+            seekPreviewSpinner.stopAnimating()
+            return
+        }
         mainFramePreviewPending = second
         if mainFramePreviewBusy { return }
         if mainFramePreviewOrigin == nil {
@@ -2836,6 +2866,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     // don't seek the main movie or allow a hidden video jump.
                     self.mainFramePreviewUnsupported = true
                     self.mainFramePreviewBusy = false
+                    self.seekPreviewSpinner.stopAnimating()
                     PlayerStartupDiagnostics.mark("native-screenshot-not-supported")
                     return
                 }
@@ -2905,10 +2936,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.frameViews.first?.image = image
                     self.lastPreviewImageSecond = desired
                     self.filmStrip.alpha = 1
+                    self.seekPreviewSpinner.stopAnimating()
                 }
                 PlayerStartupDiagnostics.mark("native-preview-frame-ready")
             } else {
                 self.mainFramePreviewUnsupported = true
+                self.seekPreviewSpinner.stopAnimating()
                 PlayerStartupDiagnostics.mark("native-preview-capture-unavailable")
             }
             self.mainFramePreviewBusy = false
@@ -2925,6 +2958,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func abortNativePreviewToOrigin(_ origin: Double) {
         // Missing snapshot / seek support should never break normal playback.
+        seekPreviewSpinner.stopAnimating()
         mainFramePreviewGeneration += 1
         mainFramePreviewPending = nil
         mainFramePreviewTarget = nil
@@ -3020,6 +3054,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         titleLabel.text = ""
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
+        seekPreviewSpinner.stopAnimating()
         showPanel()
     }
 

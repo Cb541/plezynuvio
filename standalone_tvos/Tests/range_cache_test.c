@@ -63,5 +63,35 @@ int main(void) {
     nuvio_range_free(c);
     for (int i = 0; i < 4; i++) { snprintf(partial,sizeof(partial),"%s/%d.range",dir,i); unlink(partial); }
     rmdir(dir);
+    // Foreground mode must return the FIRST requested bytes without
+    // downloading the rest of a 1 MiB block (critical for uncached seeks).
+    char fastDir[] = "/tmp/nuvio-fast-range-test-XXXXXX";
+    assert(mkdtemp(fastDir));
+    Source fastSource = {0};
+    NuvioRangeCache *fast = nuvio_range_create(fastDir, SIZE,
+        readSource, seekSource, interrupt, &fastSource);
+    assert(fast);
+    nuvio_range_set_progressive(fast, 1);
+    uint8_t immediate[128];
+    assert(nuvio_range_read(fast, immediate, sizeof(immediate)) == (int)sizeof(immediate));
+    assert(fastSource.bytes == (int64_t)sizeof(immediate)); // no 1 MiB download barrier
+    for (int i = 0; i < (int)sizeof(immediate); i++) assert(immediate[i] == value(i));
+    // Revisit the prefix and then complete it; this block must be reusable.
+    check(fast, 0, 1024 * 1024);
+    char complete[512];
+    snprintf(complete, sizeof(complete), "%s/0.range", fastDir);
+    assert(access(complete, F_OK) == 0);
+    int64_t beforeDiskHit = fastSource.bytes;
+    check(fast, 10, 4096);
+    assert(fastSource.bytes == beforeDiskHit);
+    // Sparse nonaligned seeks must also skip the unneeded block prefix.
+    beforeDiskHit = fastSource.bytes;
+    check(fast, 1024 * 1024 + 319, 5000);
+    assert(fastSource.bytes - beforeDiskHit <= 5000);
+    nuvio_range_set_progressive(fast, 0);
+    nuvio_range_free(fast);
+    unlink(complete);
+    rmdir(fastDir);
+    puts("Range cache: progressive first-byte delivery, prefix replay, exact disk reuse and sparse seeking passed");
     puts("Range cache: byte accuracy, reuse, reconnect, boundaries, cancellation, failed reads and disk fallback passed");
 }

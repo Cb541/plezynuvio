@@ -323,7 +323,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // the movie remains visible through the capsule.
     private let seekTimeGlass = UIView()
     private let seekTimeGlassBlur = UIVisualEffectView(
-        effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+        effect: UIBlurEffect(style: .dark))
     private let seekTimeGlassStack = UIStackView()
     private let seekTimeLabel = UILabel()
     // Compact, native loading spinner beside the scrub timestamp.
@@ -1057,7 +1057,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // reduced opacity, not the timestamp or spinner. This makes the
         // actual movie visible behind the controls while seeking.
         seekTimeGlassBlur.translatesAutoresizingMaskIntoConstraints = false
-        seekTimeGlassBlur.alpha = 0.58
+        seekTimeGlassBlur.alpha = 0.32
         seekTimeGlassBlur.isUserInteractionEnabled = false
         seekTimeGlass.addSubview(seekTimeGlassBlur)
 

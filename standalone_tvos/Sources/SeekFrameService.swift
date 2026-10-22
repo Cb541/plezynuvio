@@ -637,9 +637,11 @@ final class SeekFrameService {
             activeWasBackground = job.prefetch
             lock.unlock()
 
-            let currentDiskImage = readDisk(slot: job.second, directory: directory)
-            let cached = cachedImage(second: job.second)
-                ?? currentDiskImage
+            // Hot RAM hits must not block behind synchronous JPEG disk reads.
+            let hot = cachedImage(second: job.second)
+            let currentDiskImage = hot == nil
+                ? readDisk(slot: job.second, directory: directory) : nil
+            let cached = hot ?? currentDiskImage
                 ?? readDisk(slot: job.second, directory: legacyDirectory)
             let startedAt = Date()
             let decoded: UIImage?
@@ -699,7 +701,10 @@ final class SeekFrameService {
                 if job.keyframeOnly {
                     cachePlaybackFrame(image, second: job.second,
                                        automatic: false, ahead: job.prefetch)
-                    diskWriter.sync {}
+                    // Foreground can display the retained RAM image NOW.
+                    // The JPEG writer runs independently; only automatic
+                    // indexing needs to wait for durable disk bookkeeping.
+                    if job.prefetch { diskWriter.sync {} }
                 } else {
                     remember(image, slot: job.second, directory: directory,
                              writeToDisk: currentDiskImage == nil)

@@ -320,7 +320,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let idleLabel = UILabel()
     private let seekTimeLabel = UILabel()
     private let previewLoadingLabel = UILabel()
-    private let previewStatusLabel = UILabel()
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
 
@@ -467,7 +466,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.alpha = 0
         link = media
         frameViews.first?.image = nil
-        previewStatusLabel.isHidden = true
         previewLoadingLabel.isHidden = true
         titleLabel.text = ""
         idleLabel.isHidden = true
@@ -1038,19 +1036,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.textAlignment = .center
         seekTimeLabel.alpha = 0
         view.addSubview(seekTimeLabel)
-        // A separate status label remains visible while the windowed
-        // thumbnail stays hidden until FFmpeg produces a real frame.
-        previewStatusLabel.translatesAutoresizingMaskIntoConstraints = false
-        previewStatusLabel.text = "Updating preview…"
-        previewStatusLabel.textAlignment = .center
-        previewStatusLabel.textColor = .white
-        previewStatusLabel.font = .systemFont(ofSize: 18, weight: .medium)
-        previewStatusLabel.layer.shadowColor = UIColor.black.cgColor
-        previewStatusLabel.layer.shadowRadius = 5
-        previewStatusLabel.layer.shadowOpacity = 0.85
-        previewStatusLabel.isHidden = true
-        view.addSubview(previewStatusLabel)
-
         // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
         picturePanel.backgroundColor = .clear
@@ -1162,9 +1147,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 multiplier: 0.62, constant: 0),
             seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
             seekTimeLabel.bottomAnchor.constraint(equalTo: filmStrip.topAnchor, constant: -10),
-            previewStatusLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
-            previewStatusLabel.topAnchor.constraint(equalTo: filmStrip.bottomAnchor, constant: 12),
-            previewStatusLabel.widthAnchor.constraint(lessThanOrEqualTo: filmStrip.widthAnchor),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
             picturePanel.widthAnchor.constraint(equalToConstant: 535),
@@ -1204,7 +1186,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         view.bringSubviewToFront(panel)
         view.bringSubviewToFront(cacheRateLabel)
         view.bringSubviewToFront(seekTimeLabel)
-        view.bringSubviewToFront(previewStatusLabel)
         view.bringSubviewToFront(picturePanel)
         view.bringSubviewToFront(trackPanel)
         view.bringSubviewToFront(statusLabel)
@@ -2152,7 +2133,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         filmStrip.alpha = 0
         seekTimeLabel.alpha = 0
         previewLoadingLabel.isHidden = true
-        previewStatusLabel.isHidden = true
         // Keep one previous image in memory across seek sessions for this
         // movie. New media still clears it in the open/start path.
         lastPreviewRequestedBucket = nil
@@ -2629,27 +2609,20 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewIsVisible = true
         filmStrip.alpha = 1
         previewLoadingLabel.isHidden = true
-        previewStatusLabel.isHidden = true
         seekTimeLabel.alpha = 1
         previewHideTimer?.invalidate()
         previewHideTimer = nil
         // Preserve the last successfully generated image across distant seeks.
-        // Its old time must not be relabelled as the new seek target; the
-        // status below the thumbnail communicates that we're updating.
+        // The new image replaces it as soon as the cached lookup or decode finishes.
 
         // The preview grid stays at twelve seconds inside the fast-forward
         // menu too. Moving the cursor within a cell must not decode more frames.
         let slot = max(0, (Int(seconds.rounded()) / 12) * 12)
-        // A cached exact 12s frame must never display the loading message.
-        // Cached frames on disk are indexed at session startup even before
-        // their JPEG has been decoded into RAM.
-        previewStatusLabel.isHidden = thumbs.hasCachedFrame(second: slot)
         if lastCacheLookupBucket != slot {
             lastCacheLookupBucket = slot
             if let hot = thumbs.cachedImage(second: slot) {
                 frameViews.first?.image = hot
                 lastPreviewImageSecond = slot
-                previewStatusLabel.isHidden = true
             } else {
                 let serial = currentPreviewSerial
                 thumbs.lookupCached(second: slot) { [weak self] image, foundSlot, exact in
@@ -2664,9 +2637,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     if exact, let image, let foundSlot {
                         self.frameViews.first?.image = image
                         self.lastPreviewImageSecond = foundSlot
-                        self.previewStatusLabel.isHidden = true
-                    } else if !self.thumbs.hasCachedFrame(second: slot) {
-                        self.previewStatusLabel.isHidden = false
                     }
                 }
             }
@@ -2707,7 +2677,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             frameViews.first?.image = cached
             lastPreviewImageSecond = slot
             lastPreviewRequestedBucket = slot
-            previewStatusLabel.isHidden = true
             return
         }
         // An exact disk hit is loaded asynchronously by scheduleFrames.
@@ -2738,9 +2707,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 // next interaction rather than sticking to this bucket.
                 self.lastPreviewRequestedBucket = nil
             }
-            // Stop showing "Updating preview" when the attempt completes.
             self.previewLoadingLabel.isHidden = true
-            self.previewStatusLabel.isHidden = true
         }
     }
 
@@ -2938,7 +2905,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.frameViews.first?.image = image
                     self.lastPreviewImageSecond = desired
                     self.filmStrip.alpha = 1
-                    self.previewStatusLabel.isHidden = true
                 }
                 PlayerStartupDiagnostics.mark("native-preview-frame-ready")
             } else {

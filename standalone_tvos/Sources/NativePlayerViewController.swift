@@ -318,9 +318,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let hdrBoostLabel = UILabel()
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
-    // Glass-like glyphs directly over the movie, without any surrounding box.
+    // Tiny translucent timestamp and spinner, placed together directly on
+    // the lower-right of the thumbnail; absolutely no glass backdrop or box.
+    private let seekTimeRow = UIStackView()
     private let seekTimeLabel = UILabel()
-    // Compact, native loading spinner beside the scrub timestamp.
     // Only active for a thumbnail slot not yet cached.
     private let seekPreviewSpinner = UIActivityIndicatorView(style: .medium)
     private let previewLoadingLabel = UILabel()
@@ -467,7 +468,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewHideTimer?.invalidate()
         previewIsVisible = false
         filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
+        seekTimeRow.alpha = 0
         link = media
         frameViews.first?.image = nil
         seekPreviewSpinner.stopAnimating()
@@ -1035,30 +1036,41 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             previewLoadingLabel.centerYAnchor.constraint(equalTo: preview.centerYAnchor)
         ])
         filmStrip.alpha = 0
-        // Only the TIMESTAMP glyphs receive the glass-like treatment. No
-        // blurred background, border, capsule, or tinted rectangle.
+        // Use translucent glyphs with a faint glass-like highlight.
+        // The row stays clear, without a capsule, blur panel or outline.
+        seekTimeRow.translatesAutoresizingMaskIntoConstraints = false
+        seekTimeRow.axis = .horizontal
+        seekTimeRow.alignment = .center
+        seekTimeRow.spacing = 2
+        seekTimeRow.distribution = .fill
+        seekTimeRow.backgroundColor = .clear
+        seekTimeRow.isUserInteractionEnabled = false
+        seekTimeRow.alpha = 0
+        view.addSubview(seekTimeRow)
+
         seekTimeLabel.translatesAutoresizingMaskIntoConstraints = false
-        seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 20, weight: .semibold)
-        seekTimeLabel.textColor = UIColor.white.withAlphaComponent(0.70)
-        seekTimeLabel.textAlignment = .center
+        seekTimeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
+        seekTimeLabel.textColor = UIColor.white.withAlphaComponent(0.50)
+        seekTimeLabel.textAlignment = .right
         seekTimeLabel.backgroundColor = .clear
         seekTimeLabel.isUserInteractionEnabled = false
         seekTimeLabel.layer.shadowColor = UIColor.black.cgColor
-        seekTimeLabel.layer.shadowOpacity = 0.35
-        seekTimeLabel.layer.shadowRadius = 2
+        seekTimeLabel.layer.shadowOpacity = 0.22
+        seekTimeLabel.layer.shadowRadius = 1.5
         seekTimeLabel.layer.shadowOffset = CGSize(width: 0, height: 1)
-        view.addSubview(seekTimeLabel)
+        seekTimeLabel.setContentCompressionResistancePriority(
+            .required, for: .horizontal)
+        seekTimeRow.addArrangedSubview(seekTimeLabel)
 
-        // Keep the spinner discreet: ~11pt visual diameter, to the RIGHT
-        // of the timestamp, and only while an uncached frame is loading.
+        // ~8pt visible diameter, keeping the existing uncached-only logic.
         seekPreviewSpinner.translatesAutoresizingMaskIntoConstraints = false
-        seekPreviewSpinner.color = UIColor.white.withAlphaComponent(0.66)
-        seekPreviewSpinner.transform = CGAffineTransform(scaleX: 0.56, y: 0.56)
+        seekPreviewSpinner.color = UIColor.white.withAlphaComponent(0.50)
+        seekPreviewSpinner.transform = CGAffineTransform(scaleX: 0.42, y: 0.42)
         seekPreviewSpinner.hidesWhenStopped = true
         seekPreviewSpinner.stopAnimating()
         seekPreviewSpinner.isUserInteractionEnabled = false
         seekPreviewSpinner.accessibilityLabel = "Loading seek thumbnail"
-        view.addSubview(seekPreviewSpinner)
+        seekTimeRow.addArrangedSubview(seekPreviewSpinner)
         // Retain the proven picture-controls panel.
         picturePanel.translatesAutoresizingMaskIntoConstraints = false
         picturePanel.backgroundColor = .clear
@@ -1168,13 +1180,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
                 multiplier: 0.62, constant: 0),
-            seekTimeLabel.centerXAnchor.constraint(equalTo: filmStrip.centerXAnchor),
-            seekTimeLabel.bottomAnchor.constraint(
-                equalTo: filmStrip.topAnchor, constant: -10),
-            seekPreviewSpinner.leadingAnchor.constraint(
-                equalTo: seekTimeLabel.trailingAnchor, constant: 2),
-            seekPreviewSpinner.centerYAnchor.constraint(
-                equalTo: seekTimeLabel.centerYAnchor),
+            // Bottom-right INSIDE the thumbnail. Trailing-anchor the entire
+            // row so the spinner stays within the 8pt right inset.
+            seekTimeRow.trailingAnchor.constraint(
+                equalTo: filmStrip.trailingAnchor, constant: -8),
+            seekTimeRow.bottomAnchor.constraint(
+                equalTo: filmStrip.bottomAnchor, constant: -8),
+            seekTimeRow.leadingAnchor.constraint(
+                greaterThanOrEqualTo: filmStrip.leadingAnchor, constant: 8),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
             picturePanel.widthAnchor.constraint(equalToConstant: 535),
@@ -1213,8 +1226,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // surface beneath it continues to receive presses and gestures.
         view.bringSubviewToFront(panel)
         view.bringSubviewToFront(cacheRateLabel)
-        view.bringSubviewToFront(seekTimeLabel)
-        view.bringSubviewToFront(seekPreviewSpinner)
+        view.bringSubviewToFront(seekTimeRow)
         view.bringSubviewToFront(picturePanel)
         view.bringSubviewToFront(trackPanel)
         view.bringSubviewToFront(statusLabel)
@@ -2160,7 +2172,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewHideTimer = nil
         previewIsVisible = false
         filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
+        seekTimeRow.alpha = 0
         seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
         // Keep one previous image in memory across seek sessions for this
@@ -2639,7 +2651,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         previewIsVisible = true
         filmStrip.alpha = 1
         previewLoadingLabel.isHidden = true
-        seekTimeLabel.alpha = 1
+        seekTimeRow.alpha = 1
         previewHideTimer?.invalidate()
         previewHideTimer = nil
         // Preserve the last successfully generated image across distant seeks.
@@ -3067,7 +3079,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         statusLabel.text = "Choose a stream from Nuvio"
         titleLabel.text = ""
         filmStrip.alpha = 0
-        seekTimeLabel.alpha = 0
+        seekTimeRow.alpha = 0
         seekPreviewSpinner.stopAnimating()
         showPanel()
     }
@@ -3328,14 +3340,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
               "  ·  " + ["8×", "20×", "50×", "110×", "240×"][lockedSpeedIndex] +
               "  ·  " + clockString(seconds)
             : clockString(seconds)
-        // Translucent frosted-white characters with a faint specular edge.
-        // Video remains visible around and between every glyph.
+        // Gentle translucent text highlight, never a glass BACKGROUND.
         seekTimeLabel.attributedText = NSAttributedString(
             string: seekTimestamp, attributes: [
-                .foregroundColor: UIColor.white.withAlphaComponent(0.67),
-                .strokeColor: UIColor.white.withAlphaComponent(0.33),
-                .strokeWidth: -0.8,
-                .kern: 0.1
+                .foregroundColor: UIColor.white.withAlphaComponent(0.50),
+                .strokeColor: UIColor.white.withAlphaComponent(0.18),
+                .strokeWidth: -0.55,
+                .kern: 0.05
             ])
     }
 

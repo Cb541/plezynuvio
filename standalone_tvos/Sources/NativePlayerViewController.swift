@@ -1180,12 +1180,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             NSLayoutConstraint(item: filmStrip, attribute: .bottom,
                 relatedBy: .equal, toItem: view, attribute: .bottom,
                 multiplier: 0.62, constant: 0),
-            // Bottom-right INSIDE the thumbnail. Trailing-anchor the entire
-            // row so the spinner stays within the 8pt right inset.
+            // Just OUTSIDE the thumbnail, tucked below its bottom-right
+            // edge. Keep the row in the root view (not the clipped preview).
             seekTimeRow.trailingAnchor.constraint(
                 equalTo: filmStrip.trailingAnchor, constant: -8),
-            seekTimeRow.bottomAnchor.constraint(
-                equalTo: filmStrip.bottomAnchor, constant: -8),
+            seekTimeRow.topAnchor.constraint(
+                equalTo: filmStrip.bottomAnchor, constant: 5),
             seekTimeRow.leadingAnchor.constraint(
                 greaterThanOrEqualTo: filmStrip.leadingAnchor, constant: 8),
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),

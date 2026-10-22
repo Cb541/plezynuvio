@@ -2146,9 +2146,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeLabel.alpha = 0
         previewLoadingLabel.isHidden = true
         previewStatusLabel.isHidden = true
-        frameViews.first?.image = nil
+        // Keep one previous image in memory across seek sessions for this
+        // movie. New media still clears it in the open/start path.
         lastPreviewRequestedBucket = nil
-        lastPreviewImageSecond = nil
         lastCacheLookupBucket = nil
         thumbs.cancel()
         currentPreviewSerial += 1

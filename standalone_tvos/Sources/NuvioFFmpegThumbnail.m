@@ -323,6 +323,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     NSString *_lastTimingSummary;
     NuvioPreviewTiming _timing;
     BOOL _usedRangeInput;
+    BOOL _foregroundProgressive;
 }
 
 - (NSString *)lastTimingSummary {
@@ -427,6 +428,24 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
                                         second:(int64_t)seconds
                                 timeoutSeconds:(double)timeoutSeconds
                                          token:(NuvioThumbnailAbortToken *)token {
+    _foregroundProgressive = NO;
+    return [self performKeyframeThumbnailForURL:url second:seconds
+                                  timeoutSeconds:timeoutSeconds token:token];
+}
+
+- (nullable UIImage *)foregroundKeyframeThumbnailForURL:(NSURL *)url
+                                                  second:(int64_t)seconds
+                                          timeoutSeconds:(double)timeoutSeconds
+                                                   token:(NuvioThumbnailAbortToken *)token {
+    _foregroundProgressive = YES;
+    return [self performKeyframeThumbnailForURL:url second:seconds
+                                  timeoutSeconds:timeoutSeconds token:token];
+}
+
+- (nullable UIImage *)performKeyframeThumbnailForURL:(NSURL *)url
+                                               second:(int64_t)seconds
+                                       timeoutSeconds:(double)timeoutSeconds
+                                                token:(NuvioThumbnailAbortToken *)token {
     _timing = (NuvioPreviewTiming){0};
     _usedRangeInput = _cachedInput != NULL;
     double started = CFAbsoluteTimeGetCurrent();
@@ -483,6 +502,8 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
             _format->interrupt_callback.opaque = &deadline;
 
             if ([self openCachedInput:url deadline:deadline]) {
+                nuvio_range_set_progressive(_cachedInput->ranges,
+                    _foregroundProgressive ? 1 : 0);
                 _format->pb = _cachedIO;
                 _format->flags |= AVFMT_FLAG_CUSTOM_IO;
             }
@@ -558,7 +579,11 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
         // starved by HTTP negotiation time on small remote files.
         deadline.deadline = CFAbsoluteTimeGetCurrent() +
             (keyframesOnly ? MAX(2.0, timeoutSeconds) : MAX(5.0, timeoutSeconds));
-        if (_cachedInput) _cachedInput->deadline = deadline;
+        if (_cachedInput) {
+            _cachedInput->deadline = deadline;
+            nuvio_range_set_progressive(_cachedInput->ranges,
+                _foregroundProgressive ? 1 : 0);
+        }
         // Frame dropping at the codec level prevents secondary 4K P/B-frame
         // decoding. This is essential to tvOS memory/thermal stability.
         _decoder->skip_frame = keyframesOnly ? AVDISCARD_NONKEY : AVDISCARD_DEFAULT;

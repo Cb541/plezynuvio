@@ -29,6 +29,12 @@ NS_ASSUME_NONNULL_BEGIN
                                         second:(int64_t)seconds
                                 timeoutSeconds:(double)timeoutSeconds
                                          token:(NuvioThumbnailAbortToken *)token;
+/// Foreground seek requests use progressive range delivery. Background
+/// ahead-indexing retains its tested completed-block caching behavior.
+- (nullable UIImage *)foregroundKeyframeThumbnailForURL:(NSURL *)url
+                                                  second:(int64_t)seconds
+                                          timeoutSeconds:(double)timeoutSeconds
+                                                   token:(NuvioThumbnailAbortToken *)token;
 - (void)reset;
 @end
 

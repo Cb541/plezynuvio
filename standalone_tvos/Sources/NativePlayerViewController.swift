@@ -774,12 +774,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if #available(tvOS 17.0, *),
            let layer = newCore.videoLayer {
             let renderer = layer.sampleBufferRenderer
+            // The native tap delivers on its private image-conversion queue.
+            // Capture only this thread-safe cache service, never the player
+            // controller or UIKit state: revealing the progress bar must not
+            // delay frame persistence on the main thread. The tap's own
+            // generation check stops callbacks from superseded playback.
+            let captureCache = thumbs
             frameTapInstalled = NuvioFrameTapStart(layer, renderer) {
-                [weak self, weak newCore] image, second in
-                guard let self, let newCore,
-                      self.playbackGeneration == generation,
-                      self.core === newCore else { return }
-                self.thumbs.cachePlaybackFrame(image, second: Int(second))
+                image, second in
+                captureCache.cachePlaybackFrame(image, second: Int(second))
             }
         }
         if !frameTapInstalled {

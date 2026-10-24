@@ -9,6 +9,20 @@ final class NuvioAppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
+        // Clear orphaned range/video previews from previous sessions or a
+        // forced termination. This never touches the durable history/artwork
+        // in NuvioPlaybackLibrary.
+        let fm = FileManager.default
+        for base in [FileManager.SearchPathDirectory.cachesDirectory,
+                     .applicationSupportDirectory] {
+            guard let root = fm.urls(for: base, in: .userDomainMask).first else { continue }
+            let seek = root.appendingPathComponent("NuvioSeekFrames", isDirectory: true)
+            try? fm.removeItem(at: seek)
+            if base == .cachesDirectory {
+                try? fm.removeItem(at: root.appendingPathComponent("NuvioPreviewRanges",
+                                                                 isDirectory: true))
+            }
+        }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
             try AVAudioSession.sharedInstance().setActive(true)

@@ -69,6 +69,11 @@ struct NativeStreamLink {
     let url: URL
     let title: String
     let subtitle: URL?
+    let contentId: String?
+    let videoId: String?
+    let artworkURL: URL?
+    let resumeSeconds: Double
+    let isHistoryLaunch: Bool
 
     init?(link: URL) {
         guard link.scheme?.lowercased() == "nuvio-player",
@@ -79,7 +84,19 @@ struct NativeStreamLink {
               ["https", "http"].contains(video.scheme?.lowercased() ?? ""),
               video.host != nil else { return nil }
         url = video
-        title = components.queryItems?.first(where: { ["title", "name"].contains($0.name) })?.value ?? "Now Playing"
+        let query = components.queryItems ?? []
+        title = query.first(where: { ["title", "name"].contains($0.name) })?.value ?? "Now Playing"
+        contentId = query.first(where: { $0.name == "contentId" })?.value
+        videoId = query.first(where: { $0.name == "videoId" })?.value
+        if let rawArt = query.first(where: { $0.name == "artwork" })?.value,
+           let art = URL(string: rawArt),
+           ["https", "http"].contains(art.scheme?.lowercased() ?? "") {
+            artworkURL = art
+        } else {
+            artworkURL = nil
+        }
+        resumeSeconds = max(0, Double(query.first(where: { $0.name == "resume" })?.value ?? "") ?? 0)
+        isHistoryLaunch = query.contains { $0.name == "history" && $0.value == "1" }
         if let value = components.queryItems?.first(where: { $0.name == "sub" })?.value,
            let subtitleURL = URL(string: value),
            ["https", "http"].contains(subtitleURL.scheme?.lowercased() ?? ""),

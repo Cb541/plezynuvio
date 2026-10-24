@@ -491,6 +491,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         updateThumbnailHorizontalPosition()
     }
 
+    // Recent tiles are real UIKit controls, not the playback RemoteSurface.
+    // They handle Select themselves; Back still returns to Nuvio.
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if link == nil, presses.contains(where: { $0.type == .menu }) {
+            returnToNuvio()
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         hasAppeared = true
@@ -531,6 +541,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         resumeOfferTimeout = nil
         resumeButton.isHidden = true
         remote.isHidden = false
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
         lastHistorySnapshot = .distantPast
         // Turn off the old renderer hook before its core is disposed.
         NuvioFrameTapStop()

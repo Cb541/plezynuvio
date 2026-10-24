@@ -113,7 +113,7 @@ final class SeekFrameService {
 
     func prepare(url: URL) {
         // Regenerate HDR/DV previews with corrected color handling.
-        let identity = SHA256.hash(data: Data(("preview-color-v2:" + url.absoluteString).utf8))
+        let identity = SHA256.hash(data: Data(("preview-color-v3:" + url.absoluteString).utf8))
             .map { String(format: "%02x", $0) }.joined()
         let fm = FileManager.default
         let root = fm.urls(for: .applicationSupportDirectory,
@@ -474,6 +474,10 @@ final class SeekFrameService {
     func clear() {
         cancel()
         lock.lock()
+        // Keep the artwork/history store, but capture the old playback
+        // directories before clearing their references.
+        let previousDirectory = scopedDirectory
+        let previousLegacyDirectory = legacyScopedDirectory
         cacheEpoch &+= 1
         sourceKey = nil
         scopedDirectory = nil
@@ -511,7 +515,17 @@ final class SeekFrameService {
             self?.aheadDecoder?.reset()
             self?.aheadDecoder = nil
         }
-        // Intentionally DO NOT delete stored previews.
+        // Perform deletion after all previously queued JPEG writes. The
+        // generation/epoch guards prevent any cancelled decode from
+        // repopulating these directories once playback has ended.
+        diskWriter.async {
+            if let directory = previousDirectory {
+                try? FileManager.default.removeItem(at: directory)
+            }
+            if let directory = previousLegacyDirectory {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
     }
 
     func request(url: URL, second: Int, allowSystemDecode: Bool = true,

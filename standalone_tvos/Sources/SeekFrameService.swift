@@ -70,6 +70,13 @@ final class SeekFrameService {
     private var indexPlayback = 0
     private var indexingSuspended = false
     private var aheadRetryAfter = Date.distantPast
+    // In-flight background decodes interrupted by the seek UI, or failed
+    // network reads, must never leave permanent 12-second thumbnail holes.
+    private struct AheadRetry {
+        let failures: Int
+        let eligibleAt: Date
+    }
+    private var aheadRetrySlots: [Int: AheadRetry] = [:]
     private var sourceKey: String?
     // Only the compressed JPEGs consume persistent disk; memory remains
     // bounded. These slot indices are loaded once and amended after writes.
@@ -146,6 +153,7 @@ final class SeekFrameService {
         indexSourceURL = nil
         indexPlayback = 0
         aheadRetryAfter = .distantPast
+        aheadRetrySlots.removeAll()
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -494,6 +502,7 @@ final class SeekFrameService {
         indexSourceURL = nil
         indexPlayback = 0
         aheadRetryAfter = .distantPast
+        aheadRetrySlots.removeAll()
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -571,6 +580,7 @@ final class SeekFrameService {
         let position = Int(playback)
         if indexSourceURL != url {
             indexPlan = NuvioAheadPlan()
+            aheadRetrySlots.removeAll()
             indexSourceURL = url
         }
         indexURL = url
@@ -579,17 +589,38 @@ final class SeekFrameService {
         scheduleWorkerLocked()
     }
 
-    // Called with lock held. Coarse coverage first, then dense coverage.
-    // The disk range cache reuses downloaded bytes on the refinement pass.
+    // Called with lock held. Fill consecutive 12s buckets and repair
+    // interrupted/failed slots with per-slot backoff. Prioritize holes near
+    // the current playback point, without letting an inaccessible distant
+    // frame stall the rest of ahead generation.
     private func nextIndexRequestLocked() -> Request? {
         guard let url = indexURL, !indexingSuspended,
               Date() >= aheadRetryAfter else { return nil }
+        let now = Date()
+        let retries = aheadRetrySlots.keys.sorted()
+        for slot in retries {
+            if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
+                aheadRetrySlots.removeValue(forKey: slot)
+                continue
+            }
+            if slot <= indexPlayback + 120,
+               let retry = aheadRetrySlots[slot], retry.eligibleAt <= now {
+                return Request(url: url, second: slot, prefetch: true,
+                               allowSystemDecode: true, keyframeOnly: true, callback: nil)
+            }
+        }
         while let slot = indexPlan.next() {
             if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
                 continue
             }
             return Request(url: url, second: slot, prefetch: true,
                            allowSystemDecode: true, keyframeOnly: true, callback: nil)
+        }
+        for slot in retries {
+            if let retry = aheadRetrySlots[slot], retry.eligibleAt <= now {
+                return Request(url: url, second: slot, prefetch: true,
+                               allowSystemDecode: true, keyframeOnly: true, callback: nil)
+            }
         }
         return nil
     }
@@ -684,8 +715,23 @@ final class SeekFrameService {
             }
 
             lock.lock()
-            let valid = generation == version && !token.cancelled
+            let samePlayback = generation == version
+            let valid = samePlayback && !token.cancelled
             let foregroundWaiting = pending != nil
+            if samePlayback && job.keyframeOnly && job.prefetch {
+                if valid && decoded != nil {
+                    aheadRetrySlots.removeValue(forKey: job.second)
+                } else {
+                    let oldFailures = aheadRetrySlots[job.second]?.failures ?? 0
+                    let failures = token.cancelled ? oldFailures : oldFailures + 1
+                    let delay = token.cancelled ? 0.5
+                        : min(20.0, Double(max(2, failures * 3)))
+                    aheadRetrySlots[job.second] = AheadRetry(
+                        failures: failures,
+                        eligibleAt: Date().addingTimeInterval(delay)
+                    )
+                }
+            }
             if valid && cached == nil && job.keyframeOnly {
                 previewTiming = aheadDecoder?.lastTimingSummary ?? ""
             }
@@ -731,7 +777,10 @@ final class SeekFrameService {
             lock.lock()
             isWorkerRunning = false
             if pending != nil || pendingBackground != nil ||
-               (indexURL != nil && indexPlan.hasPending && Date() >= aheadRetryAfter) {
+               (indexURL != nil && Date() >= aheadRetryAfter &&
+                (indexPlan.hasPending || aheadRetrySlots.values.contains {
+                    $0.eligibleAt <= Date()
+                })) {
                 scheduleWorkerLocked()
             }
             lock.unlock()

@@ -125,7 +125,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let historyHome = NuvioHistoryHomeView()
     private let resumeButton = UIButton(type: .system)
     private var offeredResumePosition = 0.0
-    // Cancelable five-second prompt, counted from playback becoming usable.
+    // Cancelable seven-second prompt, counted from playback becoming usable.
     private var resumeOfferTimeout: DispatchWorkItem?
     private var lastHistorySnapshot = Date.distantPast
     private var pendingLink: NativeStreamLink?
@@ -398,18 +398,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         var config = UIButton.Configuration.filled()
         config.title = "Resume?"
         config.cornerStyle = .capsule
-        config.baseBackgroundColor = UIColor(white: 0.17, alpha: 0.91)
+        config.baseBackgroundColor = .black
         config.baseForegroundColor = .white
         config.contentInsets = NSDirectionalEdgeInsets(top: 13, leading: 26, bottom: 13, trailing: 26)
         resumeButton.configuration = config
         resumeButton.accessibilityLabel = "Resume playback from your saved position"
         resumeButton.configurationUpdateHandler = { button in
             guard var style = button.configuration else { return }
-            style.baseBackgroundColor = button.isFocused
-                ? UIColor.white
-                : UIColor(white: 0.17, alpha: 0.92)
-            style.baseForegroundColor = button.isFocused ? .black : .white
+            // True OLED black with white lettering, even while focused.
+            style.baseBackgroundColor = .black
+            style.baseForegroundColor = .white
             button.configuration = style
+            // White focus stroke instead of inverting the black pill.
+            button.layer.borderColor = UIColor.white.cgColor
+            button.layer.borderWidth = button.isFocused ? 2 : 0
+            button.layer.cornerRadius = button.bounds.height / 2
         }
         resumeButton.translatesAutoresizingMaskIntoConstraints = false
         resumeButton.isHidden = true
@@ -428,9 +431,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     /// Show only after mpv has produced a frame and HDMI display-mode
-    /// negotiation has finished. The visible, focusable button gets five
+    /// negotiation has finished. The visible, focusable button gets seven
     /// seconds, not fifteen seconds of hidden/blocked startup time.
-    private func offerResumeForFiveSeconds() {
+    private func offerResumeForSevenSeconds() {
         guard link != nil, core != nil, offeredResumePosition >= 20 else { return }
         resumeOfferTimeout?.cancel()
         resumeButton.isHidden = false
@@ -444,7 +447,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             self.dismissResumeOffer()
         }
         resumeOfferTimeout = expiry
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: expiry)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.0, execute: expiry)
     }
 
     private func dismissResumeOffer() {
@@ -844,7 +847,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     }
                     self.statusLabel.text = ""
                     self.showPanel()
-                    self.offerResumeForFiveSeconds()
+                    self.offerResumeForSevenSeconds()
                     // Defer subtitles until after the video is running.
                     if self.permanentlyDisableSubtitles {
                         core.setProperty("sid", value: "no")

@@ -40,8 +40,10 @@ final class SeekFrameService {
         let callback: ((UIImage?) -> Void)?
     }
 
-    private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .utility)
-    private let diskWriter = DispatchQueue(label: "com.cb541.nuvio.seek-disk", qos: .utility)
+    private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .default)
+    // Avoid starving JPEG persistence behind tvOS focus/overlay animations;
+    // ahead indexing waits for this bounded writer before its next frame.
+    private let diskWriter = DispatchQueue(label: "com.cb541.nuvio.seek-disk", qos: .default)
     private let diskReader = DispatchQueue(label: "com.cb541.nuvio.seek-read",
                                             qos: .userInitiated)
     private let lock = NSLock()
@@ -68,8 +70,17 @@ final class SeekFrameService {
     private var indexPlan = NuvioAheadPlan()
     private var indexSourceURL: URL?
     private var indexPlayback = 0
+    private var lastIndexedPlayback: Int?
+    private var recoveryWindowStart = 0
     private var indexingSuspended = false
-    private var aheadRetryAfter = Date.distantPast
+    private var aheadRecovery = NuvioAheadRecovery()
+    // In-flight background decodes interrupted by the seek UI, or failed
+    // network reads, must never leave permanent 12-second thumbnail holes.
+    private struct AheadRetry {
+        let failures: Int
+        let eligibleAt: Date
+    }
+    private var aheadRetrySlots: [Int: AheadRetry] = [:]
     private var sourceKey: String?
     // Only the compressed JPEGs consume persistent disk; memory remains
     // bounded. These slot indices are loaded once and amended after writes.
@@ -113,7 +124,7 @@ final class SeekFrameService {
 
     func prepare(url: URL) {
         // Regenerate HDR/DV previews with corrected color handling.
-        let identity = SHA256.hash(data: Data(("preview-color-v2:" + url.absoluteString).utf8))
+        let identity = SHA256.hash(data: Data(("preview-color-v3:" + url.absoluteString).utf8))
             .map { String(format: "%02x", $0) }.joined()
         let fm = FileManager.default
         let root = fm.urls(for: .applicationSupportDirectory,
@@ -145,7 +156,10 @@ final class SeekFrameService {
         indexPlan = NuvioAheadPlan()
         indexSourceURL = nil
         indexPlayback = 0
-        aheadRetryAfter = .distantPast
+        lastIndexedPlayback = nil
+        recoveryWindowStart = 0
+        aheadRecovery.reset()
+        aheadRetrySlots.removeAll()
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -474,6 +488,10 @@ final class SeekFrameService {
     func clear() {
         cancel()
         lock.lock()
+        // Keep the artwork/history store, but capture the old playback
+        // directories before clearing their references.
+        let previousDirectory = scopedDirectory
+        let previousLegacyDirectory = legacyScopedDirectory
         cacheEpoch &+= 1
         sourceKey = nil
         scopedDirectory = nil
@@ -489,7 +507,10 @@ final class SeekFrameService {
         indexPlan = NuvioAheadPlan()
         indexSourceURL = nil
         indexPlayback = 0
-        aheadRetryAfter = .distantPast
+        lastIndexedPlayback = nil
+        recoveryWindowStart = 0
+        aheadRecovery.reset()
+        aheadRetrySlots.removeAll()
         cachedSlots.removeAll()
         recentDiskWrites.removeAll()
         deliveredFrames = 0
@@ -511,7 +532,17 @@ final class SeekFrameService {
             self?.aheadDecoder?.reset()
             self?.aheadDecoder = nil
         }
-        // Intentionally DO NOT delete stored previews.
+        // Perform deletion after all previously queued JPEG writes. The
+        // generation/epoch guards prevent any cancelled decode from
+        // repopulating these directories once playback has ended.
+        diskWriter.async {
+            if let directory = previousDirectory {
+                try? FileManager.default.removeItem(at: directory)
+            }
+            if let directory = previousLegacyDirectory {
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
     }
 
     func request(url: URL, second: Int, allowSystemDecode: Bool = true,
@@ -557,27 +588,118 @@ final class SeekFrameService {
         let position = Int(playback)
         if indexSourceURL != url {
             indexPlan = NuvioAheadPlan()
+            aheadRetrySlots.removeAll()
+            aheadRecovery.reset()
+            lastIndexedPlayback = nil
+            recoveryWindowStart = position
             indexSourceURL = url
         }
+        // Resumes and actual seeks should not cause 240 seconds of
+        // unrelated *pre-resume* frames to be decoded as missing playback.
+        // A normal Up/Down press does not seek or change this boundary.
+        if let previous = lastIndexedPlayback, abs(position - previous) > 25 {
+            recoveryWindowStart = position
+            aheadRecovery.reset()
+        } else if lastIndexedPlayback == nil {
+            recoveryWindowStart = position
+        }
+        lastIndexedPlayback = position
         indexURL = url
         indexPlayback = position
         indexPlan.update(playback: position, duration: Int(duration))
         scheduleWorkerLocked()
     }
 
-    // Called with lock held. Coarse coverage first, then dense coverage.
-    // The disk range cache reuses downloaded bytes on the refinement pass.
+    // This policy is deliberately independent of the player controls.
+    // Native playback can miss a 12-second frame if tvOS focus animations
+    // briefly interrupt its render tap. A missed past slot was never attempted
+    // by the 24s forward pass, so a retry queue alone cannot recover it.
+    // Repair completed playback buckets and failed ahead decodes without
+    // starving the fast coarse-first ahead plan.
     private func nextIndexRequestLocked() -> Request? {
-        guard let url = indexURL, !indexingSuspended,
-              Date() >= aheadRetryAfter else { return nil }
-        while let slot = indexPlan.next() {
-            if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
+        guard let url = indexURL, !indexingSuspended else { return nil }
+        let now = Date()
+
+        // Prune retries already written by the independent playback tap.
+        for slot in Array(aheadRetrySlots.keys) where
+            cachedSlots.contains(slot) || compressedFrames[slot] != nil {
+            aheadRetrySlots.removeValue(forKey: slot)
+        }
+
+        let makeRequest: (Int) -> Request = { slot in
+            Request(url: url, second: slot, prefetch: true,
+                    allowSystemDecode: true, keyframeOnly: true, callback: nil)
+        }
+        var repairSlot: Int?
+        // The native tap has had a full 12-second window to capture these.
+        // A hole here needs active backfill, even if no ahead decode ever
+        // attempted the slot. Only a bounded 240s window is scanned.
+        for slot in NuvioAheadRecovery.completedPastSlots(playback: indexPlayback)
+            where slot >= recoveryWindowStart {
+            guard !cachedSlots.contains(slot), compressedFrames[slot] == nil else {
                 continue
             }
-            return Request(url: url, second: slot, prefetch: true,
-                           allowSystemDecode: true, keyframeOnly: true, callback: nil)
+            if let retry = aheadRetrySlots[slot], retry.eligibleAt > now {
+                continue
+            }
+            repairSlot = slot
+            break
+        }
+        // Recover missed future slots too. The previous policy only retried
+        // positions near the current playhead, deferring interruptions far
+        // ahead until both full-video index passes were complete.
+        if repairSlot == nil {
+            repairSlot = aheadRetrySlots.keys.sorted().first { slot in
+                guard !cachedSlots.contains(slot), compressedFrames[slot] == nil,
+                      let retry = aheadRetrySlots[slot], retry.eligibleAt <= now else {
+                    return false
+                }
+                return true
+            }
+        }
+
+        if let repairSlot, aheadRecovery.shouldRepairBeforeForward {
+            NSLog("[NuvioAhead] Repair slot=%d playback=%d", repairSlot, indexPlayback)
+            aheadRecovery.didScheduleRepair()
+            return makeRequest(repairSlot)
+        }
+
+        while let slot = indexPlan.next() {
+            guard !cachedSlots.contains(slot), compressedFrames[slot] == nil else {
+                aheadRetrySlots.removeValue(forKey: slot)
+                continue
+            }
+            // A slot still cooling down after an earlier failure must not
+            // jump its per-slot timeout just because another pass visits it.
+            if let retry = aheadRetrySlots[slot], retry.eligibleAt > now {
+                continue
+            }
+            aheadRecovery.didScheduleForward()
+            return makeRequest(slot)
+        }
+        if let repairSlot {
+            NSLog("[NuvioAhead] Repair slot=%d playback=%d", repairSlot, indexPlayback)
+            aheadRecovery.didScheduleRepair()
+            return makeRequest(repairSlot)
         }
         return nil
+    }
+
+    // Important: never spin the background queue merely because playback
+    // has past slots. Reschedule only when a slot is genuinely missing and
+    // its retry delay has elapsed. New holes are detected on the 0.25s
+    // playback clock without coupling generation to the controls UI.
+    private func hasDueRepairLocked(now: Date) -> Bool {
+        for slot in NuvioAheadRecovery.completedPastSlots(playback: indexPlayback)
+            where slot >= recoveryWindowStart {
+            if cachedSlots.contains(slot) || compressedFrames[slot] != nil { continue }
+            if let retry = aheadRetrySlots[slot], retry.eligibleAt > now { continue }
+            return true
+        }
+        return aheadRetrySlots.contains { slot, retry in
+            retry.eligibleAt <= now &&
+            !cachedSlots.contains(slot) && compressedFrames[slot] == nil
+        }
     }
 
     func pauseAheadIndex() {
@@ -670,8 +792,25 @@ final class SeekFrameService {
             }
 
             lock.lock()
-            let valid = generation == version && !token.cancelled
+            let samePlayback = generation == version
+            let valid = samePlayback && !token.cancelled
             let foregroundWaiting = pending != nil
+            if samePlayback && job.keyframeOnly && job.prefetch {
+                if valid && decoded != nil {
+                    aheadRetrySlots.removeValue(forKey: job.second)
+                } else {
+                    let oldFailures = aheadRetrySlots[job.second]?.failures ?? 0
+                    let failures = token.cancelled ? oldFailures : oldFailures + 1
+                    // Only this failed slot backs off. A temporary timeout
+                    // while controls animate must not pause *all* ahead work.
+                    let delay = token.cancelled ? 0.5
+                        : min(60.0, Double(3 * (1 << min(5, failures))))
+                    aheadRetrySlots[job.second] = AheadRetry(
+                        failures: failures,
+                        eligibleAt: Date().addingTimeInterval(delay)
+                    )
+                }
+            }
             if valid && cached == nil && job.keyframeOnly {
                 previewTiming = aheadDecoder?.lastTimingSummary ?? ""
             }
@@ -680,13 +819,10 @@ final class SeekFrameService {
                 aheadLastSeconds = Date().timeIntervalSince(startedAt)
                 if decoded == nil {
                     aheadFailures += 1
-                    // Retry transient network/codec failures on a later tick;
-                    // never permanently disable indexing for the entire movie.
-                    aheadRetryAfter = Date().addingTimeInterval(
-                        min(5.0, Double(aheadFailures)))
+                    // Do not impose a global 1-5 second hold on the entire
+                    // ahead worker; per-slot backoff above handles failures.
                 } else {
                     aheadFailures = 0
-                    aheadRetryAfter = .distantPast
                 }
                 // Retain the demuxer/HTTP connection. AVFrame and AVPacket
                 // references are released by the bridge after every sample.
@@ -717,7 +853,8 @@ final class SeekFrameService {
             lock.lock()
             isWorkerRunning = false
             if pending != nil || pendingBackground != nil ||
-               (indexURL != nil && indexPlan.hasPending && Date() >= aheadRetryAfter) {
+               (indexURL != nil && !indexingSuspended &&
+                (indexPlan.hasPending || hasDueRepairLocked(now: Date()))) {
                 scheduleWorkerLocked()
             }
             lock.unlock()

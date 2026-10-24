@@ -1,0 +1,41 @@
+name: Export standalone Nuvio tvOS source
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/tvos-resume-recent-gallery-focus
+    paths:
+      - '.github/workflows/export-native-tvos-source.yml'
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive complete standalone player sources
+        run: |
+          set -euo pipefail
+          cat > README-SOURCE.txt <<'EOF'
+          Nuvio native tvOS standalone player source.
+          Standalone tvOS target: standalone_tvos/
+          Supporting native mpv cores: shared/apple/MpvPlayer/ and ios/Runner/MpvPlayer/MpvPlayerCore.swift
+          Generate icon assets: python3 standalone_tvos/tools/generate_app_icon.py
+          Generate project: cd standalone_tvos && xcodegen generate --spec project.yml
+          Build workflow reference: .github/workflows/native-apple-tv.yml
+          Depends on MPVKit from mpv-build, as declared in standalone_tvos/project.yml.
+          EOF
+          zip -qry Nuvio-Standalone-Player-Source.zip \
+            standalone_tvos \
+            shared/apple/MpvPlayer \
+            ios/Runner/MpvPlayer/MpvPlayerCore.swift \
+            .github/workflows/native-apple-tv.yml \
+            README-SOURCE.txt
+          unzip -t Nuvio-Standalone-Player-Source.zip | tail -1
+      - name: Upload source ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nuvio-Standalone-Player-Source
+          path: Nuvio-Standalone-Player-Source.zip
+          retention-days: 30
+          if-no-files-found: error

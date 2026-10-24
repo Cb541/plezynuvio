@@ -17,6 +17,28 @@ struct NuvioHistoryItem: Codable, Hashable {
     var isInProgress: Bool {
         position >= 20 && duration > 0 && position / duration < 0.90
     }
+
+    /// Stremio series episodes use <imdb>:<season>:<episode>.
+    /// Avoid treating an ordinary movie with an IMDb ID as a television series.
+    var episodeNumbers: (season: Int, episode: Int)? {
+        guard let videoId else { return nil }
+        let parts = videoId.split(separator: ":")
+        guard parts.count >= 3,
+              let season = Int(parts[parts.count - 2]),
+              let episode = Int(parts[parts.count - 1]),
+              (0...100).contains(season), (1...500).contains(episode)
+        else { return nil }
+        return (season, episode)
+    }
+
+    var seriesIMDbId: String? {
+        guard episodeNumbers != nil else { return nil }
+        return [contentId, videoId].compactMap { raw in
+            guard let raw, let match = raw.range(
+                of: #"tt[0-9]{5,12}"#, options: .regularExpression) else { return nil }
+            return String(raw[match])
+        }.first
+    }
 }
 
 final class NuvioPlaybackLibrary {
@@ -33,8 +55,12 @@ final class NuvioPlaybackLibrary {
     private var artworkActiveURLs: [String: String] = [:]
     private var artworkAlternates: [String: [URL]] = [:]
     private var artworkFailedURL: [String: String] = [:]
-    // Show decoded images immediately, regardless of file-system write errors.
+    // Keep each artwork tier separate: a late-arriving series poster must not
+    // overwrite an already available poster from the correct season.
     private var liveArtwork: [String: UIImage] = [:]
+    private var seasonArtworkByIMDb: [String: [Int: URL]] = [:]
+    private var seasonMetadataInFlight = Set<String>()
+    private var seasonMetadataRetryAt: [String: Date] = [:]
     private var artworkDiagnostics: [String: String] = [:]
 
     func artworkStatus(for entry: NuvioHistoryItem) -> String {
@@ -83,7 +109,7 @@ final class NuvioPlaybackLibrary {
            incomingArtwork != existing?.artworkURL {
             let cached = artRoot.appendingPathComponent("provided-" + id + ".jpg")
             try? fm.removeItem(at: cached)
-            liveArtwork.removeValue(forKey: id)
+            liveArtwork.removeValue(forKey: "provided:" + id)
             artworkDiagnostics.removeValue(forKey: id)
         }
         items.removeAll { $0.id == id }
@@ -102,6 +128,7 @@ final class NuvioPlaybackLibrary {
             fetchArtwork(url, id: id, variant: "provided")
         }
         if let entry = items.first(where: { $0.id == id }) {
+            fetchSeasonPoster(for: entry)
             fetchMetadataPoster(for: entry)
         }
     }
@@ -131,25 +158,27 @@ final class NuvioPlaybackLibrary {
             if let raw = entry.artworkURL, let url = URL(string: raw) {
                 fetchArtwork(url, id: entry.id, variant: "provided")
             }
+            fetchSeasonPoster(for: entry)
             fetchMetadataPoster(for: entry)
         }
     }
 
     func artwork(for entry: NuvioHistoryItem) -> UIImage? {
-        // Memory first: never require a file-system round trip before UIKit
-        // can display a successfully downloaded and decoded poster.
-        if let live = liveArtwork[entry.id] { return live }
-        // A portrait poster should win over a landscape backdrop or an
-        // opportunistic seek frame. Preserve the legacy JPEG as a last resort.
-        for filename in ["poster-" + entry.id + ".jpg",
-                         "provided-" + entry.id + ".jpg",
-                         entry.id + ".jpg"] {
-            if let image = UIImage(contentsOfFile:
-                artRoot.appendingPathComponent(filename).path) {
-                return image
-            }
+        // Correct season > series poster > handoff poster > episode still
+        // > saved playback frame. Keep identical precedence for decoded
+        // in-memory images and persisted JPEGs, independent of arrival order.
+        let variants = entry.episodeNumbers != nil
+            ? ["season", "poster", "provided", "episode"]
+            : ["poster", "provided"]
+        for variant in variants {
+            let key = variant + ":" + entry.id
+            if let image = liveArtwork[key] { return image }
+            let path = artRoot.appendingPathComponent(
+                variant + "-" + entry.id + ".jpg").path
+            if let image = UIImage(contentsOfFile: path) { return image }
         }
-        return nil
+        return UIImage(contentsOfFile:
+            artRoot.appendingPathComponent(entry.id + ".jpg").path)
     }
 
     func openLink(for entry: NuvioHistoryItem) -> NativeStreamLink? {
@@ -198,7 +227,8 @@ final class NuvioPlaybackLibrary {
     private func fetchArtwork(_ url: URL, id: String, variant: String) {
         guard let scheme = url.scheme?.lowercased(),
               ["https", "http"].contains(scheme),
-              url.host != nil, ["poster", "provided"].contains(variant) else {
+              url.host != nil,
+              ["season", "poster", "provided", "episode"].contains(variant) else {
             updateArtworkStatus("Poster URL invalid", id: id)
             return
         }
@@ -268,7 +298,7 @@ final class NuvioPlaybackLibrary {
                 self.artworkRetryAt.removeValue(forKey: lookupKey)
                 self.artworkFailedURL.removeValue(forKey: lookupKey)
                 self.artworkAlternates.removeValue(forKey: lookupKey)
-                self.liveArtwork[id] = image
+                self.liveArtwork[lookupKey] = image
                 self.updateArtworkStatus("Poster decoded", id: id)
                 self.savePoster(image, id: id, variant: variant)
                 NSLog("[NuvioArt] Image cached type=%@ host=%@",

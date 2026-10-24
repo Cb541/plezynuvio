@@ -83,6 +83,8 @@ final class NuvioPlaybackLibrary {
            incomingArtwork != existing?.artworkURL {
             let cached = artRoot.appendingPathComponent("provided-" + id + ".jpg")
             try? fm.removeItem(at: cached)
+            liveArtwork.removeValue(forKey: id)
+            artworkDiagnostics.removeValue(forKey: id)
         }
         items.removeAll { $0.id == id }
         items.insert(NuvioHistoryItem(id: id, title: media.title,
@@ -520,7 +522,8 @@ final class NuvioHistoryHomeView: UIView {
         } else {
             for item in all {
                 let card = NuvioHistoryTile(item: item,
-                    artwork: NuvioPlaybackLibrary.shared.artwork(for: item))
+                    artwork: NuvioPlaybackLibrary.shared.artwork(for: item),
+                    status: NuvioPlaybackLibrary.shared.artworkStatus(for: item))
                 card.onClick = { [weak self] in self?.onSelect?(item) }
                 tiles.addArrangedSubview(card)
                 cards[item.id] = card
@@ -531,7 +534,10 @@ final class NuvioHistoryHomeView: UIView {
 
     private func refreshArtwork() {
         for item in NuvioPlaybackLibrary.shared.items {
-            cards[item.id]?.updateArtwork(NuvioPlaybackLibrary.shared.artwork(for: item))
+            cards[item.id]?.updateArtwork(
+                NuvioPlaybackLibrary.shared.artwork(for: item),
+                status: NuvioPlaybackLibrary.shared.artworkStatus(for: item)
+            )
         }
     }
 }
@@ -540,10 +546,11 @@ private final class NuvioHistoryTile: UIButton {
     var onClick: (() -> Void)?
     private let art = UIImageView()
     private let placeholder = UILabel()
+    private let posterStatus = UILabel()
 
     override var canBecomeFocused: Bool { true }
 
-    init(item: NuvioHistoryItem, artwork: UIImage?) {
+    init(item: NuvioHistoryItem, artwork: UIImage?, status: String) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         backgroundColor = .clear
@@ -577,6 +584,16 @@ private final class NuvioHistoryTile: UIButton {
         placeholder.isUserInteractionEnabled = false
         poster.addSubview(placeholder)
 
+        // Temporary small diagnostics, visible only on blank poster cards.
+        // No signed URLs, stream secrets, or file paths are displayed.
+        posterStatus.translatesAutoresizingMaskIntoConstraints = false
+        posterStatus.font = .systemFont(ofSize: 14, weight: .medium)
+        posterStatus.textColor = UIColor.white.withAlphaComponent(0.66)
+        posterStatus.numberOfLines = 2
+        posterStatus.textAlignment = .center
+        posterStatus.isUserInteractionEnabled = false
+        poster.addSubview(posterStatus)
+
         let title = UILabel()
         let parts = item.videoId?.split(separator: ":") ?? []
         let episodeSuffix: String
@@ -607,6 +624,9 @@ private final class NuvioHistoryTile: UIButton {
             placeholder.leadingAnchor.constraint(equalTo: poster.leadingAnchor, constant: 16),
             placeholder.trailingAnchor.constraint(equalTo: poster.trailingAnchor, constant: -16),
             placeholder.centerYAnchor.constraint(equalTo: poster.centerYAnchor),
+            posterStatus.leadingAnchor.constraint(equalTo: poster.leadingAnchor, constant: 12),
+            posterStatus.trailingAnchor.constraint(equalTo: poster.trailingAnchor, constant: -12),
+            posterStatus.bottomAnchor.constraint(equalTo: poster.bottomAnchor, constant: -18),
             title.topAnchor.constraint(equalTo: poster.bottomAnchor, constant: 12),
             title.leadingAnchor.constraint(equalTo: leadingAnchor),
             title.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -627,14 +647,16 @@ private final class NuvioHistoryTile: UIButton {
             ])
         }
         addTarget(self, action: #selector(tapped), for: .primaryActionTriggered)
-        updateArtwork(artwork)
+        updateArtwork(artwork, status: status)
     }
 
     required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
 
-    func updateArtwork(_ image: UIImage?) {
+    func updateArtwork(_ image: UIImage?, status: String) {
         art.image = image
         placeholder.isHidden = image != nil
+        posterStatus.isHidden = image != nil
+        posterStatus.text = image == nil ? status : nil
     }
 
     @objc private func tapped() { onClick?() }

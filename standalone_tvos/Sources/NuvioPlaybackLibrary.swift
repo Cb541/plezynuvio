@@ -130,6 +130,7 @@ final class NuvioPlaybackLibrary {
         if let entry = items.first(where: { $0.id == id }) {
             fetchSeasonPoster(for: entry)
             fetchMetadataPoster(for: entry)
+            fetchEpisodeStillIfNeeded(for: entry)
         }
     }
 
@@ -160,6 +161,7 @@ final class NuvioPlaybackLibrary {
             }
             fetchSeasonPoster(for: entry)
             fetchMetadataPoster(for: entry)
+            fetchEpisodeStillIfNeeded(for: entry)
         }
     }
 
@@ -334,6 +336,126 @@ final class NuvioPlaybackLibrary {
             }
         } catch {
             updateArtworkStatus("Poster decoded; disk write failed", id: id)
+        }
+    }
+
+    /// Fetch season-level key art by exact IMDb identity, without requiring
+    /// a TMDB API key or another main Nuvio installation. TVmaze's public
+    /// lookup redirects to the exact series and its seasons carry poster URLs.
+    /// Per-show requests are shared across the episode history cards.
+    private func fetchSeasonPoster(for entry: NuvioHistoryItem) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.fetchSeasonPoster(for: entry)
+            }
+            return
+        }
+        guard let imdb = entry.seriesIMDbId,
+              let season = entry.episodeNumbers?.season else { return }
+        let path = artRoot.appendingPathComponent("season-" + entry.id + ".jpg").path
+        if liveArtwork["season:" + entry.id] != nil ||
+           UIImage(contentsOfFile: path) != nil { return }
+        if let posters = seasonArtworkByIMDb[imdb] {
+            if let url = posters[season] {
+                fetchArtwork(url, id: entry.id, variant: "season")
+            }
+            return
+        }
+        if seasonMetadataInFlight.contains(imdb) { return }
+        if let retryAt = seasonMetadataRetryAt[imdb], retryAt > Date() { return }
+        seasonMetadataInFlight.insert(imdb)
+
+        guard let url = URL(string: "https://api.tvmaze.com/lookup/shows?imdb=" + imdb)
+        else { seasonMetadataInFlight.remove(imdb); return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        request.setValue("NuvioAppleTV/1.0 (season poster library)",
+                         forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard error == nil, (200...299).contains(status),
+                  let data,
+                  let show = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let showId = show["id"] as? Int, showId > 0,
+                  let returned = show["externals"] as? [String: Any],
+                  let matched = returned["imdb"] as? String,
+                  matched == imdb else {
+                DispatchQueue.main.async {
+                    self?.seasonLookupFailed(imdb: imdb, status: status)
+                }
+                return
+            }
+            self?.fetchTVMazeSeasons(imdb: imdb, showId: showId)
+        }.resume()
+    }
+
+    private func fetchTVMazeSeasons(imdb: String, showId: Int) {
+        guard let url = URL(string:
+            "https://api.tvmaze.com/shows/" + String(showId) + "/seasons")
+        else {
+            DispatchQueue.main.async { [weak self] in
+                self?.seasonLookupFailed(imdb: imdb, status: 0)
+            }
+            return
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        request.setValue("NuvioAppleTV/1.0 (season poster library)",
+                         forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard error == nil, (200...299).contains(status),
+                  let data,
+                  let seasons = try? JSONSerialization.jsonObject(with: data)
+                    as? [[String: Any]] else {
+                DispatchQueue.main.async {
+                    self?.seasonLookupFailed(imdb: imdb, status: status)
+                }
+                return
+            }
+            var posters: [Int: URL] = [:]
+            for info in seasons {
+                guard let number = info["number"] as? Int,
+                      (0...100).contains(number),
+                      let image = info["image"] as? [String: Any],
+                      let raw = (image["original"] as? String) ??
+                          (image["medium"] as? String),
+                      let url = URL(string: raw), url.scheme == "https",
+                      let host = url.host?.lowercased(),
+                      host == "tvmaze.com" || host.hasSuffix(".tvmaze.com")
+                else { continue }
+                posters[number] = url
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.seasonMetadataInFlight.remove(imdb)
+                self.seasonMetadataRetryAt.removeValue(forKey: imdb)
+                self.seasonArtworkByIMDb[imdb] = posters
+                // A single show lookup populates all recent episodes from it.
+                for item in self.items where item.seriesIMDbId == imdb {
+                    self.fetchSeasonPoster(for: item)
+                }
+            }
+        }.resume()
+    }
+
+    private func seasonLookupFailed(imdb: String, status: Int) {
+        seasonMetadataInFlight.remove(imdb)
+        // Bounded retry, while the existing series/episode poster remains.
+        seasonMetadataRetryAt[imdb] = Date().addingTimeInterval(90)
+        NSLog("[NuvioArt] Season artwork lookup unavailable HTTP=%ld", status)
+    }
+
+    /// Fallback thumbnail from the episode metadata CDN. It never replaces
+    /// an existing series poster, and a later season poster always wins.
+    private func fetchEpisodeStillIfNeeded(for entry: NuvioHistoryItem) {
+        guard let imdb = entry.seriesIMDbId,
+              let numbers = entry.episodeNumbers,
+              artwork(for: entry) == nil else { return }
+        let endpoint = "https://episodes.metahub.space/" + imdb + "/" +
+            String(numbers.season) + "/" + String(numbers.episode) + "/w780.jpg"
+        if let url = URL(string: endpoint) {
+            fetchArtwork(url, id: entry.id, variant: "episode")
         }
     }
 
@@ -613,7 +735,7 @@ private final class NuvioHistoryTile: UIButton {
         let poster = UIView()
         poster.translatesAutoresizingMaskIntoConstraints = false
         poster.backgroundColor = UIColor(red: 0.10, green: 0.13, blue: 0.20, alpha: 1)
-        poster.layer.cornerRadius = 8
+        poster.layer.cornerRadius = 9
         poster.clipsToBounds = true
         poster.isUserInteractionEnabled = false
         addSubview(poster)

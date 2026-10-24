@@ -129,6 +129,22 @@ static bool nuvioNeedsNativeDVPreview(const AVCodecParameters *params) {
     return config->dv_profile == 5;
 }
 
+// A P7/P8.x Dolby Vision file is often missing HDR10 base-layer colour
+// tags in the selected MKV stream. Its decoded base is nevertheless
+// Rec.2020/PQ. Treating those samples as SDR creates very dark or false
+// coloured JPEGs. Profile 5 must still use native sample capture instead.
+static bool nuvioHasHDRCompatibleDolbyBase(const AVCodecParameters *params) {
+    if (!params) return false;
+    const AVPacketSideData *dovi = av_packet_side_data_get(
+        params->coded_side_data, params->nb_coded_side_data,
+        AV_PKT_DATA_DOVI_CONF);
+    if (!dovi || dovi->size < sizeof(AVDOVIDecoderConfigurationRecord))
+        return false;
+    const AVDOVIDecoderConfigurationRecord *config =
+        (const AVDOVIDecoderConfigurationRecord *)dovi->data;
+    return config->dv_profile == 7 || config->dv_profile == 8;
+}
+
 static inline uint8_t nuvioTonePixel(float nits, const uint8_t *lut) {
     int index = (int)fminf(4095.0f, fmaxf(0.0f, nits) + 0.5f);
     return lut[index];
@@ -142,9 +158,12 @@ static void nuvioToneMapHDR(const uint16_t *source, int sourceStride,
     uint8_t display[4096];
     for (int i = 0; i < 4096; ++i) {
         linear[i] = nuvioHDRNits((float)i / 4095.0f, trc);
-        // A gentler 90-nit shoulder keeps shadow/mid-tone detail visible on
-        // the SDR seek thumbnail without raising the active DV/HDR movie.
-        float compressed = (float)i / ((float)i + 90.0f);
+        // Per-thumbnail shadow lift: the normal native DV renderer has
+        // metadata-driven trims which this independent FFmpeg JPEG path
+        // cannot apply. Preserve black (0 stays 0), brighten the shadow
+        // toe gently, and roll off the highlights for SDR UI composition.
+        float lifted = 1.30f * powf((float)i, 0.94f);
+        float compressed = lifted / (lifted + 85.0f);
         float srgb = compressed <= 0.0031308f ? compressed * 12.92f
             : 1.055f * powf(compressed, 1.0f / 2.4f) - 0.055f;
         display[i] = (uint8_t)lrintf(255.0f * fminf(1.0f, fmaxf(0.0f, srgb)));
@@ -199,16 +218,23 @@ static UIImage *nuvioMakeImage(AVFrame *frame,
     const int width = 640;
     const int height = MAX(2, (int)lrint((double)frame->height * width / frame->width) & ~1);
     if (height > 1200) return nil;
+    const bool dolbyHDRBase = nuvioHasHDRCompatibleDolbyBase(sourceParameters);
     enum AVColorTransferCharacteristic trc = frame->color_trc;
     if (trc == AVCOL_TRC_UNSPECIFIED && sourceParameters)
         trc = sourceParameters->color_trc;
+    if (trc == AVCOL_TRC_UNSPECIFIED && dolbyHDRBase)
+        trc = AVCOL_TRC_SMPTE2084;
     const bool hdr = trc == AVCOL_TRC_SMPTE2084 || trc == AVCOL_TRC_ARIB_STD_B67;
     enum AVColorPrimaries primaries = frame->color_primaries;
     if (primaries == AVCOL_PRI_UNSPECIFIED && sourceParameters)
         primaries = sourceParameters->color_primaries;
+    if (primaries == AVCOL_PRI_UNSPECIFIED && dolbyHDRBase)
+        primaries = AVCOL_PRI_BT2020;
     enum AVColorSpace matrix = frame->colorspace;
     if (matrix == AVCOL_SPC_UNSPECIFIED && sourceParameters)
         matrix = sourceParameters->color_space;
+    if (matrix == AVCOL_SPC_UNSPECIFIED && dolbyHDRBase)
+        matrix = AVCOL_SPC_BT2020_NCL;
     const int stride = width * 4;
     const int convertStride = width * (hdr ? 8 : 4);
     uint8_t *converted = av_malloc((size_t)convertStride * height);

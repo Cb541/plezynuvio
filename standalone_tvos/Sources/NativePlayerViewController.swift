@@ -3283,11 +3283,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             isTouchScrubbing || targetSeconds != nil ||
             toolbarFocused || toolPanel != .none
         )
-        // During normal playback, Down may reveal Audio / CC / Info, but
-        // the timeline remains hidden. Progress is ONLY visible when paused
-        // or in a locked/paused-scrub state.
+        // Down focuses the toolbar during active playback. Show the
+        // progress bar, cached segments, playhead and timestamps alongside
+        // those controls, without pausing playback or opening seek preview.
+        // Auto-hide and Back still dismiss the complete playback chrome.
         let showTimeline = core != nil && (!playing ||
-            lockedSeekDirection != 0 || isTouchScrubbing)
+            lockedSeekDirection != 0 || isTouchScrubbing || toolbarFocused)
         controlsVisible = hasPlayerControls
         panel.isHidden = !hasPlayerControls
         progress.isHidden = !showTimeline

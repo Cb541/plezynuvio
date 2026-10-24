@@ -55,6 +55,14 @@ final class NuvioPlaybackLibrary {
     func opened(_ media: NativeStreamLink) {
         let id = identifier(for: media)
         let existing = items.first { $0.id == id }
+        // A legacy Nuvio handoff might have cached a landscape backdrop.
+        // When Nuvio starts sending the real portrait poster, discard that
+        // old provided image so its file-exists check doesn't block refresh.
+        if let incomingArtwork = media.artworkURL?.absoluteString,
+           incomingArtwork != existing?.artworkURL {
+            let cached = artRoot.appendingPathComponent("provided-" + id + ".jpg")
+            try? fm.removeItem(at: cached)
+        }
         items.removeAll { $0.id == id }
         items.insert(NuvioHistoryItem(id: id, title: media.title,
             videoId: media.videoId, contentId: media.contentId,
@@ -160,7 +168,11 @@ final class NuvioPlaybackLibrary {
     /// Fetch Nuvio's poster/backdrop, using separate files so a landscape
     /// image cannot permanently block a better portrait poster.
     private func fetchArtwork(_ url: URL, id: String, variant: String) {
-        guard url.scheme?.lowercased() == "https",
+        // The deep-link parser already accepts both HTTP and HTTPS.
+        // Keep artwork fetching consistent; an HTTP CDN URL must not
+        // silently become an empty poster (ATS is allowed by project.yml).
+        guard let scheme = url.scheme?.lowercased(),
+              ["https", "http"].contains(scheme),
               url.host != nil, ["poster", "provided"].contains(variant) else { return }
         let destination = artRoot.appendingPathComponent(variant + "-" + id + ".jpg")
         guard !fm.fileExists(atPath: destination.path) else { return }

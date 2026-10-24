@@ -379,20 +379,37 @@ final class NuvioPlaybackLibrary {
                 "/top/search=" + encoded + ".json") else { return }
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 12
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            guard let self, let data, let response = response as? HTTPURLResponse,
-                  (200...299).contains(response.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let metas = json["metas"] as? [[String: Any]] else { return }
-            let match = metas.first {
-                guard let candidate = $0["name"] as? String else { return false }
-                return candidate.compare(clean, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
-            }
-            if let poster = match?["poster"] as? String,
-               let url = URL(string: poster) {
-                self.fetchArtwork(url, id: id, variant: "poster")
-            } else if category == "movie" {
-                self.fetchTitleMatchedPoster(title: clean, id: id, category: "series")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard error == nil, (200...299).contains(status),
+                      let data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let metas = json["metas"] as? [[String: Any]] else {
+                    let info = error.map { "Network error " + String(($0 as NSError).code) }
+                        ?? "HTTP " + String(status)
+                    self.updateArtworkStatus("Title search: " + info, id: id)
+                    // If a movie search returns nothing, a show still may be
+                    // found through the series catalog.
+                    if category == "movie" {
+                        self.fetchTitleMatchedPoster(title: clean, id: id, category: "series")
+                    }
+                    return
+                }
+                let match = metas.first {
+                    guard let candidate = $0["name"] as? String else { return false }
+                    return candidate.compare(clean,
+                        options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+                }
+                if let poster = match?["poster"] as? String,
+                   let url = URL(string: poster) {
+                    self.fetchArtwork(url, id: id, variant: "poster")
+                } else if category == "movie" {
+                    self.fetchTitleMatchedPoster(title: clean, id: id, category: "series")
+                } else {
+                    self.updateArtworkStatus("No exact title match in Cinemeta", id: id)
+                }
             }
         }.resume()
     }

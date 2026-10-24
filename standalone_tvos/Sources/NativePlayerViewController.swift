@@ -960,11 +960,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 } else if self.currentSeconds < 2 {
                     self.statusLabel.text = "The stream ended or could not load"
                     self.showPanel()
-                } else if reason == 0,
-                          self.totalSeconds > 0,
-                          self.currentSeconds / self.totalSeconds >= 0.90 {
-                    // Natural end of a completed movie returns to the library.
-                    self.leavePlayback()
+                } else if reason == 0 {
+                    // A successful EOF always returns to the library, while
+                    // marking the item watched even with rounded time-pos.
+                    self.leavePlayback(naturalEnd: true)
                 }
             default: break
             }
@@ -3106,8 +3105,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
-    private func leavePlayback() {
-        saveHistorySnapshot()
+    private func leavePlayback(naturalEnd: Bool = false) {
+        saveHistorySnapshot(finishing: naturalEnd)
         stopPreviewArrowHold()
         NuvioFrameTapStop()
         frameTapInstalled = false

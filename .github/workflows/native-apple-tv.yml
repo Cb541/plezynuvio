@@ -6,6 +6,7 @@ on:
     branches:
       - standalone-native-tvos-player
       - feature/nuvio-recently-played-resume-dv
+      - fix/tvos-resume-recent-gallery-focus
     paths:
       - 'standalone_tvos/**'
       - '.github/workflows/native-apple-tv.yml'

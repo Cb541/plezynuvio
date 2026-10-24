@@ -86,6 +86,7 @@ struct NativeStreamLink {
     let contentId: String?
     let videoId: String?
     let artworkURL: URL?
+    let seasonArtworkURL: URL?
     let resumeSeconds: Double
     let isHistoryLaunch: Bool
 
@@ -108,6 +109,14 @@ struct NativeStreamLink {
             artworkURL = art
         } else {
             artworkURL = nil
+        }
+        if let rawSeason = query.first(where: { $0.name == "seasonArtwork" })?.value,
+           let seasonURL = URL(string: rawSeason),
+           seasonURL.scheme?.lowercased() == "https",
+           seasonURL.host?.lowercased() == "image.tmdb.org" {
+            seasonArtworkURL = seasonURL
+        } else {
+            seasonArtworkURL = nil
         }
         resumeSeconds = max(0, Double(query.first(where: { $0.name == "resume" })?.value ?? "") ?? 0)
         isHistoryLaunch = query.contains { $0.name == "history" && $0.value == "1" }

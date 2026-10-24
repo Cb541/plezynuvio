@@ -30,6 +30,9 @@ final class NuvioPlaybackLibrary {
     private var posterLookups: [String: Date] = [:]
     private var artworkDownloads = Set<String>()
     private var artworkRetryAt: [String: Date] = [:]
+    private var artworkActiveURLs: [String: String] = [:]
+    private var artworkAlternates: [String: [URL]] = [:]
+    private var artworkFailedURL: [String: String] = [:]
 
     private init() {
         appRoot = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -186,9 +189,20 @@ final class NuvioPlaybackLibrary {
         if fm.fileExists(atPath: destination.path),
            UIImage(contentsOfFile: destination.path) != nil { return }
         let lookupKey = variant + ":" + id
-        guard !artworkDownloads.contains(lookupKey) else { return }
-        if let retry = artworkRetryAt[lookupKey], retry > Date() { return }
+        if artworkDownloads.contains(lookupKey) {
+            if artworkActiveURLs[lookupKey] != url.absoluteString {
+                var alternates = artworkAlternates[lookupKey] ?? []
+                if !alternates.contains(where: { $0.absoluteString == url.absoluteString }) {
+                    alternates.append(url)
+                    artworkAlternates[lookupKey] = alternates
+                }
+            }
+            return
+        }
+        if let retry = artworkRetryAt[lookupKey], retry > Date(),
+           artworkFailedURL[lookupKey] == url.absoluteString { return }
         artworkDownloads.insert(lookupKey)
+        artworkActiveURLs[lookupKey] = url.absoluteString
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.timeoutInterval = 18
         request.setValue("image/jpeg,image/png,image/*;q=0.8",
@@ -197,18 +211,28 @@ final class NuvioPlaybackLibrary {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.artworkDownloads.remove(lookupKey)
+                self.artworkActiveURLs.removeValue(forKey: lookupKey)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 guard error == nil, (200...299).contains(status),
                       let data, !data.isEmpty, data.count < 12_000_000,
                       let image = UIImage(data: data) else {
                     self.artworkRetryAt[lookupKey] = Date().addingTimeInterval(25)
+                    self.artworkFailedURL[lookupKey] = url.absoluteString
                     // Never log signed media links or complete artwork URLs.
-                    NSLog("[NuvioArt] Image load failed host=%@ type=%@ status=%ld reason=%@",
-                          url.host ?? "unknown", variant, status,
-                          error.map { String(describing: $0.code) } ?? "decode-or-http")
+                    let errorCode = (error as NSError?)?.code ?? 0
+                    NSLog("[NuvioArt] Image load failed host=%@ type=%@ status=%ld error=%ld",
+                          url.host ?? "unknown", variant, status, errorCode)
+                    if var alternates = self.artworkAlternates[lookupKey],
+                       !alternates.isEmpty {
+                        let alternate = alternates.removeFirst()
+                        self.artworkAlternates[lookupKey] = alternates
+                        self.fetchArtwork(alternate, id: id, variant: variant)
+                    }
                     return
                 }
                 self.artworkRetryAt.removeValue(forKey: lookupKey)
+                self.artworkFailedURL.removeValue(forKey: lookupKey)
+                self.artworkAlternates.removeValue(forKey: lookupKey)
                 self.savePoster(image, id: id, variant: variant)
                 NSLog("[NuvioArt] Image cached type=%@ host=%@",
                       variant, url.host ?? "unknown")

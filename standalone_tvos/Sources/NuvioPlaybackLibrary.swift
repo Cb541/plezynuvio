@@ -203,7 +203,10 @@ final class NuvioHistoryHomeView: UIView {
         ])
         observer = NotificationCenter.default.addObserver(
             forName: NuvioPlaybackLibrary.changed, object: nil,
-            queue: .main) { [weak self] _ in self?.reload() }
+            queue: .main) { [weak self] _ in
+                guard let self, !self.isHidden else { return }
+                self.reload()
+            }
         reload()
     }
 
@@ -290,7 +293,16 @@ private final class NuvioHistoryTile: UIButton {
         art.image = image
         addSubview(art)
         let name = UILabel()
-        name.text = item.title
+        let segments = item.videoId?.split(separator: ":") ?? []
+        let episodeLabel: String
+        if segments.count >= 3,
+           let season = Int(segments[segments.count - 2]),
+           let episode = Int(segments[segments.count - 1]) {
+            episodeLabel = String(format: " · S%02dE%02d", season, episode)
+        } else {
+            episodeLabel = ""
+        }
+        name.text = item.title + episodeLabel
         name.font = .systemFont(ofSize: 19, weight: .semibold)
         name.textColor = .white
         name.backgroundColor = UIColor.black.withAlphaComponent(0.66)

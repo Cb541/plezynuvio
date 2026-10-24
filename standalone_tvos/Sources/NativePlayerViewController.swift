@@ -122,6 +122,10 @@ private final class CachedTimelineOverlay: UIView {
 final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIGestureRecognizerDelegate {
     private var core: MpvPlayerCore?
     private let thumbs = SeekFrameService()
+    private let historyHome = NuvioHistoryHomeView()
+    private let resumeButton = UIButton(type: .system)
+    private var offeredResumePosition = 0.0
+    private var lastHistorySnapshot = Date.distantPast
     private var pendingLink: NativeStreamLink?
     private var hasAppeared = false
     private var playbackGeneration = 0
@@ -332,6 +336,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         super.viewDidLoad()
         view.backgroundColor = .clear
         buildUI()
+        configureHistoryInterface()
         // If a previous launch died in the decoder, tell the user WHICH stage
         // was reached. Never persist, display or log the signed media URL.
         if let unfinished = PlayerStartupDiagnostics.unfinishedPhase {
@@ -355,6 +360,72 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
         clock = Timer.scheduledTimer(timeInterval: 0.25, target: self, selector: #selector(refreshClock),
                                      userInfo: nil, repeats: true)
+    }
+
+    private func configureHistoryInterface() {
+        historyHome.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(historyHome)
+        NSLayoutConstraint.activate([
+            historyHome.topAnchor.constraint(equalTo: view.topAnchor),
+            historyHome.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            historyHome.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            historyHome.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        historyHome.onSelect = { [weak self] item in
+            guard let self else { return }
+            guard let media = NuvioPlaybackLibrary.shared.openLink(for: item) else {
+                let alert = UIAlertController(title: "Source unavailable",
+                    message: "Open this title again from Nuvio to refresh its stream link.",
+                    preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(alert, animated: true)
+                return
+            }
+            self.open(media)
+        }
+
+        var config = UIButton.Configuration.filled()
+        config.title = "Resume?"
+        config.cornerStyle = .capsule
+        config.baseBackgroundColor = UIColor(white: 0.17, alpha: 0.91)
+        config.baseForegroundColor = .white
+        config.contentInsets = NSDirectionalEdgeInsets(top: 15, leading: 25, bottom: 15, trailing: 25)
+        resumeButton.configuration = config
+        resumeButton.translatesAutoresizingMaskIntoConstraints = false
+        resumeButton.isHidden = true
+        resumeButton.addTarget(self, action: #selector(acceptResume),
+                               for: .primaryActionTriggered)
+        view.addSubview(resumeButton)
+        NSLayoutConstraint.activate([
+            resumeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor,
+                                                  constant: 65),
+            resumeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
+                                              constant: 40)
+        ])
+        idleLabel.isHidden = true
+    }
+
+    @objc private func acceptResume() {
+        guard offeredResumePosition > 20, let playbackCore = core else { return }
+        let seconds = offeredResumePosition
+        offeredResumePosition = 0
+        resumeButton.isHidden = true
+        playbackCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) { _ in }
+    }
+
+    private func saveHistorySnapshot(finishing: Bool = false) {
+        guard let media = link, let playbackCore = core else { return }
+        let position = max(0, playbackCore.timePos)
+        let duration = max(0, playbackCore.duration)
+        guard position > 2, duration > 0 else { return }
+        // Persist ONE small display card outside the per-video seek cache.
+        let still = thumbs.cachedImage(second: Int(min(120, max(12, position))))
+            ?? thumbs.cachedImage(second: 12)
+            ?? thumbs.cachedImage(second: 36)
+        NuvioPlaybackLibrary.shared.update(media, position: position,
+            duration: duration, finished: finishing || position / duration >= 0.95,
+            frame: still)
+        lastHistorySnapshot = Date()
     }
 
     override func viewDidLayoutSubviews() {
@@ -397,7 +468,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             pendingLink = media
             return
         }
+        if link != nil { saveHistorySnapshot() }
         isPreparingPlayback = true
+        historyHome.isHidden = true
+        resumeButton.isHidden = true
+        lastHistorySnapshot = .distantPast
         // Turn off the old renderer hook before its core is disposed.
         NuvioFrameTapStop()
         frameTapInstalled = false
@@ -470,6 +545,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         filmStrip.alpha = 0
         seekTimeRow.alpha = 0
         link = media
+        let remembered = NuvioPlaybackLibrary.shared.item(for: media)?.position ?? 0
+        offeredResumePosition = max(media.resumeSeconds, remembered)
+        NuvioPlaybackLibrary.shared.opened(media)
+        if offeredResumePosition >= 20 {
+            resumeButton.isHidden = false
+            let expectedGeneration = playbackGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
+                guard let self, self.playbackGeneration == expectedGeneration else { return }
+                self.offeredResumePosition = 0
+                self.resumeButton.isHidden = true
+            }
+        }
         frameViews.first?.image = nil
         seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
@@ -873,6 +960,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 } else if self.currentSeconds < 2 {
                     self.statusLabel.text = "The stream ended or could not load"
                     self.showPanel()
+                } else if reason == 0,
+                          self.totalSeconds > 0,
+                          self.currentSeconds / self.totalSeconds >= 0.90 {
+                    // Natural end of a completed movie returns to the library.
+                    self.leavePlayback()
                 }
             default: break
             }
@@ -3015,6 +3107,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func leavePlayback() {
+        saveHistorySnapshot()
         stopPreviewArrowHold()
         NuvioFrameTapStop()
         frameTapInstalled = false
@@ -3082,6 +3175,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeRow.alpha = 0
         seekPreviewSpinner.stopAnimating()
         showPanel()
+        offeredResumePosition = 0
+        resumeButton.isHidden = true
+        idleLabel.isHidden = true
+        statusLabel.isHidden = true
+        panel.isHidden = true
+        historyHome.reload()
+        historyHome.isHidden = false
+        view.setNeedsFocusUpdate()
     }
 
     private func showPanel() {
@@ -3139,6 +3240,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
+        if resumeButton.isHidden, core != nil,
+           !isPreparingPlayback, !waitingForFirstFrame,
+           Date().timeIntervalSince(lastHistorySnapshot) >= 5 {
+            saveHistorySnapshot()
+        }
         if !configuredNativeP5Preview, (core?.doviProfile ?? 0) == 5 {
             configuredNativeP5Preview = true
             thumbs.setNativeDolbyVisionOnly(true)

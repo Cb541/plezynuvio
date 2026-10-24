@@ -243,8 +243,13 @@ final class NuvioPlaybackLibrary {
 
     private func savePoster(_ image: UIImage, id: String, variant: String) {
         let destination = artRoot.appendingPathComponent(variant + "-" + id + ".jpg")
-        guard !fm.fileExists(atPath: destination.path),
-              image.size.width > 0, image.size.height > 0 else { return }
+        guard image.size.width > 0, image.size.height > 0 else { return }
+        // An interrupted/invalid JPEG used to block every later successful
+        // download because fileExists alone was treated as valid artwork.
+        if fm.fileExists(atPath: destination.path) {
+            if UIImage(contentsOfFile: destination.path) != nil { return }
+            try? fm.removeItem(at: destination)
+        }
         // Keep high-resolution cards sharp on a 4K Apple TV. ScaleAspectFill
         // is applied at display time, so landscape fallback isn't distorted.
         let maxDimension: CGFloat = 920

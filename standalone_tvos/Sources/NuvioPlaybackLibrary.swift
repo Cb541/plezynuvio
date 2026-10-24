@@ -33,6 +33,21 @@ final class NuvioPlaybackLibrary {
     private var artworkActiveURLs: [String: String] = [:]
     private var artworkAlternates: [String: [URL]] = [:]
     private var artworkFailedURL: [String: String] = [:]
+    // Show decoded images immediately, regardless of file-system write errors.
+    private var liveArtwork: [String: UIImage] = [:]
+    private var artworkDiagnostics: [String: String] = [:]
+
+    func artworkStatus(for entry: NuvioHistoryItem) -> String {
+        artworkDiagnostics[entry.id] ??
+            ((entry.artworkURL != nil || entry.contentId != nil)
+                ? "Poster lookup pending" : "Looking up poster by title")
+    }
+
+    private func updateArtworkStatus(_ status: String, id: String) {
+        guard artworkDiagnostics[id] != status else { return }
+        artworkDiagnostics[id] = status
+        NotificationCenter.default.post(name: Self.changed, object: nil)
+    }
 
     private init() {
         appRoot = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -119,6 +134,9 @@ final class NuvioPlaybackLibrary {
     }
 
     func artwork(for entry: NuvioHistoryItem) -> UIImage? {
+        // Memory first: never require a file-system round trip before UIKit
+        // can display a successfully downloaded and decoded poster.
+        if let live = liveArtwork[entry.id] { return live }
         // A portrait poster should win over a landscape backdrop or an
         // opportunistic seek frame. Preserve the legacy JPEG as a last resort.
         for filename in ["poster-" + entry.id + ".jpg",
@@ -178,7 +196,10 @@ final class NuvioPlaybackLibrary {
     private func fetchArtwork(_ url: URL, id: String, variant: String) {
         guard let scheme = url.scheme?.lowercased(),
               ["https", "http"].contains(scheme),
-              url.host != nil, ["poster", "provided"].contains(variant) else { return }
+              url.host != nil, ["poster", "provided"].contains(variant) else {
+            updateArtworkStatus("Poster URL invalid", id: id)
+            return
+        }
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
                 self?.fetchArtwork(url, id: id, variant: variant)
@@ -203,6 +224,7 @@ final class NuvioPlaybackLibrary {
            artworkFailedURL[lookupKey] == url.absoluteString { return }
         artworkDownloads.insert(lookupKey)
         artworkActiveURLs[lookupKey] = url.absoluteString
+        updateArtworkStatus("Loading image: " + (url.host ?? "CDN"), id: id)
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.timeoutInterval = 18
         request.setValue("image/jpeg,image/png,image/*;q=0.8",
@@ -218,6 +240,17 @@ final class NuvioPlaybackLibrary {
                       let image = UIImage(data: data) else {
                     self.artworkRetryAt[lookupKey] = Date().addingTimeInterval(25)
                     self.artworkFailedURL[lookupKey] = url.absoluteString
+                    let reason: String
+                    if let error {
+                        reason = "Network error " + String((error as NSError).code)
+                    } else if !(200...299).contains(status) {
+                        reason = "Image HTTP " + String(status)
+                    } else if let data, !data.isEmpty {
+                        reason = "Image format not decoded (" + String(data.count) + " bytes)"
+                    } else {
+                        reason = "Empty image response"
+                    }
+                    self.updateArtworkStatus(reason + " · " + (url.host ?? "unknown"), id: id)
                     // Never log signed media links or complete artwork URLs.
                     let errorCode = (error as NSError?)?.code ?? 0
                     NSLog("[NuvioArt] Image load failed host=%@ type=%@ status=%ld error=%ld",
@@ -233,6 +266,8 @@ final class NuvioPlaybackLibrary {
                 self.artworkRetryAt.removeValue(forKey: lookupKey)
                 self.artworkFailedURL.removeValue(forKey: lookupKey)
                 self.artworkAlternates.removeValue(forKey: lookupKey)
+                self.liveArtwork[id] = image
+                self.updateArtworkStatus("Poster decoded", id: id)
                 self.savePoster(image, id: id, variant: variant)
                 NSLog("[NuvioArt] Image cached type=%@ host=%@",
                       variant, url.host ?? "unknown")
@@ -260,7 +295,14 @@ final class NuvioPlaybackLibrary {
         let data = renderer.jpegData(withCompressionQuality: 0.86) { _ in
             image.draw(in: CGRect(origin: .zero, size: size))
         }
-        try? data.write(to: destination, options: .atomic)
+        do {
+            try data.write(to: destination, options: .atomic)
+            if UIImage(contentsOfFile: destination.path) == nil {
+                updateArtworkStatus("Poster decoded; disk reread failed", id: id)
+            }
+        } catch {
+            updateArtworkStatus("Poster decoded; disk write failed", id: id)
+        }
     }
 
     private func fetchMetadataPoster(for entry: NuvioHistoryItem) {
@@ -277,6 +319,7 @@ final class NuvioPlaybackLibrary {
         // Recover from intermittent network errors on the next gallery visit.
         if let last = posterLookups[id], Date().timeIntervalSince(last) < 35 { return }
         posterLookups[id] = Date()
+        updateArtworkStatus("Finding artwork by metadata", id: id)
 
         let identifiers = [entry.contentId, entry.videoId].compactMap { $0 }
         let imdb = identifiers.compactMap({ value -> String? in
@@ -308,6 +351,9 @@ final class NuvioPlaybackLibrary {
                       let posterURL = URL(string: poster) else {
                     NSLog("[NuvioArt] Metadata missing type=%@ status=%ld",
                           category, status)
+                    DispatchQueue.main.async { [weak self] in
+                        self?.updateArtworkStatus("Metadata HTTP " + String(status), id: id)
+                    }
                     return
                 }
                 DispatchQueue.main.async {
@@ -315,6 +361,7 @@ final class NuvioPlaybackLibrary {
                 }
             }.resume()
         } else {
+            updateArtworkStatus("Searching title: " + entry.title, id: id)
             fetchTitleMatchedPoster(title: entry.title, id: id, category: "movie")
         }
     }

@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - build/nuvio-controls-gapfix-20261024-031418-2534113
       - standalone-native-tvos-player
+      - feature/nuvio-recently-played-resume-dv
+      - fix/tvos-resume-recent-gallery-focus
     paths:
       - 'standalone_tvos/**'
       - '.github/workflows/native-apple-tv.yml'
@@ -30,6 +33,15 @@ jobs:
           swiftc standalone_tvos/Sources/NuvioAheadPlan.swift \
             standalone_tvos/Tests/main.swift -o /tmp/nuvio-ahead-test
           /tmp/nuvio-ahead-test
+          swiftc standalone_tvos/Sources/NuvioAheadRecovery.swift \
+            standalone_tvos/Tests/AheadRecovery/main.swift -o /tmp/nuvio-recovery-test
+          /tmp/nuvio-recovery-test
+          swiftc standalone_tvos/Sources/NuvioIntroSkip.swift \
+            standalone_tvos/Tests/IntroSkip/main.swift -o /tmp/nuvio-intro-test
+          /tmp/nuvio-intro-test
+          swiftc standalone_tvos/Sources/NuvioBlackBarProtection.swift \
+            standalone_tvos/Tests/BlackBar/main.swift -o /tmp/nuvio-blackbar-test
+          /tmp/nuvio-blackbar-test
 
       - name: Install XcodeGen
         run: |

@@ -550,12 +550,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         NuvioPlaybackLibrary.shared.opened(media)
         if offeredResumePosition >= 20 {
             resumeButton.isHidden = false
-            let expectedGeneration = playbackGeneration
-            DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-                guard let self, self.playbackGeneration == expectedGeneration else { return }
-                self.offeredResumePosition = 0
-                self.resumeButton.isHidden = true
-            }
         }
         frameViews.first?.image = nil
         seekPreviewSpinner.stopAnimating()
@@ -931,6 +925,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.applyPictureTransform()
                     self.checkColorSourceMetadata()
                     self.finishDisplayNegotiation()
+                    if !self.resumeButton.isHidden {
+                        let expectedGeneration = self.playbackGeneration
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                            guard let self, self.playbackGeneration == expectedGeneration else { return }
+                            self.offeredResumePosition = 0
+                            self.resumeButton.isHidden = true
+                        }
+                    }
                 } else {
                     // Subsequent playback-restart events also occur after
                     // seeking. Do not restart the initial-display gate.

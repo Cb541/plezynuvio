@@ -70,7 +70,7 @@ final class NuvioPlaybackLibrary {
         if let url = media.artworkURL {
             fetchArtwork(url, id: id, variant: "provided")
         }
-        fetchMetadataPoster(for: media, id: id)
+        if let entry = items.first { fetchMetadataPoster(for: entry) }
     }
 
     func update(_ media: NativeStreamLink, position: Double, duration: Double,
@@ -89,6 +89,17 @@ final class NuvioPlaybackLibrary {
         }
         if let frame { saveArtwork(frame, id: id, onlyIfAbsent: true) }
         persist()
+    }
+
+    /// Repair artwork for previously saved titles, including entries made by
+    /// Nuvio builds that sent just a title and signed stream URL.
+    func prepareRecentArtwork() {
+        for entry in items.prefix(35) {
+            if let raw = entry.artworkURL, let url = URL(string: raw) {
+                fetchArtwork(url, id: entry.id, variant: "provided")
+            }
+            fetchMetadataPoster(for: entry)
+        }
     }
 
     func artwork(for entry: NuvioHistoryItem) -> UIImage? {
@@ -184,36 +195,71 @@ final class NuvioPlaybackLibrary {
         try? data.write(to: destination, options: .atomic)
     }
 
-    private func fetchMetadataPoster(for media: NativeStreamLink, id: String) {
+    private func fetchMetadataPoster(for entry: NuvioHistoryItem) {
+        let id = entry.id
         guard !posterLookups.contains(id),
               !fm.fileExists(atPath:
                 artRoot.appendingPathComponent("poster-" + id + ".jpg").path)
         else { return }
-        let rawIdentifiers = [media.contentId, media.videoId].compactMap { $0 }
-        guard let imdb = rawIdentifiers.compactMap({ value -> String? in
+        posterLookups.insert(id)
+        let rawIdentifiers = [entry.contentId, entry.videoId].compactMap { $0 }
+        let imdb = rawIdentifiers.compactMap({ value -> String? in
             guard let match = value.range(of: #"tt[0-9]{5,12}"#,
                                           options: .regularExpression) else { return nil }
             return String(value[match])
-        }).first else { return }
-        posterLookups.insert(id)
-        // Stremio's Cinemeta metadata endpoint accepts IMDb ids and returns
-        // a poster URL. Avoid guessing from title strings or requiring API keys.
-        let looksLikeSeries = (media.videoId ?? "").range(
+        }).first
+        let looksLikeSeries = (entry.videoId ?? "").range(
             of: #":[0-9]+:[0-9]+$"#, options: .regularExpression) != nil
-        let category = looksLikeSeries ? "series" : "movie"
-        guard let endpoint = URL(string:
-            "https://v3-cinemeta.strem.io/meta/" + category + "/" + imdb + ".json")
-        else { return }
+        if let imdb {
+            // Exact IMDb metadata avoids guessing between similarly named titles.
+            let category = looksLikeSeries ? "series" : "movie"
+            guard let endpoint = URL(string:
+                "https://v3-cinemeta.strem.io/meta/" + category + "/" + imdb + ".json")
+            else { return }
+            var request = URLRequest(url: endpoint)
+            request.timeoutInterval = 12
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+                guard let self, let data, let response = response as? HTTPURLResponse,
+                      (200...299).contains(response.statusCode),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let meta = json["meta"] as? [String: Any],
+                      let poster = meta["poster"] as? String,
+                      let posterURL = URL(string: poster) else { return }
+                self.fetchArtwork(posterURL, id: id, variant: "poster")
+            }.resume()
+        } else {
+            // Older handoffs did not include IMDb ids. Search by title, but
+            // accept ONLY an exact title match: never attach random artwork.
+            fetchTitleMatchedPoster(title: entry.title, id: id, category: "movie")
+        }
+    }
+
+    private func fetchTitleMatchedPoster(title: String, id: String,
+                                         category: String) {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean.count >= 2, clean.count <= 140,
+              let encoded = clean.addingPercentEncoding(
+                withAllowedCharacters: .alphanumerics),
+              let endpoint = URL(string:
+                "https://v3-cinemeta.strem.io/catalog/" + category +
+                "/top/search=" + encoded + ".json") else { return }
         var request = URLRequest(url: endpoint)
         request.timeoutInterval = 12
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             guard let self, let data, let response = response as? HTTPURLResponse,
                   (200...299).contains(response.statusCode),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let meta = json["meta"] as? [String: Any],
-                  let poster = meta["poster"] as? String,
-                  let posterURL = URL(string: poster) else { return }
-            self.fetchArtwork(posterURL, id: id, variant: "poster")
+                  let metas = json["metas"] as? [[String: Any]] else { return }
+            let match = metas.first {
+                guard let candidate = $0["name"] as? String else { return false }
+                return candidate.compare(clean, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            }
+            if let poster = match?["poster"] as? String,
+               let url = URL(string: poster) {
+                self.fetchArtwork(url, id: id, variant: "poster")
+            } else if category == "movie" {
+                self.fetchTitleMatchedPoster(title: clean, id: id, category: "series")
+            }
         }.resume()
     }
 
@@ -315,6 +361,7 @@ final class NuvioHistoryHomeView: UIView {
     }
 
     func reload() {
+        NuvioPlaybackLibrary.shared.prepareRecentArtwork()
         tiles.arrangedSubviews.forEach {
             tiles.removeArrangedSubview($0)
             $0.removeFromSuperview()

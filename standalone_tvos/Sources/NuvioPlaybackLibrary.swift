@@ -40,7 +40,7 @@ final class NuvioPlaybackLibrary {
 
     func identifier(for media: NativeStreamLink) -> String {
         let identity = media.videoId ?? media.contentId ?? (
-            media.title.lowercased() + "|" + media.url.host.map(String.init(describing:))! +
+            media.title.lowercased() + "|" + (media.url.host ?? "") +
             media.url.path
         )
         return SHA256.hash(data: Data(identity.utf8))
@@ -331,11 +331,14 @@ private final class NuvioHistoryTile: UIButton {
     }
     required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
     @objc private func tapped() { onClick?() }
-    override var isFocused: Bool {
-        didSet { UIView.animate(withDuration: 0.16) {
-            self.transform = self.isFocused ? CGAffineTransform(scaleX: 1.06, y: 1.06) : .identity
+    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        coordinator.addCoordinatedAnimations({
+            self.transform = self.isFocused
+                ? CGAffineTransform(scaleX: 1.06, y: 1.06) : .identity
             self.layer.borderWidth = self.isFocused ? 3 : 0
             self.layer.borderColor = UIColor.white.cgColor
-        } }
+        })
     }
 }

@@ -22,6 +22,79 @@ private final class RemoteSurface: UIView {
     }
 }
 
+/// Shared OLED-black playback action. tvOS standard filled UIButtons can
+/// paint an opaque white focus plate over an otherwise black configuration.
+/// Our custom focusable view preserves black and white in both focus states.
+private final class OLEDActionButton: UIView {
+    var onActivate: (() -> Void)?
+    private let blackPill = UIView()
+    private let caption = UILabel()
+
+    override var canBecomeFocused: Bool { true }
+
+    init(title: String, accessibility: String) {
+        super.init(frame: .zero)
+        isUserInteractionEnabled = true
+        isAccessibilityElement = true
+        backgroundColor = .clear
+        accessibilityLabel = accessibility
+        accessibilityTraits.insert(.button)
+
+        blackPill.translatesAutoresizingMaskIntoConstraints = false
+        blackPill.backgroundColor = UIColor(red: 0, green: 0, blue: 0, alpha: 1)
+        blackPill.layer.cornerRadius = 30
+        blackPill.layer.borderColor = UIColor.white.cgColor
+        blackPill.layer.borderWidth = 0
+        blackPill.isUserInteractionEnabled = false
+        addSubview(blackPill)
+
+        caption.translatesAutoresizingMaskIntoConstraints = false
+        caption.text = title
+        caption.font = .systemFont(ofSize: 27, weight: .semibold)
+        caption.textColor = .white
+        caption.textAlignment = .center
+        caption.backgroundColor = .clear
+        caption.isUserInteractionEnabled = false
+        blackPill.addSubview(caption)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 200),
+            heightAnchor.constraint(equalToConstant: 60),
+            blackPill.leadingAnchor.constraint(equalTo: leadingAnchor),
+            blackPill.trailingAnchor.constraint(equalTo: trailingAnchor),
+            blackPill.topAnchor.constraint(equalTo: topAnchor),
+            blackPill.bottomAnchor.constraint(equalTo: bottomAnchor),
+            caption.leadingAnchor.constraint(equalTo: blackPill.leadingAnchor, constant: 18),
+            caption.trailingAnchor.constraint(equalTo: blackPill.trailingAnchor, constant: -18),
+            caption.centerYAnchor.constraint(equalTo: blackPill.centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { return nil }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        coordinator.addCoordinatedAnimations({
+            // Preserve true OLED black in both focus states: only the subtle
+            // white border and scale change, never the pill's fill or text.
+            self.blackPill.backgroundColor = .black
+            self.caption.textColor = .white
+            self.blackPill.layer.borderWidth = self.isFocused ? 2 : 0
+            self.transform = self.isFocused
+                ? CGAffineTransform(scaleX: 1.045, y: 1.045) : .identity
+        })
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if presses.contains(where: { $0.type == .select }) {
+            onActivate?()
+        } else {
+            super.pressesBegan(presses, with: event)
+        }
+    }
+}
+
 /// Canvas-drawn transport symbols remain visible on sideloaded tvOS,
 /// without depending on UIButton-disabled imagery or SF Symbol fonts.
 private final class PlayerToolGlyph: UIView {
@@ -122,6 +195,22 @@ private final class CachedTimelineOverlay: UIView {
 final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIGestureRecognizerDelegate {
     private var core: MpvPlayerCore?
     private let thumbs = SeekFrameService()
+    private let historyHome = NuvioHistoryHomeView()
+    private let resumeButton = OLEDActionButton(
+        title: "Resume?", accessibility: "Resume playback from your saved position")
+    private let skipIntroButton = OLEDActionButton(
+        title: "Skip?", accessibility: "Skip intro")
+    private var introWindow: NuvioIntroWindow?
+    private var introLookupTask: Task<Void, Never>?
+    private var skippedIntroForPlayback = false
+    // Show Skip? once per episode, for five seconds from its first appearance.
+    // This is separate from Resume?'s seven-second countdown.
+    private var skipIntroOfferTimeout: DispatchWorkItem?
+    private var hasOfferedSkipIntroForPlayback = false
+    private var offeredResumePosition = 0.0
+    // Cancelable seven-second prompt, counted from playback becoming usable.
+    private var resumeOfferTimeout: DispatchWorkItem?
+    private var lastHistorySnapshot = Date.distantPast
     private var pendingLink: NativeStreamLink?
     private var hasAppeared = false
     private var playbackGeneration = 0
@@ -188,8 +277,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var totalSeconds: Double = 0
     private var zoom: CGFloat = 1
     private var verticalStretch: CGFloat = 1
-    // Saturation, contrast and brightness share the existing SDR-only
-    // lutyuv filter. The neutral values preserve native HDR / DV playback.
+    // Picture adjustments use a black-matte-protecting YUV LUT for SDR
+    // and opt-in HDR. Neutral settings and all Dolby Vision stay native.
     private var colorSaturation = 1.0
     private var colorContrast = 1.0
     private var colorBrightness = 1.0
@@ -207,6 +296,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // Explicit per-video opt-in: never auto-apply an experimental filter to
     // Dolby Vision or HDR during startup or across separate movies.
     private var experimentalHDRColorBoost = false
+    // tvOS AVFoundation has no mpvRx GPU shader hooks. Vivid reproduces its
+    // default 1.2 luma and chroma settings via our black-bar-safe LUT graph.
+    // Explicitly OFF for each new video; DV never uses this processing path.
+    private var vividEnabled = false
     private var colorFilterInFlight = false
     private var colorCopyMode = false
     // Switching to CPU-accessible decoded frames can be expensive, so no
@@ -316,6 +409,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let contrastLabel = UILabel()
     private let brightnessLabel = UILabel()
     private let hdrBoostLabel = UILabel()
+    private let vividLabel = UILabel()
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
     // Tiny translucent timestamp and spinner, placed together directly on
@@ -326,12 +420,26 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let seekPreviewSpinner = UIActivityIndicatorView(style: .medium)
     private let previewLoadingLabel = UILabel()
 
-    override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
+    override var preferredFocusEnvironments: [UIFocusEnvironment] {
+        // A full-screen RemoteSurface was always first before, swallowing
+        // Siri Remote Select and making both ordinary UIButtons unclickable.
+        // The two action buttons share a vertical focus lane. Retain the
+        // already focused action when the other becomes visible.
+        if !skipIntroButton.isHidden && skipIntroButton.isFocused { return [skipIntroButton] }
+        if !resumeButton.isHidden { return [resumeButton] }
+        if !skipIntroButton.isHidden { return [skipIntroButton] }
+        if link == nil, !historyHome.isHidden,
+           !historyHome.preferredFocusEnvironments.isEmpty {
+            return [historyHome]
+        }
+        return [remote]
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .clear
         buildUI()
+        configureHistoryInterface()
         // If a previous launch died in the decoder, tell the user WHICH stage
         // was reached. Never persist, display or log the signed media URL.
         if let unfinished = PlayerStartupDiagnostics.unfinishedPhase {
@@ -357,11 +465,215 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                                      userInfo: nil, repeats: true)
     }
 
+    private func configureHistoryInterface() {
+        historyHome.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(historyHome)
+        NSLayoutConstraint.activate([
+            historyHome.topAnchor.constraint(equalTo: view.topAnchor),
+            historyHome.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            historyHome.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            historyHome.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+        historyHome.onSelect = { [weak self] item in
+            guard let self else { return }
+            guard let media = NuvioPlaybackLibrary.shared.openLink(for: item) else {
+                let alert = UIAlertController(title: "Source unavailable",
+                    message: "Open this title again from Nuvio to refresh its stream link.",
+                    preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(alert, animated: true)
+                return
+            }
+            self.open(media)
+        }
+
+        // Use a custom focusable view instead of tvOS's filled UIButton:
+        // the latter paints a white system focus plate over custom colors.
+        resumeButton.translatesAutoresizingMaskIntoConstraints = false
+        resumeButton.isHidden = true
+        resumeButton.onActivate = { [weak self] in self?.acceptResume() }
+        view.addSubview(resumeButton)
+        skipIntroButton.translatesAutoresizingMaskIntoConstraints = false
+        skipIntroButton.isHidden = true
+        skipIntroButton.onActivate = { [weak self] in self?.acceptSkipIntro() }
+        view.addSubview(skipIntroButton)
+        NSLayoutConstraint.activate([
+            // Two separate, vertically adjacent focus targets. Up/Down on
+            // the Siri Remote switches between them when both are present.
+            resumeButton.trailingAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -76),
+            resumeButton.bottomAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -126),
+            skipIntroButton.trailingAnchor.constraint(equalTo: resumeButton.trailingAnchor),
+            skipIntroButton.bottomAnchor.constraint(equalTo: resumeButton.topAnchor, constant: -18)
+        ])
+        idleLabel.isHidden = true
+    }
+
+    /// Show only after mpv has produced a frame and HDMI display-mode
+    /// negotiation has finished. The visible, focusable button gets seven
+    /// seconds, not fifteen seconds of hidden/blocked startup time.
+    private func offerResumeForSevenSeconds() {
+        guard link != nil, core != nil, offeredResumePosition >= 20 else { return }
+        resumeOfferTimeout?.cancel()
+        resumeButton.isHidden = false
+        updateActionFocus()
+        let generation = playbackGeneration
+        let expiry = DispatchWorkItem { [weak self] in
+            guard let self, self.playbackGeneration == generation else { return }
+            self.dismissResumeOffer()
+        }
+        resumeOfferTimeout = expiry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 7.0, execute: expiry)
+    }
+
+    private func dismissResumeOffer() {
+        resumeOfferTimeout?.cancel()
+        resumeOfferTimeout = nil
+        resumeButton.isHidden = true
+        offeredResumePosition = 0
+        // Keep the remote unfocused if the other action is still visible.
+        updateActionFocus()
+    }
+
+    @objc private func acceptResume() {
+        guard !resumeButton.isHidden, offeredResumePosition >= 20,
+              let playbackCore = core else { return }
+        let seconds = offeredResumePosition
+        dismissResumeOffer()
+        currentSeconds = seconds
+        refreshLabels()
+        playbackCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) { _ in }
+    }
+
+    /// The full-screen RemoteSurface must not steal Select from either
+    /// action. Show it again only after BOTH buttons have disappeared.
+    private func updateActionFocus() {
+        let anyActionVisible = !resumeButton.isHidden || !skipIntroButton.isHidden
+        if link != nil { remote.isHidden = anyActionVisible }
+        if !skipIntroButton.isHidden { view.bringSubviewToFront(skipIntroButton) }
+        if !resumeButton.isHidden { view.bringSubviewToFront(resumeButton) }
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+    }
+
+    private func clearIntroLookup() {
+        introLookupTask?.cancel()
+        introLookupTask = nil
+        skipIntroOfferTimeout?.cancel()
+        skipIntroOfferTimeout = nil
+        hasOfferedSkipIntroForPlayback = false
+        introWindow = nil
+        skippedIntroForPlayback = false
+        skipIntroButton.isHidden = true
+    }
+
+    private func startIntroLookup(for media: NativeStreamLink, generation: Int) {
+        clearIntroLookup()
+        guard let episode = media.episodeIdentity else {
+            NSLog("[NuvioIntro] Skipped lookup: no selected-episode IMDb/season/episode identity")
+            return
+        }
+        NSLog("[NuvioIntro] Looking up %@ S%dE%d",
+              episode.imdbID, episode.season, episode.episode)
+        introLookupTask = Task { [weak self] in
+            let result = await NuvioIntroDB.lookup(episode)
+            guard !Task.isCancelled, let self,
+                  self.playbackGeneration == generation,
+                  self.link?.episodeIdentity == episode else { return }
+            self.introWindow = result
+            if let result {
+                NSLog("[NuvioIntro] Timing received start=%.1fs end=%.1fs",
+                      result.startSec, result.endSec)
+            } else {
+                NSLog("[NuvioIntro] No verified intro timing available for selected episode")
+            }
+            self.refreshIntroOffer()
+        }
+    }
+
+    /// Dismiss Skip? without affecting Resume? or its independent timeout.
+    private func dismissSkipIntroOffer() {
+        skipIntroOfferTimeout?.cancel()
+        skipIntroOfferTimeout = nil
+        guard !skipIntroButton.isHidden else { return }
+        skipIntroButton.isHidden = true
+        updateActionFocus()
+    }
+
+    /// Once the selected episode reaches its verified intro, display Skip?
+    /// for five seconds. Polling must not restart the countdown or re-show it
+    /// after expiry; seeking out of the intro hides it immediately.
+    private func refreshIntroOffer() {
+        let second = max(0, core?.timePos ?? currentSeconds)
+        let isReady = link != nil && core != nil && !isPreparingPlayback &&
+            !waitingForFirstFrame && !displayNegotiationPending
+        let isInsideIntro = introWindow?.contains(second) ?? false
+        let isWithinDuration = introWindow.map {
+            totalSeconds <= 0 || $0.endSec < totalSeconds - 0.5
+        } ?? false
+        let eligible = isReady && !skippedIntroForPlayback &&
+            isInsideIntro && isWithinDuration
+        if !eligible {
+            dismissSkipIntroOffer()
+            return
+        }
+        guard !hasOfferedSkipIntroForPlayback else { return }
+        hasOfferedSkipIntroForPlayback = true
+        skipIntroButton.isHidden = false
+        updateActionFocus()
+
+        let generation = playbackGeneration
+        let expiry = DispatchWorkItem { [weak self] in
+            guard let self, self.playbackGeneration == generation else { return }
+            self.dismissSkipIntroOffer()
+        }
+        skipIntroOfferTimeout = expiry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: expiry)
+    }
+
+    private func acceptSkipIntro() {
+        guard !skipIntroButton.isHidden, let window = introWindow,
+              window.contains(core?.timePos ?? currentSeconds),
+              core != nil else { return }
+        skippedIntroForPlayback = true
+        dismissSkipIntroOffer()
+        targetSeconds = window.endSec
+        // Use the existing guarded mpv seek/cancel path so Skip never races
+        // an FFmpeg preview decode and cannot change HDR/DV or media cache.
+        commitSeek(resumeAfter: playing, closeChrome: true)
+    }
+
+    private func saveHistorySnapshot(finishing: Bool = false) {
+        guard let media = link, let playbackCore = core else { return }
+        let position = max(0, playbackCore.timePos)
+        let duration = max(0, playbackCore.duration)
+        guard position > 2, duration > 0 else { return }
+        // Persist ONE small display card outside the per-video seek cache.
+        let still = thumbs.cachedImage(second: Int(min(120, max(12, position))))
+            ?? thumbs.cachedImage(second: 12)
+            ?? thumbs.cachedImage(second: 36)
+        NuvioPlaybackLibrary.shared.update(media, position: position,
+            duration: duration, finished: finishing || position / duration >= 0.95,
+            frame: still)
+        lastHistorySnapshot = Date()
+    }
+
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         // Progress-bar geometry depends on Safe Area and the trailing tools.
         // Read it after Auto Layout, including after display-mode changes.
         updateThumbnailHorizontalPosition()
+    }
+
+    // Recent tiles are real UIKit controls, not the playback RemoteSurface.
+    // They handle Select themselves; Back still returns to Nuvio.
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if link == nil, presses.contains(where: { $0.type == .menu }) {
+            returnToNuvio()
+            return
+        }
+        super.pressesBegan(presses, with: event)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -397,7 +709,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             pendingLink = media
             return
         }
+        if link != nil { saveHistorySnapshot() }
         isPreparingPlayback = true
+        historyHome.isHidden = true
+        clearIntroLookup()
+        resumeOfferTimeout?.cancel()
+        resumeOfferTimeout = nil
+        resumeButton.isHidden = true
+        remote.isHidden = false
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+        lastHistorySnapshot = .distantPast
         // Turn off the old renderer hook before its core is disposed.
         NuvioFrameTapStop()
         frameTapInstalled = false
@@ -470,6 +792,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         filmStrip.alpha = 0
         seekTimeRow.alpha = 0
         link = media
+        startIntroLookup(for: media, generation: generation)
+        let remembered = NuvioPlaybackLibrary.shared.item(for: media)?.position ?? 0
+        offeredResumePosition = max(media.resumeSeconds, remembered)
+        NuvioPlaybackLibrary.shared.opened(media)
+        // Do not display the offer while the hardware decoder or HDMI mode
+        // is still starting. It becomes actionable only after playback starts.
         frameViews.first?.image = nil
         seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
@@ -493,6 +821,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         configuredNativeP5Preview = false
         originalIsDolbyVision = false
         experimentalHDRColorBoost = false
+        vividEnabled = false
         colorFilterActive = false
         colorFilterInFlight = false
         colorCopyMode = false
@@ -565,12 +894,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if #available(tvOS 17.0, *),
            let layer = newCore.videoLayer {
             let renderer = layer.sampleBufferRenderer
+            // The native tap delivers on its private image-conversion queue.
+            // Capture only this thread-safe cache service, never the player
+            // controller or UIKit state: revealing the progress bar must not
+            // delay frame persistence on the main thread. The tap's own
+            // generation check stops callbacks from superseded playback.
+            let captureCache = thumbs
             frameTapInstalled = NuvioFrameTapStart(layer, renderer) {
-                [weak self, weak newCore] image, second in
-                guard let self, let newCore,
-                      self.playbackGeneration == generation,
-                      self.core === newCore else { return }
-                self.thumbs.cachePlaybackFrame(image, second: Int(second))
+                image, second in
+                captureCache.cachePlaybackFrame(image, second: Int(second))
             }
         }
         if !frameTapInstalled {
@@ -693,6 +1025,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     }
                     self.statusLabel.text = ""
                     self.showPanel()
+                    self.offerResumeForSevenSeconds()
                     // Defer subtitles until after the video is running.
                     if self.permanentlyDisableSubtitles {
                         core.setProperty("sid", value: "no")
@@ -873,6 +1206,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 } else if self.currentSeconds < 2 {
                     self.statusLabel.text = "The stream ended or could not load"
                     self.showPanel()
+                } else if reason == 0 {
+                    // A successful EOF always returns to the library, while
+                    // marking the item watched even with rounded time-pos.
+                    self.leavePlayback(naturalEnd: true)
                 }
             default: break
             }
@@ -1079,7 +1416,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
         addGlassBackdrop(to: picturePanel, radius: 18)
-        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, brightnessLabel, hdrBoostLabel] {
+        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, brightnessLabel, hdrBoostLabel, vividLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
             label.textColor = .white
@@ -1209,7 +1546,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             hdrBoostLabel.topAnchor.constraint(equalTo: brightnessLabel.bottomAnchor, constant: 15),
             hdrBoostLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             hdrBoostLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            colorStatusLabel.topAnchor.constraint(equalTo: hdrBoostLabel.bottomAnchor, constant: 15),
+            vividLabel.topAnchor.constraint(equalTo: hdrBoostLabel.bottomAnchor, constant: 15),
+            vividLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            vividLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            colorStatusLabel.topAnchor.constraint(equalTo: vividLabel.bottomAnchor, constant: 15),
             colorStatusLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             colorStatusLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
             colorStatusLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -20),
@@ -1275,6 +1615,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         hdrBoostLabel.text = requiresNativeDolbyVision
             ? "   Dolby Vision: native (smooth)"
             : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
+        vividLabel.text = "\(selectedPictureControl == 6 ? "▶ " : "   ")Vivid: \(vividEnabled ? "ON" : "OFF")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
         let available = sourceColorMetadataReady && !requiresNativeDolbyVision
@@ -1292,6 +1633,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
             && !requiresNativeDolbyVision
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
+        vividLabel.textColor = available
+            ? (selectedPictureControl == 6 ? .white : .lightGray)
+            : .gray
         if requiresNativeDolbyVision {
             colorStatusLabel.text = "Dolby Vision uses native hardware playback.\nUse TV Color Depth / Contrast for DV."
         } else if !sourceColorMetadataReady {
@@ -1303,11 +1647,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         } else if sourceIsHDR && !experimentalHDRColorBoost {
             colorStatusLabel.text = "Native HDR protected.\nTurn boost ON to test color changes."
         } else if sourceIsHDR {
-            colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\n\(colorFilterVerified ? "Filter loaded" : "Verify picture changes") • OFF restores original."
+            colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\n\(vividEnabled ? "Vivid ON" : "Vivid OFF") • \(colorFilterVerified ? "Filter loaded" : "Verify picture changes")"
+        } else if vividEnabled {
+            colorStatusLabel.text = "Vivid (mpvRx 1.2 luma / 1.2 chroma)\n\(colorFilterVerified ? "Filter loaded" : "Applying…") • Select Vivid to turn off"
         } else {
             colorStatusLabel.text = colorEffectRequestedForVideo
                 ? "SDR: \(colorFilterVerified ? "filter listed" : "testing processing")\n100% is original • Select resets all"
-                : "SDR native picture • adjust a value to enable\n100% is original • Select resets all"
+                : "SDR native picture • adjust or toggle Vivid\nSelect on Vivid row toggles • other rows reset"
         }
     }
 
@@ -1344,8 +1690,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             scheduleColorFilterUpdate()
         case 4 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
-            // A small luma-plane offset lifts a dark SDR picture without
-            // changing the video geometry or invoking a second filter path.
+            // Fade the luma boost above the encoded-black threshold so the
+            // movie brightens without lifting OLED-black letterbox bars.
             colorBrightness = min(1.50, max(0.70,
                 (colorBrightness * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorBrightness, forKey: "Nuvio.ColorBrightness")
@@ -1365,11 +1711,27 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     colorContrast = 1.05
                 }
             } else {
+                // Disabling HDR boost must also turn off HDR software Vivid.
+                vividEnabled = false
                 colorFilterFailed = false
             }
             scheduleColorFilterUpdate()
+        case 6 where sourceColorMetadataReady && !requiresNativeDolbyVision
+            && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
+            // Right enables, left disables. Select toggles independently.
+            vividEnabled = direction > 0
+            scheduleColorFilterUpdate()
         default: break
         }
+        updatePictureLabels()
+        showPanel()
+    }
+
+    private func toggleVivid() {
+        guard sourceColorMetadataReady, !requiresNativeDolbyVision,
+              (!sourceIsHDR || experimentalHDRColorBoost), !colorFilterFailed else { return }
+        vividEnabled.toggle()
+        scheduleColorFilterUpdate()
         updatePictureLabels()
         showPanel()
     }
@@ -1381,6 +1743,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         colorContrast = 1.0
         colorBrightness = 1.0
         experimentalHDRColorBoost = false
+        vividEnabled = false
         colorEffectRequestedForVideo = false
         colorFilterFailed = false
         UserDefaults.standard.set(1.0, forKey: "Nuvio.ColorSaturation")
@@ -1458,7 +1821,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let nonneutral = abs(colorSaturation - 1.0) > 0.001
             || abs(colorContrast - 1.0) > 0.001
             || abs(colorBrightness - 1.0) > 0.001
-        let enabled = nonneutral && colorEffectRequestedForVideo
+        let enabled = (vividEnabled || (nonneutral && colorEffectRequestedForVideo))
             && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
@@ -1534,20 +1897,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             return
         }
 
-        // MPVKit's pinned FFmpeg is built with --disable-filters and a
-        // selective allowlist. It DOES NOT include the video 'eq' filter
-        // used by previous builds. The supported 'lutyuv' filter is enabled
-        // by --enable-filter=lut*. Apply contrast to the Y plane and
-        // saturation to U/V around the bit-depth-correct neutral midpoint.
-        // Brightness adds a modest luma offset in native sample units.
-        // This expression works on both 8-bit (128) and 10-bit (512) YUV;
-        // no hardcoded pixel depth or conversion to 8-bit is required.
-        // IMPORTANT: HDR/Dolby Vision may still lose dynamic metadata when
-        // video pixels are filtered. HDR stays explicit opt-in.
-        let lumaLift = (colorBrightness - 1.0) * 0.35
-        let spec = String(format:
-            "@nuvio-color:lavfi=[lutyuv=y=(val-(maxval+1)/2)*%.2f+(maxval+1)/2+(maxval+1)*%.4f:u=(val-(maxval+1)/2)*%.2f+(maxval+1)/2:v=(val-(maxval+1)/2)*%.2f+(maxval+1)/2]",
-            colorContrast, lumaLift, colorSaturation, colorSaturation)
+        // MPVKit's pinned FFmpeg supports lutyuv, but its old constant
+        // brightness offset also brightened source-encoded black letterbox
+        // and pillarbox pixels. Keep their original YUV black levels (SDR
+        // and HDR) while fading the normal brightness/contrast changes into
+        // the actual picture. This is a per-pixel black-matte detector, not
+        // a rectangle overlay that could crop content or clash with zoom.
+        // Native display bars are already pure black. Dolby Vision is still
+        // excluded from this software filter entirely; HDR requires opt-in.
+        let spec = NuvioBlackBarProtection.videoFilter(
+            contrast: colorContrast, brightness: colorBrightness,
+            saturation: colorSaturation, vivid: vividEnabled)
         colorFilterInFlight = true
         colorFilterVerified = false
         updatePictureLabels()
@@ -1585,7 +1945,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                               self.core === playbackCore,
                               self.playbackGeneration == generation,
                               self.colorFilterActive,
-                              self.colorEffectRequestedForVideo else { return }
+                              (self.colorEffectRequestedForVideo || self.vividEnabled) else { return }
                         playbackCore.getPropertyAsync("hwdec-current") {
                             [weak self, weak playbackCore] decoderResult in
                             guard let self, let playbackCore,
@@ -1641,6 +2001,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if key == .upArrow || key == .downArrow || key == .playPause {
             explicitChromeHidden = false
         }
+        if key == .upArrow || key == .downArrow {
+            // Lightweight diagnostics for correlating Siri Remote focus
+            // changes with renderer capture. No signed media URL is logged.
+            NSLog("[NuvioControls] %@ playback=%.1f renderer=%llu captures=%llu",
+                  key == .upArrow ? "Up" : "Down", core?.timePos ?? 0,
+                  NuvioFrameTapMatchedCount(), NuvioFrameTapCallbackCount())
+        }
+        // Keep the familiar "click Select to accept" behavior even if tvOS
+        // briefly leaves focus on the transparent remote during a handoff.
+        if key == .select, resumeButton.isFocused, !resumeButton.isHidden {
+            acceptResume()
+            return
+        }
+        if key == .select, skipIntroButton.isFocused, !skipIntroButton.isHidden {
+            acceptSkipIntro()
+            return
+        }
         switch key {
         case .leftArrow, .rightArrow:
             let direction = key == .rightArrow ? 1 : -1
@@ -1682,7 +2059,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .downArrow:
             if toolPanel == .picture {
-                selectedPictureControl = (selectedPictureControl + 1) % 6
+                selectedPictureControl = (selectedPictureControl + 1) % 7
                 updatePictureLabels()
                 showPanel()
             } else if toolPanel == .audio || toolPanel == .subtitles {
@@ -1696,8 +2073,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .select:
             if toolPanel == .picture {
-                resetPicture()
-                showPanel()
+                if selectedPictureControl == 6 {
+                    toggleVivid()
+                } else {
+                    resetPicture()
+                    showPanel()
+                }
             } else if toolPanel == .audio || toolPanel == .subtitles {
                 chooseSelectedTrack()
             } else if toolPanel == .info {
@@ -3014,7 +3395,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         }
     }
 
-    private func leavePlayback() {
+    private func leavePlayback(naturalEnd: Bool = false) {
+        resumeOfferTimeout?.cancel()
+        resumeOfferTimeout = nil
+        saveHistorySnapshot(finishing: naturalEnd)
         stopPreviewArrowHold()
         NuvioFrameTapStop()
         frameTapInstalled = false
@@ -3082,6 +3466,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         seekTimeRow.alpha = 0
         seekPreviewSpinner.stopAnimating()
         showPanel()
+        offeredResumePosition = 0
+        resumeButton.isHidden = true
+        clearIntroLookup()
+        idleLabel.isHidden = true
+        statusLabel.isHidden = true
+        panel.isHidden = true
+        historyHome.reload()
+        historyHome.isHidden = false
+        // On the Recent gallery, real UIButton cards own Siri Remote focus.
+        remote.isHidden = !historyHome.preferredFocusEnvironments.isEmpty
+        view.bringSubviewToFront(historyHome)
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
     }
 
     private func showPanel() {
@@ -3103,11 +3500,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             isTouchScrubbing || targetSeconds != nil ||
             toolbarFocused || toolPanel != .none
         )
-        // During normal playback, Down may reveal Audio / CC / Info, but
-        // the timeline remains hidden. Progress is ONLY visible when paused
-        // or in a locked/paused-scrub state.
+        // Down focuses the toolbar during active playback. Show the
+        // progress bar, cached segments, playhead and timestamps alongside
+        // those controls, without pausing playback or opening seek preview.
+        // Auto-hide and Back still dismiss the complete playback chrome.
         let showTimeline = core != nil && (!playing ||
-            lockedSeekDirection != 0 || isTouchScrubbing)
+            lockedSeekDirection != 0 || isTouchScrubbing || toolbarFocused)
         controlsVisible = hasPlayerControls
         panel.isHidden = !hasPlayerControls
         progress.isHidden = !showTimeline
@@ -3139,6 +3537,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func refreshClock() {
+        if resumeButton.isHidden, core != nil,
+           !isPreparingPlayback, !waitingForFirstFrame,
+           Date().timeIntervalSince(lastHistorySnapshot) >= 5 {
+            saveHistorySnapshot()
+        }
         if !configuredNativeP5Preview, (core?.doviProfile ?? 0) == 5 {
             configuredNativeP5Preview = true
             thumbs.setNativeDolbyVisionOnly(true)
@@ -3153,6 +3556,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             sourceIsHDR = true
             sourceColorMetadataReady = true
             experimentalHDRColorBoost = false
+            vividEnabled = false
             colorEffectRequestedForVideo = false
             scheduleColorFilterUpdate()
             updatePictureLabels()
@@ -3176,6 +3580,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 currentSeconds = actual
             }
         }
+        refreshIntroOffer()
         // Feed the active media timestamp into the renderer's decoded-frame
         // tap. Conversion runs on a private GPU queue and JPEGs write on the
         // existing serial cache writer. Nothing seeks or opens another codec.
@@ -3286,9 +3691,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
             // Keep cached-frame highlighting; omit all capture/decode/debug
             // counters from the user-facing playback overlay.
-            cachedTimeline.durationSeconds = totalSeconds
-            cachedTimeline.frameSlots = stats.slots
-            cachedTimeline.setNeedsDisplay()
+            // Focus animations can run while the progress overlay is visible.
+            // Do not redraw hundreds of timeline notches every second unless
+            // actual coverage or duration changed. Set iteration order is
+            // unstable, so compare sorted slots for a meaningful difference.
+            let newSlots = stats.slots.sorted()
+            if cachedTimeline.frameSlots != newSlots ||
+               abs(cachedTimeline.durationSeconds - totalSeconds) > 0.5 {
+                cachedTimeline.durationSeconds = totalSeconds
+                cachedTimeline.frameSlots = newSlots
+                cachedTimeline.setNeedsDisplay()
+            }
         }
     }
 
@@ -3359,8 +3772,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     deinit {
+        introLookupTask?.cancel()
+        skipIntroOfferTimeout?.cancel()
         clock?.invalidate()
         firstFrameTimeout?.cancel()
+        resumeOfferTimeout?.cancel()
         repeatTimer?.invalidate()
         holdActivationTimer?.invalidate()
         thumbTimer?.invalidate()

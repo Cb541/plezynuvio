@@ -383,6 +383,7 @@ final class NuvioHistoryHomeView: UIView {
     private var cards: [String: NuvioHistoryTile] = [:]
     private var firstCard: UIButton?
     private var observer: NSObjectProtocol?
+    private var artworkRetryTimer: Timer?
 
     override var preferredFocusEnvironments: [UIFocusEnvironment] {
         firstCard.map { [$0] } ?? []
@@ -432,11 +433,20 @@ final class NuvioHistoryHomeView: UIView {
             self.refreshArtwork()
         }
         reload()
+        // Retry failed requests while Recent remains open. Success is disk
+        // cached, so this does not repeatedly download finished posters.
+        artworkRetryTimer = Timer.scheduledTimer(withTimeInterval: 12,
+            repeats: true) { [weak self] _ in
+            guard let self, !self.isHidden else { return }
+            NuvioPlaybackLibrary.shared.prepareRecentArtwork()
+            self.refreshArtwork()
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("Use init(frame:)") }
 
     deinit {
+        artworkRetryTimer?.invalidate()
         if let observer { NotificationCenter.default.removeObserver(observer) }
     }
 

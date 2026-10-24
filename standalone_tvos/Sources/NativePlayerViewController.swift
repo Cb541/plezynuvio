@@ -125,6 +125,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let historyHome = NuvioHistoryHomeView()
     private let resumeButton = UIButton(type: .system)
     private var offeredResumePosition = 0.0
+    // Cancelable five-second prompt, counted from playback becoming usable.
+    private var resumeOfferTimeout: DispatchWorkItem?
     private var lastHistorySnapshot = Date.distantPast
     private var pendingLink: NativeStreamLink?
     private var hasAppeared = false
@@ -330,7 +332,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let seekPreviewSpinner = UIActivityIndicatorView(style: .medium)
     private let previewLoadingLabel = UILabel()
 
-    override var preferredFocusEnvironments: [UIFocusEnvironment] { [remote] }
+    override var preferredFocusEnvironments: [UIFocusEnvironment] {
+        // A full-screen RemoteSurface was always first before, swallowing
+        // Siri Remote Select and making both ordinary UIButtons unclickable.
+        if !resumeButton.isHidden { return [resumeButton] }
+        if link == nil, !historyHome.isHidden,
+           !historyHome.preferredFocusEnvironments.isEmpty {
+            return [historyHome]
+        }
+        return [remote]
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -389,27 +400,72 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         config.cornerStyle = .capsule
         config.baseBackgroundColor = UIColor(white: 0.17, alpha: 0.91)
         config.baseForegroundColor = .white
-        config.contentInsets = NSDirectionalEdgeInsets(top: 15, leading: 25, bottom: 15, trailing: 25)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 13, leading: 26, bottom: 13, trailing: 26)
         resumeButton.configuration = config
+        resumeButton.accessibilityLabel = "Resume playback from your saved position"
+        resumeButton.configurationUpdateHandler = { button in
+            guard var style = button.configuration else { return }
+            style.baseBackgroundColor = button.isFocused
+                ? UIColor.white
+                : UIColor(white: 0.17, alpha: 0.92)
+            style.baseForegroundColor = button.isFocused ? .black : .white
+            button.configuration = style
+        }
         resumeButton.translatesAutoresizingMaskIntoConstraints = false
         resumeButton.isHidden = true
         resumeButton.addTarget(self, action: #selector(acceptResume),
                                for: .primaryActionTriggered)
         view.addSubview(resumeButton)
         NSLayoutConstraint.activate([
-            resumeButton.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor,
-                                                  constant: 65),
-            resumeButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor,
-                                              constant: 40)
+            // Above the bottom transport row and aligned near its right edge.
+            // Keep a full independent vertical lane for future Skip Intro UI.
+            resumeButton.trailingAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -76),
+            resumeButton.bottomAnchor.constraint(
+                equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -126)
         ])
         idleLabel.isHidden = true
     }
 
-    @objc private func acceptResume() {
-        guard offeredResumePosition > 20, let playbackCore = core else { return }
-        let seconds = offeredResumePosition
-        offeredResumePosition = 0
+    /// Show only after mpv has produced a frame and HDMI display-mode
+    /// negotiation has finished. The visible, focusable button gets five
+    /// seconds, not fifteen seconds of hidden/blocked startup time.
+    private func offerResumeForFiveSeconds() {
+        guard link != nil, core != nil, offeredResumePosition >= 20 else { return }
+        resumeOfferTimeout?.cancel()
+        resumeButton.isHidden = false
+        remote.isHidden = true
+        view.bringSubviewToFront(resumeButton)
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+        let generation = playbackGeneration
+        let expiry = DispatchWorkItem { [weak self] in
+            guard let self, self.playbackGeneration == generation else { return }
+            self.dismissResumeOffer()
+        }
+        resumeOfferTimeout = expiry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: expiry)
+    }
+
+    private func dismissResumeOffer() {
+        resumeOfferTimeout?.cancel()
+        resumeOfferTimeout = nil
         resumeButton.isHidden = true
+        offeredResumePosition = 0
+        // Release focus back to the original player remote; none of the
+        // 12-second seek/toolbar handlers need to change.
+        remote.isHidden = false
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+    }
+
+    @objc private func acceptResume() {
+        guard !resumeButton.isHidden, offeredResumePosition >= 20,
+              let playbackCore = core else { return }
+        let seconds = offeredResumePosition
+        dismissResumeOffer()
+        currentSeconds = seconds
+        refreshLabels()
         playbackCore.commandAsync(["seek", String(format: "%.3f", seconds), "absolute"]) { _ in }
     }
 
@@ -471,7 +527,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if link != nil { saveHistorySnapshot() }
         isPreparingPlayback = true
         historyHome.isHidden = true
+        resumeOfferTimeout?.cancel()
+        resumeOfferTimeout = nil
         resumeButton.isHidden = true
+        remote.isHidden = false
         lastHistorySnapshot = .distantPast
         // Turn off the old renderer hook before its core is disposed.
         NuvioFrameTapStop()
@@ -548,9 +607,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let remembered = NuvioPlaybackLibrary.shared.item(for: media)?.position ?? 0
         offeredResumePosition = max(media.resumeSeconds, remembered)
         NuvioPlaybackLibrary.shared.opened(media)
-        if offeredResumePosition >= 20 {
-            resumeButton.isHidden = false
-        }
+        // Do not display the offer while the hardware decoder or HDMI mode
+        // is still starting. It becomes actionable only after playback starts.
         frameViews.first?.image = nil
         seekPreviewSpinner.stopAnimating()
         previewLoadingLabel.isHidden = true
@@ -774,6 +832,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     }
                     self.statusLabel.text = ""
                     self.showPanel()
+                    self.offerResumeForFiveSeconds()
                     // Defer subtitles until after the video is running.
                     if self.permanentlyDisableSubtitles {
                         core.setProperty("sid", value: "no")
@@ -925,14 +984,6 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     self.applyPictureTransform()
                     self.checkColorSourceMetadata()
                     self.finishDisplayNegotiation()
-                    if !self.resumeButton.isHidden {
-                        let expectedGeneration = self.playbackGeneration
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
-                            guard let self, self.playbackGeneration == expectedGeneration else { return }
-                            self.offeredResumePosition = 0
-                            self.resumeButton.isHidden = true
-                        }
-                    }
                 } else {
                     // Subsequent playback-restart events also occur after
                     // seeking. Do not restart the initial-display gate.
@@ -1733,6 +1784,12 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // The select that confirms a preview sets this back to true below.
         if key == .upArrow || key == .downArrow || key == .playPause {
             explicitChromeHidden = false
+        }
+        // Keep the familiar "click Select to accept" behavior even if tvOS
+        // briefly leaves focus on the transparent remote during a handoff.
+        if key == .select, !resumeButton.isHidden {
+            acceptResume()
+            return
         }
         switch key {
         case .leftArrow, .rightArrow:
@@ -3108,6 +3165,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func leavePlayback(naturalEnd: Bool = false) {
+        resumeOfferTimeout?.cancel()
+        resumeOfferTimeout = nil
         saveHistorySnapshot(finishing: naturalEnd)
         stopPreviewArrowHold()
         NuvioFrameTapStop()
@@ -3183,7 +3242,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         panel.isHidden = true
         historyHome.reload()
         historyHome.isHidden = false
-        view.setNeedsFocusUpdate()
+        // On the Recent gallery, real UIButton cards own Siri Remote focus.
+        remote.isHidden = !historyHome.preferredFocusEnvironments.isEmpty
+        view.bringSubviewToFront(historyHome)
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
     }
 
     private func showPanel() {
@@ -3468,6 +3531,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     deinit {
         clock?.invalidate()
         firstFrameTimeout?.cancel()
+        resumeOfferTimeout?.cancel()
         repeatTimer?.invalidate()
         holdActivationTimer?.invalidate()
         thumbTimer?.invalidate()

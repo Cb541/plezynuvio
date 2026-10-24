@@ -632,12 +632,13 @@ final class NuvioHistoryHomeView: UIView {
         tiles.translatesAutoresizingMaskIntoConstraints = false
         tiles.axis = .horizontal
         tiles.alignment = .top
-        tiles.spacing = 31
+        tiles.spacing = 36
         gallery.addSubview(tiles)
         NSLayoutConstraint.activate([
-            heading.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 60),
-            heading.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 78),
-            gallery.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 48),
+            heading.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 20),
+            heading.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            // Preserve the existing poster row position while moving the heading up.
+            gallery.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 88),
             gallery.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 74),
             gallery.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -40),
             // Large cinematic poster wall: allow the full-size cards and their titles.

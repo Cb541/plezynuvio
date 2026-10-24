@@ -480,7 +480,7 @@ final class NuvioHistoryHomeView: UIView {
         tiles.translatesAutoresizingMaskIntoConstraints = false
         tiles.axis = .horizontal
         tiles.alignment = .top
-        tiles.spacing = 38
+        tiles.spacing = 24
         gallery.addSubview(tiles)
         NSLayoutConstraint.activate([
             heading.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 60),
@@ -488,7 +488,7 @@ final class NuvioHistoryHomeView: UIView {
             gallery.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 48),
             gallery.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 74),
             gallery.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -40),
-            gallery.heightAnchor.constraint(equalToConstant: 515),
+            gallery.heightAnchor.constraint(equalToConstant: 348),
             tiles.topAnchor.constraint(equalTo: gallery.contentLayoutGuide.topAnchor, constant: 10),
             tiles.leadingAnchor.constraint(equalTo: gallery.contentLayoutGuide.leadingAnchor, constant: 4),
             tiles.trailingAnchor.constraint(equalTo: gallery.contentLayoutGuide.trailingAnchor, constant: -26),
@@ -573,15 +573,16 @@ private final class NuvioHistoryTile: UIButton {
         backgroundColor = .clear
         clipsToBounds = false
         isUserInteractionEnabled = true
-        widthAnchor.constraint(equalToConstant: 285).isActive = true
-        heightAnchor.constraint(equalToConstant: 478).isActive = true
+        widthAnchor.constraint(equalToConstant: 162).isActive = true
+        // 249pt poster plus space for the two-line title beneath it.
+        heightAnchor.constraint(equalToConstant: 310).isActive = true
         accessibilityLabel = "Play " + item.title
         accessibilityTraits.insert(.button)
 
         let poster = UIView()
         poster.translatesAutoresizingMaskIntoConstraints = false
         poster.backgroundColor = UIColor(red: 0.10, green: 0.13, blue: 0.20, alpha: 1)
-        poster.layer.cornerRadius = 15
+        poster.layer.cornerRadius = 8
         poster.clipsToBounds = true
         poster.isUserInteractionEnabled = false
         addSubview(poster)
@@ -595,7 +596,7 @@ private final class NuvioHistoryTile: UIButton {
         placeholder.translatesAutoresizingMaskIntoConstraints = false
         placeholder.text = item.title
         placeholder.textAlignment = .center
-        placeholder.font = .systemFont(ofSize: 29, weight: .bold)
+        placeholder.font = .systemFont(ofSize: 20, weight: .bold)
         placeholder.numberOfLines = 4
         placeholder.textColor = .white.withAlphaComponent(0.83)
         placeholder.isUserInteractionEnabled = false
@@ -604,7 +605,7 @@ private final class NuvioHistoryTile: UIButton {
         // Temporary small diagnostics, visible only on blank poster cards.
         // No signed URLs, stream secrets, or file paths are displayed.
         posterStatus.translatesAutoresizingMaskIntoConstraints = false
-        posterStatus.font = .systemFont(ofSize: 14, weight: .medium)
+        posterStatus.font = .systemFont(ofSize: 11, weight: .medium)
         posterStatus.textColor = UIColor.white.withAlphaComponent(0.66)
         posterStatus.numberOfLines = 2
         posterStatus.textAlignment = .center
@@ -622,7 +623,7 @@ private final class NuvioHistoryTile: UIButton {
             episodeSuffix = ""
         }
         title.text = item.title + episodeSuffix
-        title.font = .systemFont(ofSize: 24, weight: .semibold)
+        title.font = .systemFont(ofSize: 18, weight: .semibold)
         title.textColor = .white
         title.numberOfLines = 2
         title.translatesAutoresizingMaskIntoConstraints = false
@@ -633,7 +634,8 @@ private final class NuvioHistoryTile: UIButton {
             poster.leadingAnchor.constraint(equalTo: leadingAnchor),
             poster.trailingAnchor.constraint(equalTo: trailingAnchor),
             poster.topAnchor.constraint(equalTo: topAnchor),
-            poster.heightAnchor.constraint(equalToConstant: 422),
+            // Exactly 162 × 249 points; scaleAspectFill preserves art proportions.
+            poster.heightAnchor.constraint(equalToConstant: 249),
             art.leadingAnchor.constraint(equalTo: poster.leadingAnchor),
             art.trailingAnchor.constraint(equalTo: poster.trailingAnchor),
             art.topAnchor.constraint(equalTo: poster.topAnchor),
@@ -644,7 +646,7 @@ private final class NuvioHistoryTile: UIButton {
             posterStatus.leadingAnchor.constraint(equalTo: poster.leadingAnchor, constant: 12),
             posterStatus.trailingAnchor.constraint(equalTo: poster.trailingAnchor, constant: -12),
             posterStatus.bottomAnchor.constraint(equalTo: poster.bottomAnchor, constant: -18),
-            title.topAnchor.constraint(equalTo: poster.bottomAnchor, constant: 12),
+            title.topAnchor.constraint(equalTo: poster.bottomAnchor, constant: 9),
             title.leadingAnchor.constraint(equalTo: leadingAnchor),
             title.trailingAnchor.constraint(equalTo: trailingAnchor),
             title.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor)

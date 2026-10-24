@@ -726,7 +726,7 @@ private final class NuvioHistoryTile: UIButton {
         backgroundColor = .clear
         clipsToBounds = false
         isUserInteractionEnabled = true
-        widthAnchor.constraint(equalToConstant: 391).isActive = true
+        widthAnchor.constraint(equalToConstant: 411).isActive = true
         // 601pt poster plus room for the two-line title beneath it.
         heightAnchor.constraint(equalToConstant: 667).isActive = true
         accessibilityLabel = "Play " + item.title
@@ -735,7 +735,7 @@ private final class NuvioHistoryTile: UIButton {
         let poster = UIView()
         poster.translatesAutoresizingMaskIntoConstraints = false
         poster.backgroundColor = UIColor(red: 0.10, green: 0.13, blue: 0.20, alpha: 1)
-        poster.layer.cornerRadius = 9
+        poster.layer.cornerRadius = 11
         poster.clipsToBounds = true
         poster.isUserInteractionEnabled = false
         addSubview(poster)
@@ -787,7 +787,7 @@ private final class NuvioHistoryTile: UIButton {
             poster.leadingAnchor.constraint(equalTo: leadingAnchor),
             poster.trailingAnchor.constraint(equalTo: trailingAnchor),
             poster.topAnchor.constraint(equalTo: topAnchor),
-            // Fifteen percent smaller: 391 × 601pt, preserving the portrait ratio.
+            // Updated portrait card: 411 × 601pt, 5% wider than the previous 391pt.
             poster.heightAnchor.constraint(equalToConstant: 601),
             art.leadingAnchor.constraint(equalTo: poster.leadingAnchor),
             art.trailingAnchor.constraint(equalTo: poster.trailingAnchor),

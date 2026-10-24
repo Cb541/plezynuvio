@@ -26,7 +26,10 @@ final class NuvioPlaybackLibrary {
     private let appRoot: URL
     private let artRoot: URL
     private(set) var items: [NuvioHistoryItem] = []
-    private var posterLookups = Set<String>()
+    // Retry failed metadata lookups rather than permanently blacklisting cards.
+    private var posterLookups: [String: Date] = [:]
+    private var artworkDownloads = Set<String>()
+    private var artworkRetryAt: [String: Date] = [:]
 
     private init() {
         appRoot = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -78,7 +81,9 @@ final class NuvioPlaybackLibrary {
         if let url = media.artworkURL {
             fetchArtwork(url, id: id, variant: "provided")
         }
-        if let entry = items.first { fetchMetadataPoster(for: entry) }
+        if let entry = items.first(where: { $0.id == id }) {
+            fetchMetadataPoster(for: entry)
+        }
     }
 
     func update(_ media: NativeStreamLink, position: Double, duration: Double,
@@ -165,26 +170,48 @@ final class NuvioPlaybackLibrary {
         }
     }
 
-    /// Fetch Nuvio's poster/backdrop, using separate files so a landscape
-    /// image cannot permanently block a better portrait poster.
+    /// Bounded retryable network image download. Failed image requests used
+    /// to fail silently and the gallery would show only the title forever.
     private func fetchArtwork(_ url: URL, id: String, variant: String) {
-        // The deep-link parser already accepts both HTTP and HTTPS.
-        // Keep artwork fetching consistent; an HTTP CDN URL must not
-        // silently become an empty poster (ATS is allowed by project.yml).
         guard let scheme = url.scheme?.lowercased(),
               ["https", "http"].contains(scheme),
               url.host != nil, ["poster", "provided"].contains(variant) else { return }
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.fetchArtwork(url, id: id, variant: variant)
+            }
+            return
+        }
         let destination = artRoot.appendingPathComponent(variant + "-" + id + ".jpg")
-        guard !fm.fileExists(atPath: destination.path) else { return }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 12
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            guard let self, let response = response as? HTTPURLResponse,
-                  (200...299).contains(response.statusCode),
-                  let data, data.count < 8_000_000,
-                  let image = UIImage(data: data) else { return }
+        if fm.fileExists(atPath: destination.path),
+           UIImage(contentsOfFile: destination.path) != nil { return }
+        let lookupKey = variant + ":" + id
+        guard !artworkDownloads.contains(lookupKey) else { return }
+        if let retry = artworkRetryAt[lookupKey], retry > Date() { return }
+        artworkDownloads.insert(lookupKey)
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = 18
+        request.setValue("image/jpeg,image/png,image/*;q=0.8",
+                         forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
+                guard let self else { return }
+                self.artworkDownloads.remove(lookupKey)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard error == nil, (200...299).contains(status),
+                      let data, !data.isEmpty, data.count < 12_000_000,
+                      let image = UIImage(data: data) else {
+                    self.artworkRetryAt[lookupKey] = Date().addingTimeInterval(25)
+                    // Never log signed media links or complete artwork URLs.
+                    NSLog("[NuvioArt] Image load failed host=%@ type=%@ status=%ld reason=%@",
+                          url.host ?? "unknown", variant, status,
+                          error.map { String(describing: $0.code) } ?? "decode-or-http")
+                    return
+                }
+                self.artworkRetryAt.removeValue(forKey: lookupKey)
                 self.savePoster(image, id: id, variant: variant)
+                NSLog("[NuvioArt] Image cached type=%@ host=%@",
+                      variant, url.host ?? "unknown")
                 NotificationCenter.default.post(name: Self.changed, object: nil)
             }
         }.resume()
@@ -208,14 +235,22 @@ final class NuvioPlaybackLibrary {
     }
 
     private func fetchMetadataPoster(for entry: NuvioHistoryItem) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.fetchMetadataPoster(for: entry)
+            }
+            return
+        }
         let id = entry.id
-        guard !posterLookups.contains(id),
-              !fm.fileExists(atPath:
-                artRoot.appendingPathComponent("poster-" + id + ".jpg").path)
-        else { return }
-        posterLookups.insert(id)
-        let rawIdentifiers = [entry.contentId, entry.videoId].compactMap { $0 }
-        let imdb = rawIdentifiers.compactMap({ value -> String? in
+        let posterPath = artRoot.appendingPathComponent("poster-" + id + ".jpg").path
+        if fm.fileExists(atPath: posterPath),
+           UIImage(contentsOfFile: posterPath) != nil { return }
+        // Recover from intermittent network errors on the next gallery visit.
+        if let last = posterLookups[id], Date().timeIntervalSince(last) < 35 { return }
+        posterLookups[id] = Date()
+
+        let identifiers = [entry.contentId, entry.videoId].compactMap { $0 }
+        let imdb = identifiers.compactMap({ value -> String? in
             guard let match = value.range(of: #"tt[0-9]{5,12}"#,
                                           options: .regularExpression) else { return nil }
             return String(value[match])
@@ -223,25 +258,34 @@ final class NuvioPlaybackLibrary {
         let looksLikeSeries = (entry.videoId ?? "").range(
             of: #":[0-9]+:[0-9]+$"#, options: .regularExpression) != nil
         if let imdb {
-            // Exact IMDb metadata avoids guessing between similarly named titles.
+            // Stremio officially uses this deterministic poster endpoint.
+            // It can succeed even when Cinemeta's JSON lookup does not.
+            if let direct = URL(string:
+                "https://images.metahub.space/poster/medium/" + imdb + "/img") {
+                fetchArtwork(direct, id: id, variant: "poster")
+            }
             let category = looksLikeSeries ? "series" : "movie"
             guard let endpoint = URL(string:
                 "https://v3-cinemeta.strem.io/meta/" + category + "/" + imdb + ".json")
             else { return }
             var request = URLRequest(url: endpoint)
-            request.timeoutInterval = 12
-            URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-                guard let self, let data, let response = response as? HTTPURLResponse,
-                      (200...299).contains(response.statusCode),
+            request.timeoutInterval = 15
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard let data, error == nil, (200...299).contains(status),
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let meta = json["meta"] as? [String: Any],
                       let poster = meta["poster"] as? String,
-                      let posterURL = URL(string: poster) else { return }
-                self.fetchArtwork(posterURL, id: id, variant: "poster")
+                      let posterURL = URL(string: poster) else {
+                    NSLog("[NuvioArt] Metadata missing type=%@ status=%ld",
+                          category, status)
+                    return
+                }
+                DispatchQueue.main.async {
+                    self?.fetchArtwork(posterURL, id: id, variant: "poster")
+                }
             }.resume()
         } else {
-            // Older handoffs did not include IMDb ids. Search by title, but
-            // accept ONLY an exact title match: never attach random artwork.
             fetchTitleMatchedPoster(title: entry.title, id: id, category: "movie")
         }
     }

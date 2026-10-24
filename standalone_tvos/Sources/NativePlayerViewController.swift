@@ -22,6 +22,79 @@ private final class RemoteSurface: UIView {
     }
 }
 
+/// UIKit's standard filled UIButton can become an opaque white focus plate
+/// on tvOS even when configuration.baseBackgroundColor is set to black.
+/// A focusable UIView with our own opaque black backing avoids the system
+/// UIButton focus treatment entirely, while keeping Siri Remote Select.
+private final class OLEDResumeButton: UIView {
+    var onActivate: (() -> Void)?
+    private let blackPill = UIView()
+    private let caption = UILabel()
+
+    override var canBecomeFocused: Bool { true }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = true
+        backgroundColor = .clear
+        accessibilityLabel = "Resume playback from your saved position"
+        accessibilityTraits.insert(.button)
+
+        blackPill.translatesAutoresizingMaskIntoConstraints = false
+        blackPill.backgroundColor = UIColor(red: 0, green: 0, blue: 0, alpha: 1)
+        blackPill.layer.cornerRadius = 30
+        blackPill.layer.borderColor = UIColor.white.cgColor
+        blackPill.layer.borderWidth = 0
+        blackPill.isUserInteractionEnabled = false
+        addSubview(blackPill)
+
+        caption.translatesAutoresizingMaskIntoConstraints = false
+        caption.text = "Resume?"
+        caption.font = .systemFont(ofSize: 27, weight: .semibold)
+        caption.textColor = .white
+        caption.textAlignment = .center
+        caption.backgroundColor = .clear
+        caption.isUserInteractionEnabled = false
+        blackPill.addSubview(caption)
+
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 200),
+            heightAnchor.constraint(equalToConstant: 60),
+            blackPill.leadingAnchor.constraint(equalTo: leadingAnchor),
+            blackPill.trailingAnchor.constraint(equalTo: trailingAnchor),
+            blackPill.topAnchor.constraint(equalTo: topAnchor),
+            blackPill.bottomAnchor.constraint(equalTo: bottomAnchor),
+            caption.leadingAnchor.constraint(equalTo: blackPill.leadingAnchor, constant: 18),
+            caption.trailingAnchor.constraint(equalTo: blackPill.trailingAnchor, constant: -18),
+            caption.centerYAnchor.constraint(equalTo: blackPill.centerYAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) { return nil }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext,
+                                 with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        coordinator.addCoordinatedAnimations({
+            // Preserve true OLED black in both focus states: only the subtle
+            // white border and scale change, never the pill's fill or text.
+            self.blackPill.backgroundColor = .black
+            self.caption.textColor = .white
+            self.blackPill.layer.borderWidth = self.isFocused ? 2 : 0
+            self.transform = self.isFocused
+                ? CGAffineTransform(scaleX: 1.045, y: 1.045) : .identity
+        })
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if presses.contains(where: { $0.type == .select }) {
+            onActivate?()
+        } else {
+            super.pressesBegan(presses, with: event)
+        }
+    }
+}
+
 /// Canvas-drawn transport symbols remain visible on sideloaded tvOS,
 /// without depending on UIButton-disabled imagery or SF Symbol fonts.
 private final class PlayerToolGlyph: UIView {
@@ -123,7 +196,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var core: MpvPlayerCore?
     private let thumbs = SeekFrameService()
     private let historyHome = NuvioHistoryHomeView()
-    private let resumeButton = UIButton(type: .system)
+    private let resumeButton = OLEDResumeButton()
     private var offeredResumePosition = 0.0
     // Cancelable seven-second prompt, counted from playback becoming usable.
     private var resumeOfferTimeout: DispatchWorkItem?
@@ -395,29 +468,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             self.open(media)
         }
 
-        var config = UIButton.Configuration.filled()
-        config.title = "Resume?"
-        config.cornerStyle = .capsule
-        config.baseBackgroundColor = .black
-        config.baseForegroundColor = .white
-        config.contentInsets = NSDirectionalEdgeInsets(top: 13, leading: 26, bottom: 13, trailing: 26)
-        resumeButton.configuration = config
-        resumeButton.accessibilityLabel = "Resume playback from your saved position"
-        resumeButton.configurationUpdateHandler = { button in
-            guard var style = button.configuration else { return }
-            // True OLED black with white lettering, even while focused.
-            style.baseBackgroundColor = .black
-            style.baseForegroundColor = .white
-            button.configuration = style
-            // White focus stroke instead of inverting the black pill.
-            button.layer.borderColor = UIColor.white.cgColor
-            button.layer.borderWidth = button.isFocused ? 2 : 0
-            button.layer.cornerRadius = button.bounds.height / 2
-        }
+        // Use a custom focusable view instead of tvOS's filled UIButton:
+        // the latter paints a white system focus plate over custom colors.
         resumeButton.translatesAutoresizingMaskIntoConstraints = false
         resumeButton.isHidden = true
-        resumeButton.addTarget(self, action: #selector(acceptResume),
-                               for: .primaryActionTriggered)
+        resumeButton.onActivate = { [weak self] in self?.acceptResume() }
         view.addSubview(resumeButton)
         NSLayoutConstraint.activate([
             // Above the bottom transport row and aligned near its right edge.

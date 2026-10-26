@@ -190,14 +190,16 @@ static void nuvio_process_sample(id receiver, CMSampleBufferRef sample, bool via
             os_unfair_lock_lock(&sCallbackLock);
             NuvioFrameTapHandler callback = [sCallback copy];
             os_unfair_lock_unlock(&sCallbackLock);
-            if (callback) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (generation == atomic_load(&sGeneration)) {
-                        atomic_fetch_add_explicit(&sCallbackCount, 1,
-                                                  memory_order_relaxed);
-                        callback(result, slot);
-                    }
-                });
+            if (callback && generation == atomic_load(&sGeneration)) {
+                // Persist the already-decoded thumbnail directly from this
+                // independent serial conversion queue. Dispatching to the
+                // UIKit main queue created holes whenever the player controls
+                // or tvOS focus animations briefly occupied that queue.
+                // The callback only calls SeekFrameService's thread-safe
+                // cachePlaybackFrame; it must NEVER touch UIKit views here.
+                atomic_fetch_add_explicit(&sCallbackCount, 1,
+                                          memory_order_relaxed);
+                callback(result, slot);
             }
         }
     });

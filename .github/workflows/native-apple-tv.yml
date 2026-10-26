@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - build/nuvio-better-posters-20261026-001423-1418327
       - standalone-native-tvos-player
+      - feature/nuvio-recently-played-resume-dv
+      - fix/tvos-resume-recent-gallery-focus
     paths:
       - 'standalone_tvos/**'
       - '.github/workflows/native-apple-tv.yml'
@@ -30,6 +33,27 @@ jobs:
           swiftc standalone_tvos/Sources/NuvioAheadPlan.swift \
             standalone_tvos/Tests/main.swift -o /tmp/nuvio-ahead-test
           /tmp/nuvio-ahead-test
+          swiftc standalone_tvos/Sources/NuvioAheadRecovery.swift \
+            standalone_tvos/Tests/AheadRecovery/main.swift -o /tmp/nuvio-recovery-test
+          /tmp/nuvio-recovery-test
+          swiftc standalone_tvos/Sources/NuvioIntroSkip.swift \
+            standalone_tvos/Tests/IntroSkip/main.swift -o /tmp/nuvio-intro-test
+          /tmp/nuvio-intro-test
+          swiftc standalone_tvos/Sources/NuvioBlackBarProtection.swift \
+            standalone_tvos/Tests/BlackBar/main.swift -o /tmp/nuvio-blackbar-test
+          /tmp/nuvio-blackbar-test
+          swiftc standalone_tvos/Sources/NuvioBlackBarProtection.swift \
+            standalone_tvos/Tests/Vivid/main.swift -o /tmp/nuvio-vivid-test
+          /tmp/nuvio-vivid-test
+          swiftc standalone_tvos/Sources/NuvioVividPreferences.swift \
+            standalone_tvos/Tests/VividDefault/main.swift -o /tmp/nuvio-vivid-default-test
+          /tmp/nuvio-vivid-default-test
+          swiftc standalone_tvos/Sources/NuvioRecentFocus.swift \
+            standalone_tvos/Tests/RecentRemoval/main.swift -o /tmp/nuvio-recent-removal-test
+          /tmp/nuvio-recent-removal-test
+          swiftc standalone_tvos/Sources/NuvioBetterPosters.swift \
+            standalone_tvos/Tests/BetterPosters/main.swift -o /tmp/nuvio-better-posters-test
+          /tmp/nuvio-better-posters-test
 
       - name: Install XcodeGen
         run: |

@@ -9,6 +9,20 @@ final class NuvioAppDelegate: UIResponder, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
+        // Clear orphaned range/video previews from previous sessions or a
+        // forced termination. This never touches the durable history/artwork
+        // in NuvioPlaybackLibrary.
+        let fm = FileManager.default
+        for base in [FileManager.SearchPathDirectory.cachesDirectory,
+                     .applicationSupportDirectory] {
+            guard let root = fm.urls(for: base, in: .userDomainMask).first else { continue }
+            let seek = root.appendingPathComponent("NuvioSeekFrames", isDirectory: true)
+            try? fm.removeItem(at: seek)
+            if base == .cachesDirectory {
+                try? fm.removeItem(at: root.appendingPathComponent("NuvioPreviewRanges",
+                                                                 isDirectory: true))
+            }
+        }
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
             try AVAudioSession.sharedInstance().setActive(true)
@@ -69,6 +83,13 @@ struct NativeStreamLink {
     let url: URL
     let title: String
     let subtitle: URL?
+    let contentId: String?
+    let videoId: String?
+    let artworkURL: URL?
+    let seasonArtworkURL: URL?
+    let resumeSeconds: Double
+    let isHistoryLaunch: Bool
+    let episodeIdentity: NuvioEpisodeIdentity?
 
     init?(link: URL) {
         guard link.scheme?.lowercased() == "nuvio-player",
@@ -79,7 +100,37 @@ struct NativeStreamLink {
               ["https", "http"].contains(video.scheme?.lowercased() ?? ""),
               video.host != nil else { return nil }
         url = video
-        title = components.queryItems?.first(where: { ["title", "name"].contains($0.name) })?.value ?? "Now Playing"
+        let query = components.queryItems ?? []
+        title = query.first(where: { ["title", "name"].contains($0.name) })?.value ?? "Now Playing"
+        contentId = query.first(where: { $0.name == "contentId" })?.value
+        videoId = query.first(where: { $0.name == "videoId" })?.value
+        // Prefer explicit selected-episode identifiers; the standard
+        // Stremio videoId (tt...:season:episode) is supported automatically.
+        func queryValue(_ name: String) -> String? {
+            query.first(where: { $0.name == name })?.value
+        }
+        episodeIdentity = NuvioEpisodeIdentity.from(
+            videoId: videoId, contentId: contentId,
+            imdbID: queryValue("imdb_id") ?? queryValue("imdbId"),
+            season: queryValue("season").flatMap(Int.init),
+            episode: queryValue("episode").flatMap(Int.init))
+        if let rawArt = query.first(where: { $0.name == "artwork" })?.value,
+           let art = URL(string: rawArt),
+           ["https", "http"].contains(art.scheme?.lowercased() ?? "") {
+            artworkURL = art
+        } else {
+            artworkURL = nil
+        }
+        if let rawSeason = query.first(where: { $0.name == "seasonArtwork" })?.value,
+           let seasonURL = URL(string: rawSeason),
+           seasonURL.scheme?.lowercased() == "https",
+           seasonURL.host?.lowercased() == "image.tmdb.org" {
+            seasonArtworkURL = seasonURL
+        } else {
+            seasonArtworkURL = nil
+        }
+        resumeSeconds = max(0, Double(query.first(where: { $0.name == "resume" })?.value ?? "") ?? 0)
+        isHistoryLaunch = query.contains { $0.name == "history" && $0.value == "1" }
         if let value = components.queryItems?.first(where: { $0.name == "sub" })?.value,
            let subtitleURL = URL(string: value),
            ["https", "http"].contains(subtitleURL.scheme?.lowercased() ?? ""),

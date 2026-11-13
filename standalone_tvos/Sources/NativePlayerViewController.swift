@@ -220,6 +220,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var firstFrameTimeout: DispatchWorkItem?
     private var subtitleURLToLoad: URL?
     private var subtitleAlreadyRequested = false
+    // An explicit menu selection must not be replaced by automatic subtitles.
+    private var hasSelectedSubtitlesManually = false
     private let persistentSubtitlesKey = "Nuvio.PermanentlyDisableSubtitles"
     private var permanentlyDisableSubtitles: Bool {
         UserDefaults.standard.bool(forKey: persistentSubtitlesKey)
@@ -805,6 +807,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         repeatTimer = nil
         waitingForFirstFrame = true
         subtitleAlreadyRequested = false
+        hasSelectedSubtitlesManually = false
         firstFrameTimeout?.cancel()
         firstFrameTimeout = nil
         playbackGeneration += 1
@@ -914,8 +917,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         newCore.observeProperty("time-pos", format: "double")
         newCore.observeProperty("duration", format: "double")
         newCore.observeProperty("pause", format: "flag")
-        // Prevent mpv from automatically choosing embedded subtitle tracks.
-        if permanentlyDisableSubtitles { newCore.setProperty("sid", value: "no") }
+        // Do not enable full captions by default. Select only a forced
+        // English track after the media publishes its subtitle tracks.
+        newCore.setProperty("sid", value: "no")
         core = newCore
         // Observe the AVFoundation renderer's *input* samples, not its
         // displayedPixelBuffer() output (nil on some tvOS hardware paths).
@@ -1061,6 +1065,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                         core.setProperty("sid", value: "no")
                     } else {
                         self.attachInitialSubtitleIfAvailable()
+                        self.scheduleForcedEnglishSubtitleSelection()
                     }
                     self.schedulePreferredEnglishAudioSelection()
                     self.showPanel()
@@ -1084,6 +1089,90 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 guard let self, self.playbackGeneration == generation else { return }
                 if case .failure = result {
                     self.statusLabel.text = "Playing (external subtitles could not load)"
+                }
+            }
+        }
+    }
+
+    // Select a supplied forced English subtitle track for foreign-language
+    // dialogue; this does not do live audio recognition or translation.
+    private func scheduleForcedEnglishSubtitleSelection(after delay: TimeInterval = 1.2,
+                                                        retriesRemaining: Int = 2) {
+        guard let subtitleCore = core, !permanentlyDisableSubtitles,
+              !hasSelectedSubtitlesManually, subtitleURLToLoad == nil else { return }
+        let generation = playbackGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak subtitleCore] in
+            guard let self, let subtitleCore, self.core === subtitleCore,
+                  self.playbackGeneration == generation,
+                  !self.permanentlyDisableSubtitles, !self.hasSelectedSubtitlesManually,
+                  self.subtitleURLToLoad == nil else { return }
+            subtitleCore.getPropertyAsync("track-list/count") { [weak self, weak subtitleCore] result in
+                guard let self, let subtitleCore, self.core === subtitleCore,
+                      self.playbackGeneration == generation,
+                      !self.permanentlyDisableSubtitles, !self.hasSelectedSubtitlesManually,
+                      self.subtitleURLToLoad == nil else { return }
+                let count = min(96, max(0, Int((try? result.get()) ?? "") ?? 0))
+                guard count > 0 else {
+                    if retriesRemaining > 0 {
+                        self.scheduleForcedEnglishSubtitleSelection(after: 2.0,
+                                                                    retriesRemaining: retriesRemaining - 1)
+                    }
+                    return
+                }
+                let keys = ["type", "id", "lang", "title", "forced"]
+                var tracks = Array(repeating: [String: String](), count: count)
+                let group = DispatchGroup()
+                for index in 0..<count {
+                    for key in keys {
+                        group.enter()
+                        subtitleCore.getPropertyAsync("track-list/\(index)/\(key)") { result in
+                            if case .success(let value) = result, let value {
+                                tracks[index][key] = value
+                            }
+                            group.leave()
+                        }
+                    }
+                }
+                group.notify(queue: .main) { [weak self, weak subtitleCore] in
+                    guard let self, let subtitleCore, self.core === subtitleCore,
+                          self.playbackGeneration == generation,
+                          !self.permanentlyDisableSubtitles, !self.hasSelectedSubtitlesManually,
+                          self.subtitleURLToLoad == nil else { return }
+                    var bestID: String?
+                    var bestScore = Int.min
+                    for track in tracks where track["type"] == "sub" {
+                        guard let id = track["id"], !id.isEmpty else { continue }
+                        let language = (track["lang"] ?? "").trimmingCharacters(
+                            in: .whitespacesAndNewlines).lowercased()
+                        let title = (track["title"] ?? "").lowercased()
+                        let englishLanguage = language == "en" || language == "eng" ||
+                            language == "english" || language.hasPrefix("en-") ||
+                            language.hasPrefix("en_")
+                        let english = englishLanguage || title.contains("english")
+                        let forcedFlag = ["yes", "true", "1"].contains(
+                            (track["forced"] ?? "").lowercased())
+                        let forcedTitle = title.contains("forced") ||
+                            title.contains("foreign parts") ||
+                            title.contains("foreign dialogue") ||
+                            title.contains("non-english only") ||
+                            title.contains("signs & songs") ||
+                            title.contains("signs and songs")
+                        guard english && (forcedFlag || forcedTitle) else { continue }
+                        let score = (forcedFlag ? 100 : 50) + (englishLanguage ? 10 : 0)
+                        if score > bestScore {
+                            bestScore = score
+                            bestID = id
+                        }
+                    }
+                    // Never enable full English captions as a fallback.
+                    subtitleCore.setProperty("sid", value: bestID ?? "no")
+                    if let bestID {
+                        NSLog("[NuvioSubs] Auto-selected forced English subtitle track %@", bestID)
+                    } else if retriesRemaining > 0 {
+                        // Some streams reveal embedded subtitle tracks late.
+                        self.scheduleForcedEnglishSubtitleSelection(after: 2.0,
+                                                                    retriesRemaining: retriesRemaining - 1)
+                    }
                 }
             }
         }
@@ -1638,7 +1727,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func updatePictureLabels() {
         zoomLabel.text = "\(selectedPictureControl == 0 ? "▶ " : "   ")Zoom: \(Int(zoom * 100))%"
-        stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
+        stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int((verticalStretch * 100).rounded()))%"
         saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
         brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
@@ -1696,13 +1785,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         CATransaction.commit()
     }
 
-    private func changePictureValue(_ direction: Int) {
+    private func changePictureValue(_ direction: Int, stretchStepPercent: Int = 5) {
         switch selectedPictureControl {
         case 0:
             zoom = max(1, min(2.5, zoom + CGFloat(direction) * 0.05))
             applyPictureTransform()
         case 1:
-            verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
+            // Clicks keep 5% steps; touchpad swipes adjust by exactly 1%.
+            let currentPercent = Int((verticalStretch * 100).rounded())
+            let nextPercent = max(75, min(170, currentPercent + direction * stretchStepPercent))
+            verticalStretch = CGFloat(nextPercent) / 100
             applyPictureTransform()
         case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
@@ -2355,6 +2447,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        // In Picture settings, only Vertical Stretch responds to swipes.
+        if toolPanel == .picture {
+            return selectedPictureControl == 1 && gestureRecognizer is UISwipeGestureRecognizer
+        }
         guard core != nil, toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
               !isPreparingPlayback else { return false }
@@ -2368,11 +2464,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func remoteSwipe(_ recognizer: UISwipeGestureRecognizer) {
-        guard recognizer.state == .ended, core != nil,
-              toolPanel == .none, !toolbarFocused,
+        guard recognizer.state == .ended else { return }
+        let direction = recognizer.direction == .right ? 1 : -1
+        if toolPanel == .picture {
+            guard selectedPictureControl == 1 else { return }
+            changePictureValue(direction, stretchStepPercent: 1)
+            return
+        }
+        guard core != nil, toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
               lockedSeekDirection == 0, !isTouchScrubbing else { return }
-        let direction = recognizer.direction == .right ? 1 : -1
         if playing {
             silentSkip(direction)
         } else {
@@ -2696,12 +2797,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(disable, forKey: persistentSubtitlesKey)
             // Applies immediately, and the saved preference survives every
             // stream change and future app launches.
-            core.setProperty("sid", value: disable ? "no" : "auto")
+            hasSelectedSubtitlesManually = disable
+            core.setProperty("sid", value: "no")
+            if !disable {
+                if subtitleURLToLoad == nil {
+                    scheduleForcedEnglishSubtitleSelection()
+                } else {
+                    core.setProperty("sid", value: "auto")
+                }
+            }
             closeToolPanel()
             return
         }
         let property = toolPanel == .audio ? "aid" : "sid"
         if toolPanel == .audio { hasSelectedPreferredAudio = true }
+        if toolPanel == .subtitles { hasSelectedSubtitlesManually = true }
         core.setProperty(property, value: choice.id)
         closeToolPanel()
     }
@@ -2804,7 +2914,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 self.renderTrackPanel()
                 return
             }
-            let keys = ["type", "id", "lang", "title", "codec", "selected", "audio-channels"]
+            let keys = ["type", "id", "lang", "title", "codec", "selected", "audio-channels", "forced"]
             var values = Array(repeating: [String: String](), count: count)
             let group = DispatchGroup()
             for index in 0..<count {
@@ -2834,9 +2944,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     guard let id = value["id"], !id.isEmpty else { continue }
                     let lang = value["lang"]?.isEmpty == false ? value["lang"]! : "Unknown"
                     let title = value["title"] ?? ""
+                    let forced = ["yes", "true", "1"].contains((value["forced"] ?? "").lowercased())
+                    let forcedText = forced && !title.lowercased().contains("forced") ? "Forced" : ""
                     let codec = (value["codec"] ?? "").uppercased()
                     let channels = value["audio-channels"] ?? ""
-                    let details = [lang, title, codec, channels].filter { !$0.isEmpty }
+                    let details = [lang, title, forcedText, codec, channels].filter { !$0.isEmpty }
                         .joined(separator: " · ")
                     choices.append(TrackChoice(id: id, caption: "\(ordinal). \(details)",
                                                selected: value["selected"] == "yes"))
@@ -3445,6 +3557,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         firstFrameTimeout = nil
         subtitleURLToLoad = nil
         subtitleAlreadyRequested = false
+        hasSelectedSubtitlesManually = false
         PlayerStartupDiagnostics.clear()
         colorFilterTimer?.invalidate()
         colorFilterTimer = nil

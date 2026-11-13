@@ -1268,7 +1268,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func updatePictureLabels() {
         zoomLabel.text = "\(selectedPictureControl == 0 ? "▶ " : "   ")Zoom: \(Int(zoom * 100))%"
-        stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int(verticalStretch * 100))%"
+        stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int((verticalStretch * 100).rounded()))%"
         saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
         brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
@@ -1320,13 +1320,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         CATransaction.commit()
     }
 
-    private func changePictureValue(_ direction: Int) {
+    private func changePictureValue(_ direction: Int, stretchStepPercent: Int = 5) {
         switch selectedPictureControl {
         case 0:
             zoom = max(1, min(2.5, zoom + CGFloat(direction) * 0.05))
             applyPictureTransform()
         case 1:
-            verticalStretch = max(0.75, min(1.7, verticalStretch + CGFloat(direction) * 0.05))
+            // Clicks keep their 5% step; touchpad swipes use 1% for precise adjustment.
+            // Calculate whole percentage points to avoid floating-point display drift.
+            let currentPercent = Int((verticalStretch * 100).rounded())
+            let nextPercent = max(75, min(170, currentPercent + direction * stretchStepPercent))
+            verticalStretch = CGFloat(nextPercent) / 100
             applyPictureTransform()
         case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
@@ -1938,6 +1942,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Picture controls normally ignore touch gestures; Vertical Stretch alone
+        // accepts horizontal swipes. Reject the pan so the swipe can recognize.
+        if toolPanel == .picture {
+            return selectedPictureControl == 1 && gestureRecognizer is UISwipeGestureRecognizer
+        }
         guard core != nil, toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
               !isPreparingPlayback else { return false }
@@ -1951,11 +1960,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     @objc private func remoteSwipe(_ recognizer: UISwipeGestureRecognizer) {
-        guard recognizer.state == .ended, core != nil,
-              toolPanel == .none, !toolbarFocused,
+        guard recognizer.state == .ended else { return }
+        let direction = recognizer.direction == .right ? 1 : -1
+        if toolPanel == .picture {
+            guard selectedPictureControl == 1 else { return }
+            changePictureValue(direction, stretchStepPercent: 1)
+            return
+        }
+        guard core != nil, toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
               lockedSeekDirection == 0, !isTouchScrubbing else { return }
-        let direction = recognizer.direction == .right ? 1 : -1
         if playing {
             silentSkip(direction)
         } else {

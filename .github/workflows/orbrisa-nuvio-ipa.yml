@@ -1,0 +1,64 @@
+name: Orbrisa Nuvio automatic video handoff IPA
+
+on:
+  push:
+    branches:
+      - integration/orbrisa-nuvio-handoff
+    paths:
+      - 'integrations/orbrisa-nuvio-handoff.patch.gz.b64'
+      - '.github/workflows/orbrisa-nuvio-ipa.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tvos-browser:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch original Orbrisa Beta 2 and apply Nuvio handoff patch
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.1.0-beta.2 https://github.com/fdm96/Orbrisa.git orbrisa
+          base64 --decode integrations/orbrisa-nuvio-handoff.patch.gz.b64 | gzip -dc > /tmp/orbrisa-nuvio.patch
+          cd orbrisa
+          git apply --check /tmp/orbrisa-nuvio.patch
+          git apply /tmp/orbrisa-nuvio.patch
+          plutil -lint Orbrisa/Info.plist
+          grep -q 'openCapturedStreamInNuvio' Orbrisa/BrowserVideoPlaybackCoordinator.m
+          grep -q 'didDetectVideoPlayback' Orbrisa/BrowserWebView.m
+          echo 'Nuvio handoff patch applied to upstream Orbrisa v1.1.0-beta.2'
+
+      - name: Build Orbrisa for tvOS (unsigned)
+        run: |
+          set -euo pipefail
+          cd orbrisa
+          xcodebuild -project Orbrisa.xcodeproj \
+            -scheme Orbrisa \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            -quiet build
+          test -d build/Build/Products/Release-appletvos/Orbrisa.app
+
+      - name: Package unsigned browser IPA
+        run: |
+          set -euo pipefail
+          mkdir -p output/Payload
+          cp -R orbrisa/build/Build/Products/Release-appletvos/Orbrisa.app output/Payload/
+          (cd output && zip -qry Orbrisa-Nuvio-Handoff-unsigned.ipa Payload)
+          test -s output/Orbrisa-Nuvio-Handoff-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbrisa-Nuvio-Handoff-unsigned
+          path: output/Orbrisa-Nuvio-Handoff-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error

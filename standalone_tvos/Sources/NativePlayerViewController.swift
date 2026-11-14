@@ -278,7 +278,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var currentSeconds: Double = 0
     private var totalSeconds: Double = 0
     private var zoom: CGFloat = 1
+    private let savedVerticalStretchKey = "Nuvio.VerticalStretchPercent"
     private var verticalStretch: CGFloat = 1
+    // Start each new video in Dolby Vision when available; this menu control
+    // only changes the current stream's requested HDMI output dynamic range.
+    private var dolbyVisionOutputEnabled = true
     // Picture adjustments use a black-matte-protecting YUV LUT for SDR
     // and opt-in HDR. Neutral settings and all Dolby Vision stay native.
     private var colorSaturation = 1.0
@@ -412,6 +416,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private let brightnessLabel = UILabel()
     private let hdrBoostLabel = UILabel()
     private let vividLabel = UILabel()
+    private let dolbyVisionLabel = UILabel()
     private let colorStatusLabel = UILabel()
     private let idleLabel = UILabel()
     // Tiny translucent timestamp and spinner, placed together directly on
@@ -836,7 +841,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         showSettings = false
         picturePanel.isHidden = true
         zoom = 1
-        verticalStretch = 1
+        let savedStretchPercent = UserDefaults.standard.object(forKey: savedVerticalStretchKey) as? Int ?? 100
+        verticalStretch = CGFloat(max(75, min(170, savedStretchPercent))) / 100
+        dolbyVisionOutputEnabled = true
         // Restore previous adjustments without modifying media until
         // SDR/HDR metadata has been checked for this new stream.
         colorSaturation = (UserDefaults.standard.object(forKey: "Nuvio.ColorSaturation") as? Double)
@@ -900,6 +907,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // auto also preserves the patched profile conversion behavior;
         // defer display criteria changes until the stream is decoded.
         newCore.setDvConversionMode("dv81")
+        // Always begin a new stream with its native Dolby Vision output allowed.
+        newCore.setDolbyVisionOutputAllowed(true)
 
         PlayerStartupDiagnostics.mark("mpv-initialize")
         guard newCore.initialize(in: window) else {
@@ -1535,7 +1544,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         picturePanel.isUserInteractionEnabled = false
         view.addSubview(picturePanel)
         addGlassBackdrop(to: picturePanel, radius: 18)
-        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, brightnessLabel, hdrBoostLabel, vividLabel] {
+        for label in [zoomLabel, stretchLabel, saturationLabel, contrastLabel, brightnessLabel, hdrBoostLabel, vividLabel, dolbyVisionLabel] {
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = .monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
             label.textColor = .white
@@ -1668,7 +1677,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             vividLabel.topAnchor.constraint(equalTo: hdrBoostLabel.bottomAnchor, constant: 15),
             vividLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             vividLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            colorStatusLabel.topAnchor.constraint(equalTo: vividLabel.bottomAnchor, constant: 15),
+            dolbyVisionLabel.topAnchor.constraint(equalTo: vividLabel.bottomAnchor, constant: 15),
+            dolbyVisionLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
+            dolbyVisionLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
+            colorStatusLabel.topAnchor.constraint(equalTo: dolbyVisionLabel.bottomAnchor, constant: 15),
             colorStatusLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             colorStatusLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
             colorStatusLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -20),
@@ -1732,9 +1744,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
         brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
         hdrBoostLabel.text = requiresNativeDolbyVision
-            ? "   Dolby Vision: native (smooth)"
+            ? "   HDR boost: unavailable (DV source)"
             : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         vividLabel.text = "\(selectedPictureControl == 6 ? "▶ " : "   ")Vivid: \(vividEnabled ? "ON" : "OFF")"
+        dolbyVisionLabel.text = "\(selectedPictureControl == 7 ? "▶ " : "   ")Dolby Vision: \(requiresNativeDolbyVision ? (dolbyVisionOutputEnabled ? "ON" : "OFF") : "N/A")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
         let available = sourceColorMetadataReady && !requiresNativeDolbyVision
@@ -1755,8 +1768,16 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         vividLabel.textColor = available
             ? (selectedPictureControl == 6 ? .white : .lightGray)
             : .gray
+        dolbyVisionLabel.textColor = requiresNativeDolbyVision
+            ? (selectedPictureControl == 7 ? .white : .lightGray) : .gray
         if requiresNativeDolbyVision {
-            colorStatusLabel.text = "Dolby Vision uses native hardware playback.\nUse TV Color Depth / Contrast for DV."
+            if dolbyVisionOutputEnabled {
+                colorStatusLabel.text = "Dolby Vision output ON • native playback.\nLeft disables DV output; Select toggles."
+            } else if core?.doviProfile == 5 {
+                colorStatusLabel.text = "Dolby Vision output OFF • HDR10 requested.\nProfile 5 has no HDR10 base; verify colors."
+            } else {
+                colorStatusLabel.text = "Dolby Vision output OFF • HDR10 requested.\nFallback depends on the source and display."
+            }
         } else if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
         } else if colorFilterInFlight {
@@ -1795,6 +1816,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let currentPercent = Int((verticalStretch * 100).rounded())
             let nextPercent = max(75, min(170, currentPercent + direction * stretchStepPercent))
             verticalStretch = CGFloat(nextPercent) / 100
+            UserDefaults.standard.set(nextPercent, forKey: savedVerticalStretchKey)
             applyPictureTransform()
         case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
@@ -1846,6 +1868,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             vividEnabled = direction > 0
             NuvioVividPreferences.setEnabled(vividEnabled)
             scheduleColorFilterUpdate()
+        case 7 where requiresNativeDolbyVision:
+            // Right enables DV output; left asks tvOS for the HDR10-compatible
+            // fallback range. The core already handles HDMI criteria updates.
+            dolbyVisionOutputEnabled = direction > 0
+            core?.setDolbyVisionOutputAllowed(dolbyVisionOutputEnabled)
         default: break
         }
         updatePictureLabels()
@@ -1862,9 +1889,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         showPanel()
     }
 
+    private func toggleDolbyVisionOutput() {
+        guard requiresNativeDolbyVision, let core else { return }
+        dolbyVisionOutputEnabled.toggle()
+        core.setDolbyVisionOutputAllowed(dolbyVisionOutputEnabled)
+        updatePictureLabels()
+        showPanel()
+    }
+
     private func resetPicture() {
         zoom = 1
         verticalStretch = 1
+        UserDefaults.standard.set(100, forKey: savedVerticalStretchKey)
         colorSaturation = 1.0
         colorContrast = 1.0
         colorBrightness = 1.0
@@ -2187,7 +2223,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .downArrow:
             if toolPanel == .picture {
-                selectedPictureControl = (selectedPictureControl + 1) % 7
+                selectedPictureControl = (selectedPictureControl + 1) % 8
                 updatePictureLabels()
                 showPanel()
             } else if toolPanel == .audio || toolPanel == .subtitles {
@@ -2203,6 +2239,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if toolPanel == .picture {
                 if selectedPictureControl == 6 {
                     toggleVivid()
+                } else if selectedPictureControl == 7 {
+                    toggleDolbyVisionOutput()
                 } else {
                     resetPicture()
                     showPanel()

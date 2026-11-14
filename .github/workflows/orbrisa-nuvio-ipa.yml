@@ -6,6 +6,8 @@ on:
       - integration/orbrisa-nuvio-handoff
     paths:
       - 'integrations/orbrisa-nuvio-handoff.patch.gz.b64'
+      - 'integrations/orbrisa-adblock-boost.patch.gz.b64'
+      - 'integrations/build_orbrisa_adblock.py'
       - '.github/workflows/orbrisa-nuvio-ipa.yml'
   workflow_dispatch:
 
@@ -27,10 +29,22 @@ jobs:
           cd orbrisa
           git apply --check /tmp/orbrisa-nuvio.patch
           git apply /tmp/orbrisa-nuvio.patch
+          cd ..
+          cat integrations/orbrisa-adblock-boost.patch.gz.b64 | base64 --decode | gzip -dc > /tmp/orbrisa-adblock.patch
+          cd orbrisa
+          git apply --check /tmp/orbrisa-adblock.patch
+          git apply /tmp/orbrisa-adblock.patch
           plutil -lint Orbrisa/Info.plist
           grep -q 'openCapturedStreamInNuvio' Orbrisa/BrowserVideoPlaybackCoordinator.m
           grep -q 'didDetectVideoPlayback' Orbrisa/BrowserWebView.m
-          echo 'Nuvio handoff patch applied to upstream Orbrisa v1.1.0-beta.2'
+          grep -q 'BrowserPopupShieldScript' Orbrisa/BrowserWebView.m
+          echo 'Nuvio handoff and popup/redirect shield applied to Orbrisa beta 2'
+
+      - name: Generate extended ad-block host list
+        run: |
+          set -euo pipefail
+          python3 integrations/build_orbrisa_adblock.py orbrisa/OrbrisaAdBlockDomains.txt
+          test -s orbrisa/OrbrisaAdBlockDomains.txt
 
       - name: Build Orbrisa for tvOS (unsigned)
         run: |
@@ -53,12 +67,13 @@ jobs:
           set -euo pipefail
           mkdir -p output/Payload
           cp -R orbrisa/build/Build/Products/Release-appletvos/Orbrisa.app output/Payload/
-          (cd output && zip -qry Orbrisa-Nuvio-Handoff-unsigned.ipa Payload)
-          test -s output/Orbrisa-Nuvio-Handoff-unsigned.ipa
+          cp orbrisa/OrbrisaAdBlockDomains.txt output/Payload/Orbrisa.app/OrbrisaAdBlockDomains.txt
+          (cd output && zip -qry Orbrisa-Nuvio-Strong-Adblock-unsigned.ipa Payload)
+          test -s output/Orbrisa-Nuvio-Strong-Adblock-unsigned.ipa
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Orbrisa-Nuvio-Handoff-unsigned
-          path: output/Orbrisa-Nuvio-Handoff-unsigned.ipa
+          name: Orbrisa-Nuvio-Strong-Adblock-unsigned
+          path: output/Orbrisa-Nuvio-Strong-Adblock-unsigned.ipa
           retention-days: 30
           if-no-files-found: error

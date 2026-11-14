@@ -1994,12 +1994,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if self.sourceColorMetadataReady
                 && self.sourceIsHDR == hdr
                 && self.sourceIsDolbyVision == dv {
-                if dv { self.scheduleColorFilterUpdate() }
+                if dv && self.pictureFiltersBlockedByDolbyVision {
+                    self.scheduleColorFilterUpdate()
+                }
                 return
             }
             // If an active experimental filter caused an apparent loss of
             // Dolby Vision, immediately disable and revert that filter.
-            if self.sourceIsDolbyVision && !dv && self.experimentalHDRColorBoost {
+            if self.sourceIsDolbyVision && !dv && self.experimentalHDRColorBoost
+                && self.dolbyVisionOutputEnabled {
                 self.experimentalHDRColorBoost = false
                 self.colorFilterFailed = true
             }

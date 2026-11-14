@@ -296,8 +296,17 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     // decoded color metadata, but the original DV file must NEVER be allowed
     // to fall into an expensive 4K CPU-copy color adjustment path.
     private var originalIsDolbyVision = false
+    private var originalDolbyVisionProfile: Int64 = 0
+    private var pendingDolbyVisionOutputRestore = false
     private var requiresNativeDolbyVision: Bool {
         originalIsDolbyVision || sourceIsDolbyVision || (core?.doviProfile ?? 0) > 0
+    }
+    // The source being DV is not the same as requesting DV output. A DV
+    // profile 7/8 HDR fallback may try the existing opt-in HDR10 filters.
+    // Profile 5 has no standard HDR10 base and must stay protected.
+    private var pictureFiltersBlockedByDolbyVision: Bool {
+        requiresNativeDolbyVision
+            && (dolbyVisionOutputEnabled || originalDolbyVisionProfile == 5)
     }
     // Explicit per-video opt-in: never auto-apply an experimental filter to
     // Dolby Vision or HDR during startup or across separate movies.
@@ -844,6 +853,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let savedStretchPercent = UserDefaults.standard.object(forKey: savedVerticalStretchKey) as? Int ?? 100
         verticalStretch = CGFloat(max(75, min(170, savedStretchPercent))) / 100
         dolbyVisionOutputEnabled = true
+        pendingDolbyVisionOutputRestore = false
         // Restore previous adjustments without modifying media until
         // SDR/HDR metadata has been checked for this new stream.
         colorSaturation = (UserDefaults.standard.object(forKey: "Nuvio.ColorSaturation") as? Double)
@@ -857,6 +867,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         sourceIsDolbyVision = false
         configuredNativeP5Preview = false
         originalIsDolbyVision = false
+        originalDolbyVisionProfile = 0
         experimentalHDRColorBoost = false
         // Restore the saved preference, not an unconditional per-video OFF.
         // The filter activates only after the format check confirms SDR or
@@ -1743,14 +1754,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
         contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
         brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
-        hdrBoostLabel.text = requiresNativeDolbyVision
-            ? "   HDR boost: unavailable (DV source)"
+        hdrBoostLabel.text = pictureFiltersBlockedByDolbyVision
+            ? "   HDR boost: unavailable (DV protected)"
             : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
         vividLabel.text = "\(selectedPictureControl == 6 ? "▶ " : "   ")Vivid: \(vividEnabled ? "ON" : "OFF")"
         dolbyVisionLabel.text = "\(selectedPictureControl == 7 ? "▶ " : "   ")Dolby Vision: \(requiresNativeDolbyVision ? (dolbyVisionOutputEnabled ? "ON" : "OFF") : "N/A")"
         zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
         stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
-        let available = sourceColorMetadataReady && !requiresNativeDolbyVision
+        let available = sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
         saturationLabel.textColor = available
@@ -1763,21 +1774,19 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             ? (selectedPictureControl == 4 ? .white : .lightGray)
             : .gray
         hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
-            && !requiresNativeDolbyVision
+            && !pictureFiltersBlockedByDolbyVision
             ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
         vividLabel.textColor = available
             ? (selectedPictureControl == 6 ? .white : .lightGray)
             : .gray
         dolbyVisionLabel.textColor = requiresNativeDolbyVision
             ? (selectedPictureControl == 7 ? .white : .lightGray) : .gray
-        if requiresNativeDolbyVision {
-            if dolbyVisionOutputEnabled {
-                colorStatusLabel.text = "Dolby Vision output ON • native playback.\nLeft disables DV output; Select toggles."
-            } else if core?.doviProfile == 5 {
-                colorStatusLabel.text = "Dolby Vision output OFF • HDR10 requested.\nProfile 5 has no HDR10 base; verify colors."
-            } else {
-                colorStatusLabel.text = "Dolby Vision output OFF • HDR10 requested.\nFallback depends on the source and display."
-            }
+        if pendingDolbyVisionOutputRestore {
+            colorStatusLabel.text = "Restoring native Dolby Vision…\nRemoving color filters before switching output."
+        } else if requiresNativeDolbyVision && dolbyVisionOutputEnabled {
+            colorStatusLabel.text = "Dolby Vision output ON • native playback.\nLeft disables DV output; Select toggles."
+        } else if requiresNativeDolbyVision && originalDolbyVisionProfile == 5 {
+            colorStatusLabel.text = "DV OFF • Profile 5 has no HDR10 base.\nNative decoder protected; colors may differ."
         } else if !sourceColorMetadataReady {
             colorStatusLabel.text = "Checking source color format…"
         } else if colorFilterInFlight {
@@ -1785,7 +1794,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         } else if colorFilterFailed {
             colorStatusLabel.text = "Video filter failed or HDR mode changed.\nBoost disabled; reset to try again."
         } else if sourceIsHDR && !experimentalHDRColorBoost {
-            colorStatusLabel.text = "Native HDR protected.\nTurn boost ON to test color changes."
+            colorStatusLabel.text = requiresNativeDolbyVision && !dolbyVisionOutputEnabled
+                ? "DV OFF • HDR fallback requested.\nEnable experimental HDR boost for color controls."
+                : "Native HDR protected.\nTurn boost ON to test color changes."
         } else if sourceIsHDR {
             colorStatusLabel.text = "EXPERIMENTAL HDR: verify TV still shows HDR.\n\(vividEnabled ? "Vivid ON" : "Vivid OFF") • \(colorFilterVerified ? "Filter loaded" : "Verify picture changes")"
         } else if vividEnabled {
@@ -1818,21 +1829,21 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             verticalStretch = CGFloat(nextPercent) / 100
             UserDefaults.standard.set(nextPercent, forKey: savedVerticalStretchKey)
             applyPictureTransform()
-        case 2 where sourceColorMetadataReady && !requiresNativeDolbyVision
+        case 2 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorSaturation = min(1.50, max(0.60,
                 (colorSaturation * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 3 where sourceColorMetadataReady && !requiresNativeDolbyVision
+        case 3 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
                 (colorContrast * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 4 where sourceColorMetadataReady && !requiresNativeDolbyVision
+        case 4 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             // Fade the luma boost above the encoded-black threshold so the
             // movie brightens without lifting OLED-black letterbox bars.
@@ -1841,9 +1852,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorBrightness, forKey: "Nuvio.ColorBrightness")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 5 where sourceColorMetadataReady && sourceIsHDR && !requiresNativeDolbyVision:
-            // HDR10 remains a per-movie experiment. Dolby Vision MUST NOT
-            // use this path; copying its 4K 10-bit frames caused extreme lag.
+        case 5 where sourceColorMetadataReady && sourceIsHDR && !pictureFiltersBlockedByDolbyVision:
+            // Remains an explicit opt-in for HDR sources. DV output stays
+            // protected; HDR fallback on compatible profile 7/8 is experimental
+            // because software copy/filter may still affect performance.
             experimentalHDRColorBoost = direction > 0
             colorEffectRequestedForVideo = experimentalHDRColorBoost
             if experimentalHDRColorBoost {
@@ -1862,17 +1874,14 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 colorFilterFailed = false
             }
             scheduleColorFilterUpdate()
-        case 6 where sourceColorMetadataReady && !requiresNativeDolbyVision
+        case 6 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             // Right enables, left disables. Save across future playback.
             vividEnabled = direction > 0
             NuvioVividPreferences.setEnabled(vividEnabled)
             scheduleColorFilterUpdate()
         case 7 where requiresNativeDolbyVision:
-            // Right enables DV output; left asks tvOS for the HDR10-compatible
-            // fallback range. The core already handles HDMI criteria updates.
-            dolbyVisionOutputEnabled = direction > 0
-            core?.setDolbyVisionOutputAllowed(dolbyVisionOutputEnabled)
+            setDolbyVisionOutputEnabled(direction > 0)
         default: break
         }
         updatePictureLabels()
@@ -1880,7 +1889,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func toggleVivid() {
-        guard sourceColorMetadataReady, !requiresNativeDolbyVision,
+        guard sourceColorMetadataReady, !pictureFiltersBlockedByDolbyVision,
               (!sourceIsHDR || experimentalHDRColorBoost), !colorFilterFailed else { return }
         vividEnabled.toggle()
         NuvioVividPreferences.setEnabled(vividEnabled)
@@ -1890,9 +1899,40 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func toggleDolbyVisionOutput() {
-        guard requiresNativeDolbyVision, let core else { return }
-        dolbyVisionOutputEnabled.toggle()
-        core.setDolbyVisionOutputAllowed(dolbyVisionOutputEnabled)
+        setDolbyVisionOutputEnabled(!dolbyVisionOutputEnabled)
+    }
+
+    private func finishDolbyVisionRestoreIfReady() {
+        guard pendingDolbyVisionOutputRestore, dolbyVisionOutputEnabled,
+              !colorFilterActive, !colorFilterInFlight, !colorCopyMode,
+              let core else { return }
+        pendingDolbyVisionOutputRestore = false
+        core.setDolbyVisionOutputAllowed(true)
+        updatePictureLabels()
+        showPanel()
+    }
+
+    private func setDolbyVisionOutputEnabled(_ enabled: Bool) {
+        guard requiresNativeDolbyVision, let core,
+              enabled != dolbyVisionOutputEnabled else { return }
+        dolbyVisionOutputEnabled = enabled
+        if enabled {
+            // Strip the software filter, then restore direct VideoToolbox
+            // decoding BEFORE asking tvOS to output Dolby Vision again.
+            pendingDolbyVisionOutputRestore = true
+            experimentalHDRColorBoost = false
+            colorEffectRequestedForVideo = false
+            vividEnabled = false
+            colorFilterFailed = false
+            scheduleColorFilterUpdate()
+            finishDolbyVisionRestoreIfReady()
+        } else {
+            pendingDolbyVisionOutputRestore = false
+            core.setDolbyVisionOutputAllowed(false)
+            // Never enable HDR software processing just from the DV toggle.
+            // HDR Boost remains a conscious, per-video opt-in.
+            scheduleColorFilterUpdate()
+        }
         updatePictureLabels()
         showPanel()
     }
@@ -1943,8 +1983,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 || gamma.contains("arib")
             if dv {
                 self.originalIsDolbyVision = true
-                self.experimentalHDRColorBoost = false
-                self.colorEffectRequestedForVideo = false
+                if self.originalDolbyVisionProfile == 0 {
+                    self.originalDolbyVisionProfile = playbackCore.doviProfile
+                }
+                if self.pictureFiltersBlockedByDolbyVision {
+                    self.experimentalHDRColorBoost = false
+                    self.colorEffectRequestedForVideo = false
+                }
             }
             if self.sourceColorMetadataReady
                 && self.sourceIsHDR == hdr
@@ -1986,7 +2031,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             || abs(colorContrast - 1.0) > 0.001
             || abs(colorBrightness - 1.0) > 0.001
         let enabled = (vividEnabled || (nonneutral && colorEffectRequestedForVideo))
-            && !requiresNativeDolbyVision
+            && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
 
@@ -2011,6 +2056,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // This is important for native HDR/Dolby Vision metadata.
         if !enabled {
             guard colorCopyMode else {
+                finishDolbyVisionRestoreIfReady()
                 updatePictureLabels()
                 return
             }
@@ -2026,6 +2072,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                           error.localizedDescription)
                     self.colorFilterFailed = true
                 }
+                self.finishDolbyVisionRestoreIfReady()
                 self.updatePictureLabels()
                 if self.colorFilterOperation != operation {
                     self.scheduleColorFilterUpdate()
@@ -2067,8 +2114,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // and HDR) while fading the normal brightness/contrast changes into
         // the actual picture. This is a per-pixel black-matte detector, not
         // a rectangle overlay that could crop content or clash with zoom.
-        // Native display bars are already pure black. Dolby Vision is still
-        // excluded from this software filter entirely; HDR requires opt-in.
+        // Native display bars are already pure black. Native DV output is
+        // protected; compatible DV-to-HDR fallbacks require explicit HDR opt-in.
         let spec = NuvioBlackBarProtection.videoFilter(
             contrast: colorContrast, brightness: colorBrightness,
             saturation: colorSaturation, vivid: vividEnabled)
@@ -3739,15 +3786,18 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // and unwind the CPU-copy filter before it can cause sustained lag.
         if !originalIsDolbyVision, (core?.doviProfile ?? 0) > 0 {
             originalIsDolbyVision = true
+            originalDolbyVisionProfile = core?.doviProfile ?? 0
             sourceIsDolbyVision = true
             sourceIsHDR = true
             sourceColorMetadataReady = true
-            experimentalHDRColorBoost = false
-            vividEnabled = false
-            colorEffectRequestedForVideo = false
+            if pictureFiltersBlockedByDolbyVision {
+                experimentalHDRColorBoost = false
+                vividEnabled = false
+                colorEffectRequestedForVideo = false
+            }
             scheduleColorFilterUpdate()
             updatePictureLabels()
-            NSLog("[NuvioColor] Dolby Vision detected; native playback enforced")
+            NSLog("[NuvioColor] Dolby Vision detected; output protected when enabled")
         }
         totalSeconds = max(0, core?.duration ?? totalSeconds)
         if targetSeconds == nil {

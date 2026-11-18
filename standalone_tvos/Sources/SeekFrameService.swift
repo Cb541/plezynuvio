@@ -80,6 +80,19 @@ final class SeekFrameService {
 
     private func bucket(_ second: Int) -> Int { max(0, second) }
 
+    /// Some browser-originated video CDNs require the same HTTP context as
+    /// their web player for random-access thumbnail reads. Only apply these
+    /// headers to known ePorner-owned hosts; never send them to other sites.
+    private static func extraPreviewHeaders(for url: URL) -> [String: String] {
+        guard let host = url.host?.lowercased(),
+              host == "eporner.com" || host.hasSuffix(".eporner.com")
+        else { return [:] }
+        return [
+            "Referer": "https://www.eporner.com/",
+            "User-Agent": "Mozilla/5.0 (AppleTV; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+        ]
+    }
+
     private func cost(_ image: UIImage) -> Int {
         if let cg = image.cgImage { return max(1, cg.bytesPerRow * cg.height) }
         return max(1, Int(image.size.width * image.size.height * image.scale * image.scale * 4))
@@ -135,7 +148,8 @@ final class SeekFrameService {
             self.nativePreview = nil
             guard let url else { return }
             self.nativePreview = NuvioOnDemandPreview(
-                url: url, headers: [:], thumbnailPixelWidth: url.isFileURL ? 512 : 0,
+                url: url, headers: Self.extraPreviewHeaders(for: url),
+                thumbnailPixelWidth: url.isFileURL ? 512 : 0,
                 imageReady: { [weak self] image, _ in
                     self?.nativeCompleted(image, epoch: epoch)
                 },

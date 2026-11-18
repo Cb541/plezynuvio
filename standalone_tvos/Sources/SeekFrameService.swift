@@ -74,7 +74,7 @@ final class SeekFrameService {
     // Guarded by `lock`, and invalidated on every new seek target/session.
     private var nativeWaiting: Request?
 
-    private func bucket(_ second: Int) -> Int { max(0, (second / 12) * 12) }
+    private func bucket(_ second: Int) -> Int { max(0, second) }
 
     private func cost(_ image: UIImage) -> Int {
         if let cg = image.cgImage { return max(1, cg.bytesPerRow * cg.height) }
@@ -131,7 +131,7 @@ final class SeekFrameService {
             self.nativePreview = nil
             guard let url else { return }
             self.nativePreview = NuvioOnDemandPreview(
-                url: url, headers: [:], thumbnailPixelWidth: 640,
+                url: url, headers: [:], thumbnailPixelWidth: url.isFileURL ? 512 : 0,
                 imageReady: { [weak self] image, _ in
                     self?.nativeCompleted(image)
                 },
@@ -155,7 +155,7 @@ final class SeekFrameService {
         let valid = session == job.session && version == job.version &&
             source == job.url && !suspended && !nativeDolbyVisionOnly
         if valid {
-            storeLocked(image, slot: job.slot, automatic: false)
+            storeLocked(image, slot: job.slot, automatic: false, alreadyEncodedByRust: true)
             timing = "rust-indexed-keyframe"
         }
         lock.unlock()
@@ -260,12 +260,15 @@ final class SeekFrameService {
         storeLocked(image, slot: slot, automatic: automatic)
     }
 
-    private func storeLocked(_ image: UIImage, slot: Int, automatic: Bool) {
+    private func storeLocked(_ image: UIImage, slot: Int, automatic: Bool, alreadyEncodedByRust: Bool = false) {
         let existed = hot.contains(slot) || compressed.contains(slot)
         if automatic && existed { return }
         hot.put(image, key: slot, cost: cost(image))
         delivered += 1
         if automatic { autoSlots.insert(slot) } else { seekSlots.insert(slot) }
+        // Rust retains up to 256 native JPEGs; encoding them a second time
+        // on Swift's JPEG queue causes unnecessary CPU contention while scrubbing.
+        guard !alreadyEncodedByRust else { return }
         guard !compressed.contains(slot), !encodingSlots.contains(slot),
               encodingSlots.count < 8 else { return }
 

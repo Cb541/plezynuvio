@@ -46,7 +46,7 @@ final class SeekFrameService {
     private let lock = NSLock()
     // Count ceilings match the Android architecture; byte ceilings protect
     // Apple TV playback at the existing (unchanged) preview resolution.
-    private var hot = NuvioPreviewLRU<UIImage>(maxCount: 100, maxBytes: 48 * 1024 * 1024)
+    private var hot = NuvioPreviewLRU<UIImage>(maxCount: 100, maxBytes: Int.max)
     private var compressed = NuvioPreviewLRU<Data>(maxCount: 256, maxBytes: 24 * 1024 * 1024)
     private var encodingSlots = Set<Int>()
     private var source: URL?
@@ -257,6 +257,10 @@ final class SeekFrameService {
         lock.lock()
         defer { lock.unlock() }
         guard source != nil, !ahead else { return }
+        // As on Android, ordinary playback does not generate or populate
+        // seek thumbnails ahead of user requests. Keep the existing capture
+        // path only when native Dolby Vision Profile 5 requires it.
+        if automatic && !nativeDolbyVisionOnly { return }
         storeLocked(image, slot: slot, automatic: automatic)
     }
 

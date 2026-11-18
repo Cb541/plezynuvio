@@ -6,6 +6,11 @@ struct NuvioPreviewLRU<Value> {
     let maxCount: Int
     let maxBytes: Int
 
+    init(maxCount: Int, maxBytes: Int) {
+        self.maxCount = maxCount
+        self.maxBytes = maxBytes
+    }
+
     var keys: Set<Int> { Set(values.keys) }
     func contains(_ key: Int) -> Bool { values[key] != nil }
 

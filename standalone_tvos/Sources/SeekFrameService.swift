@@ -7,6 +7,10 @@ import UIKit
 /// The existing native frame tap can still cheaply supply played slots and
 /// history artwork without a second decode (including native-only DV P5).
 final class SeekFrameService {
+    /// Called on the main thread for a completed older keyframe while the
+    /// current target is still loading, as in Android mpvRx.
+    var onInterimFrame: ((UIImage, Int) -> Void)?
+
     struct CacheStats {
         let slots: [Int]
         let writeMBPerSecond: Double
@@ -133,10 +137,13 @@ final class SeekFrameService {
             self.nativePreview = NuvioOnDemandPreview(
                 url: url, headers: [:], thumbnailPixelWidth: url.isFileURL ? 512 : 0,
                 imageReady: { [weak self] image, _ in
-                    self?.nativeCompleted(image)
+                    self?.nativeCompleted(image, epoch: epoch)
+                },
+                interimReady: { [weak self] image, at in
+                    self?.nativeInterim(image, actualMilliseconds: at, epoch: epoch)
                 },
                 fallback: { [weak self] _ in
-                    self?.nativeFallback()
+                    self?.nativeFallback(epoch: epoch)
                 })
         }
         if Thread.isMainThread {
@@ -146,11 +153,35 @@ final class SeekFrameService {
         }
     }
 
+    /// Android mpvRx displays completed older keyframes while seeking quickly.
+    /// Cache that frame at its true keyframe position and show it as interim,
+    /// but never mark the requested target complete or stop its spinner.
+    private func nativeInterim(_ image: UIImage, actualMilliseconds: UInt64, epoch: UInt64) {
+        let second = Int(actualMilliseconds / 1_000)
+        lock.lock()
+        let valid = session == epoch && source != nil &&
+            !suspended && !nativeDolbyVisionOnly
+        if valid {
+            storeLocked(image, slot: second, automatic: false,
+                        alreadyEncodedByRust: true)
+        }
+        lock.unlock()
+        guard valid else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stillValid = self.session == epoch && self.source != nil &&
+                !self.suspended && !self.nativeDolbyVisionOnly
+            self.lock.unlock()
+            if stillValid { self.onInterimFrame?(image, second) }
+        }
+    }
+
     /// Rust's keyframe result and the legacy extractor share the existing RAM
     /// store, so none of the UI's timestamp/last-good-frame logic is changed.
-    private func nativeCompleted(_ image: UIImage) {
+    private func nativeCompleted(_ image: UIImage, epoch: UInt64) {
         lock.lock()
-        guard let job = nativeWaiting else { lock.unlock(); return }
+        guard session == epoch, let job = nativeWaiting else { lock.unlock(); return }
         nativeWaiting = nil
         let valid = session == job.session && version == job.version &&
             source == job.url && !suspended && !nativeDolbyVisionOnly
@@ -167,9 +198,9 @@ final class SeekFrameService {
 
     /// Unsupported formats, servers without Range support, and native request
     /// timeouts fall back to the original independent FFmpeg seek worker.
-    private func nativeFallback() {
+    private func nativeFallback(epoch: UInt64) {
         lock.lock()
-        guard let job = nativeWaiting else { lock.unlock(); return }
+        guard session == epoch, let job = nativeWaiting else { lock.unlock(); return }
         nativeWaiting = nil
         let valid = session == job.session && version == job.version &&
             source == job.url && !suspended && !nativeDolbyVisionOnly

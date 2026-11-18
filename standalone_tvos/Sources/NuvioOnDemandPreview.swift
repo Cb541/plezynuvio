@@ -12,10 +12,12 @@ final class NuvioOnDemandPreview {
     private var permanentlyUnavailable = false
 
     private let imageReady: (UIImage, UInt64) -> Void
+    private let interimReady: (UIImage, UInt64) -> Void
     private let fallback: (UInt64) -> Void
 
     init?(url: URL, headers: [String: String] = [:], thumbnailPixelWidth: UInt32 = 640,
           imageReady: @escaping (UIImage, UInt64) -> Void,
+          interimReady: @escaping (UIImage, UInt64) -> Void,
           fallback: @escaping (UInt64) -> Void) {
         guard url.isFileURL || ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
             return nil
@@ -23,6 +25,7 @@ final class NuvioOnDemandPreview {
         guard let data = try? JSONSerialization.data(withJSONObject: headers),
               let json = String(data: data, encoding: .utf8) else { return nil }
         self.imageReady = imageReady
+        self.interimReady = interimReady
         self.fallback = fallback
         let source = url.isFileURL ? url.path : url.absoluteString
         handle = source.withCString { urlString in
@@ -62,13 +65,17 @@ final class NuvioOnDemandPreview {
             }
             // The native index reports the exact keyframe timestamp; discard
             // late results from previously requested slots.
-            if actual == nvthumb_keyframe(handle, target) {
-                var length = 0
-                if let data = nvthumb_event_data(event, &length), length > 0,
-                   let image = UIImage(data: Data(bytes: data, count: length)) {
+            var length = 0
+            if let data = nvthumb_event_data(event, &length), length > 0,
+               let image = UIImage(data: Data(bytes: data, count: length)) {
+                if actual == nvthumb_keyframe(handle, target) {
                     imageReady(image, UInt64(actual))
                     return
                 }
+                // Android mpvRx publishes a completed older request as a
+                // last-good frame while the newest keyframe is still loading.
+                // Present it without incorrectly marking the newest target ready.
+                interimReady(image, UInt64(actual))
             }
         }
         if ProcessInfo.processInfo.systemUptime >= deadline {

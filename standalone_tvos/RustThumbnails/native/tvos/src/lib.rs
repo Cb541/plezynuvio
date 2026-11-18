@@ -8,7 +8,8 @@ pub struct Handle { engine: Thumbnails, inbox: Arc<Mutex<Option<Event>>> }
 /// URL and optional JSON dictionary of HTTP headers are borrowed only during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nvthumb_open(url: *const c_char, headers: *const c_char, width: u32) -> *mut Handle {
-    if url.is_null() || !(64..=2048).contains(&width) { return std::ptr::null_mut(); }
+    // Zero selects mpvRx's indexed adaptive thumbnail dimensions.
+    if url.is_null() || (width != 0 && !(64..=2048).contains(&width)) { return std::ptr::null_mut(); }
     let Ok(url) = (unsafe { CStr::from_ptr(url) }).to_str() else { return std::ptr::null_mut(); };
     let pairs = if headers.is_null() { Vec::new() } else {
         let Ok(s) = (unsafe { CStr::from_ptr(headers) }).to_str() else { return std::ptr::null_mut(); };

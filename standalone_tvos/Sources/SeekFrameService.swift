@@ -1,10 +1,11 @@
-import AVFoundation
-import CryptoKit
 import Foundation
 import UIKit
 
-/// Disk-backed previews with an independent, continuous future indexer.
-/// Playback capture supplements coverage; it is not the source of future frames.
+/// mpvRx November 18-style on-demand seek previews.
+/// One persistent, independent FFmpeg decoder; no speculative whole-movie
+/// indexing and no JPEG disk writes. Main playback's media cache is untouched.
+/// The existing native frame tap can still cheaply supply played slots and
+/// history artwork without a second decode (including native-only DV P5).
 final class SeekFrameService {
     struct CacheStats {
         let slots: [Int]
@@ -33,863 +34,335 @@ final class SeekFrameService {
 
     private struct Request {
         let url: URL
-        let second: Int
-        let prefetch: Bool
+        let slot: Int
+        let session: UInt64
+        let version: UInt64
         let allowSystemDecode: Bool
-        let keyframeOnly: Bool
-        let callback: ((UIImage?) -> Void)?
+        let callback: (UIImage?) -> Void
     }
 
-    private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-frames", qos: .default)
-    // Avoid starving JPEG persistence behind tvOS focus/overlay animations;
-    // ahead indexing waits for this bounded writer before its next frame.
-    private let diskWriter = DispatchQueue(label: "com.cb541.nuvio.seek-disk", qos: .default)
-    private let diskReader = DispatchQueue(label: "com.cb541.nuvio.seek-read",
-                                            qos: .userInitiated)
+    private let worker = DispatchQueue(label: "com.cb541.nuvio.seek-on-demand", qos: .userInitiated)
+    private let encoder = DispatchQueue(label: "com.cb541.nuvio.seek-jpeg-memory", qos: .utility)
     private let lock = NSLock()
-    private let hotImages = NSCache<NSString, UIImage>()
-    private var generation: UInt64 = 0
-    private var latestCacheLookup: UInt64 = 0
-    private var isWorkerRunning = false
+    // Count ceilings match the Android architecture; byte ceilings protect
+    // Apple TV playback at the existing (unchanged) preview resolution.
+    private var hot = NuvioPreviewLRU<UIImage>(maxCount: 100, maxBytes: 48 * 1024 * 1024)
+    private var compressed = NuvioPreviewLRU<Data>(maxCount: 256, maxBytes: 24 * 1024 * 1024)
+    private var encodingSlots = Set<Int>()
+    private var source: URL?
+    private var session: UInt64 = 0
+    private var version: UInt64 = 0
+    private var lookupVersion: UInt64 = 0
+    private var desiredSlot: Int?
     private var pending: Request?
-    private var pendingBackground: Request?
-    private var activeToken: NuvioThumbnailAbortToken?
-    private var activeWasBackground = false
-    private var scopedDirectory: URL?
-    // Keep older thumbnails readable while new frames live in Application Support.
-    private var legacyScopedDirectory: URL?
-    private var backgroundPrefetchUnavailable = false
-    private var aheadDecoder: NuvioThumbnailDecoder?
-    private var aheadAttempts = 0
-    private var aheadFailures = 0
-    private var aheadLastSeconds = 0.0
-    private var previewTiming = ""
-    private var aheadDisabled = false
+    private var token: NuvioThumbnailAbortToken?
+    private var running = false
+    private var suspended = false
     private var nativeDolbyVisionOnly = false
-    private var indexURL: URL?
-    private var indexPlan = NuvioAheadPlan()
-    private var indexSourceURL: URL?
-    private var indexPlayback = 0
-    private var lastIndexedPlayback: Int?
-    private var recoveryWindowStart = 0
-    private var indexingSuspended = false
-    private var aheadRecovery = NuvioAheadRecovery()
-    // In-flight background decodes interrupted by the seek UI, or failed
-    // network reads, must never leave permanent 12-second thumbnail holes.
-    private struct AheadRetry {
-        let failures: Int
-        let eligibleAt: Date
-    }
-    private var aheadRetrySlots: [Int: AheadRetry] = [:]
-    private var sourceKey: String?
-    // Only the compressed JPEGs consume persistent disk; memory remains
-    // bounded. These slot indices are loaded once and amended after writes.
-    private var cachedSlots = Set<Int>()
-    private var recentDiskWrites: [(date: Date, bytes: Int)] = []
-    // Keep frame capture entirely separate from the seek/AVAsset worker.
-    // In particular, a slow remote seek can no longer prevent frames from
-    // an already-playing video from reaching persistent thumbnail storage.
-    private var cacheEpoch: UInt64 = 0
-    private var deliveredFrames = 0
-    private var jpegEncodedFrames = 0
-    private var failedEncodes = 0
-    private var failedWrites = 0
-    private var missingDirectories = 0
-    private var diskBytes: Int64 = 0
-    // JPEG-compressed RAM fallbacks stay seekable when tvOS rejects file IO.
-    // Unlike NSCache<UIImage>, this store has a strict 24 MiB byte budget
-    // and removes evicted slots from the reported coverage accurately.
-    private var compressedFrames: [Int: Data] = [:]
-    private var compressedOrder: [Int] = []
-    private var compressedBytes = 0
-    private let compressedLimit = 24 * 1_024 * 1_024
-    private var lastStorageError = ""
-    private var autoCapturedSlots = Set<Int>()
-    private var seekCapturedSlots = Set<Int>()
-    private var aheadCapturedSlots = Set<Int>()
+    // Accessed exclusively on worker, never on the UI or encoder queue.
+    private var decoder: NuvioThumbnailDecoder?
+    private var delivered = 0
+    private var encoded = 0
+    private var failed = 0
+    private var autoSlots = Set<Int>()
+    private var seekSlots = Set<Int>()
+    private var timing = ""
 
-    init() {
-        // RAM is bounded to protect playback; the persistent disk cache
-        // has no application-imposed frame-count or size limit.
-        hotImages.totalCostLimit = 48 * 1_024 * 1_024
+    private func bucket(_ second: Int) -> Int { max(0, (second / 12) * 12) }
+
+    private func cost(_ image: UIImage) -> Int {
+        if let cg = image.cgImage { return max(1, cg.bytesPerRow * cg.height) }
+        return max(1, Int(image.size.width * image.size.height * image.scale * image.scale * 4))
     }
 
-    private func bucket(_ second: Int) -> Int {
-        max(0, (second / 12) * 12)
-    }
+    /// New media owns a new session. Old queued decodes or JPEG callbacks
+    /// must never populate a new video's cache, even if the URL is identical.
+    func prepare(url: URL) { resetSession(to: url) }
+    func clear() { resetSession(to: nil) }
 
-    private func key(_ second: Int) -> NSString {
-        String(bucket(second)) as NSString
-    }
-
-    func prepare(url: URL) {
-        // Regenerate HDR/DV previews with corrected color handling.
-        let identity = SHA256.hash(data: Data(("preview-color-v3:" + url.absoluteString).utf8))
-            .map { String(format: "%02x", $0) }.joined()
-        let fm = FileManager.default
-        let root = fm.urls(for: .applicationSupportDirectory,
-            in: .userDomainMask)[0].appendingPathComponent("NuvioSeekFrames",
-                                                          isDirectory: true)
-        let dir = root.appendingPathComponent(identity, isDirectory: true)
-        let legacyRoot = fm.urls(for: .cachesDirectory,
-            in: .userDomainMask)[0].appendingPathComponent("NuvioSeekFrames",
-                                                          isDirectory: true)
+    private func resetSession(to url: URL?) {
         lock.lock()
-        generation &+= 1
-        cacheEpoch &+= 1
-        latestCacheLookup &+= 1
-        activeToken?.cancelled = true
+        session &+= 1
+        version &+= 1
+        lookupVersion &+= 1
+        token?.cancelled = true
         pending = nil
-        pendingBackground = nil
-        sourceKey = identity
-        scopedDirectory = dir
-        legacyScopedDirectory = legacyRoot.appendingPathComponent(identity,
-                                                                  isDirectory: true)
-        backgroundPrefetchUnavailable = false
-        aheadAttempts = 0
-        aheadFailures = 0
-        aheadLastSeconds = 0
-        previewTiming = ""
-        aheadDisabled = false
+        desiredSlot = nil
+        source = url
+        suspended = false
         nativeDolbyVisionOnly = false
-        indexURL = nil
-        indexPlan = NuvioAheadPlan()
-        indexSourceURL = nil
-        indexPlayback = 0
-        lastIndexedPlayback = nil
-        recoveryWindowStart = 0
-        aheadRecovery.reset()
-        aheadRetrySlots.removeAll()
-        cachedSlots.removeAll()
-        recentDiskWrites.removeAll()
-        deliveredFrames = 0
-        jpegEncodedFrames = 0
-        failedEncodes = 0
-        failedWrites = 0
-        missingDirectories = 0
-        diskBytes = 0
-        compressedFrames.removeAll()
-        compressedOrder.removeAll()
-        compressedBytes = 0
-        lastStorageError = ""
-        autoCapturedSlots.removeAll()
-        seekCapturedSlots.removeAll()
-        aheadCapturedSlots.removeAll()
-        hotImages.removeAllObjects()
-        let version = generation
-        let oldDirectory = legacyScopedDirectory
-        lock.unlock()
+        hot.removeAll()
+        compressed.removeAll()
+        encodingSlots.removeAll()
+        delivered = 0
+        encoded = 0
+        failed = 0
+        autoSlots.removeAll()
+        seekSlots.removeAll()
+        timing = ""
+        // Queue before releasing the lock: a request for the next source
+        // cannot enqueue a decode ahead of the old decoder's disposal.
         worker.async { [weak self] in
-            self?.aheadDecoder?.reset()
-            self?.aheadDecoder = nil
+            self?.decoder?.reset()
+            self?.decoder = nil
         }
-        // Populate timeline coverage from this movie's previous sessions.
-        // One directory scan, never one filesystem lookup per UI frame.
-        diskReader.async { [weak self] in
-            guard let self else { return }
-            let files = [dir, oldDirectory].compactMap { $0 }.flatMap { directory in
-                (try? FileManager.default.contentsOfDirectory(
-                    at: directory, includingPropertiesForKeys: nil)) ?? []
-            }
-            let slots = Set(files.compactMap { file -> Int? in
-                let name = file.lastPathComponent
-                guard name.hasPrefix("frame-"), name.hasSuffix(".jpg") else { return nil }
-                return Int(name.dropFirst(6).dropLast(4))
-            })
-            self.lock.lock()
-            if self.scopedDirectory == dir && self.generation == version {
-                self.cachedSlots.formUnion(slots)
-            }
-            self.lock.unlock()
-        }
-        diskWriter.async {
-            try? FileManager.default.createDirectory(at: dir,
-                withIntermediateDirectories: true)
-            // Regenerable thumbnails should never enter an iCloud backup.
-            var backupRoot = root
-            var values = URLResourceValues()
-            values.isExcludedFromBackup = true
-            try? backupRoot.setResourceValues(values)
-        }
+        lock.unlock()
     }
 
-    /// A rolling eight-second average of actual JPEG bytes successfully
-    /// written to local storage, NOT incoming video bandwidth.
     func cacheStats() -> CacheStats {
         lock.lock()
-        let cutoff = Date().addingTimeInterval(-8)
-        recentDiskWrites.removeAll { $0.date < cutoff }
-        let bytes = recentDiskWrites.reduce(0) { $0 + $1.bytes }
-        let coverage = cachedSlots.union(compressedFrames.keys)
-        let result = CacheStats(slots: Array(coverage),
-            writeMBPerSecond: Double(bytes) / 8_000_000.0,
-            frameCount: coverage.count,
-            deliveredFrames: deliveredFrames,
-            jpegEncodedFrames: jpegEncodedFrames,
-            failedEncodes: failedEncodes,
-            failedWrites: failedWrites,
-            missingDirectories: missingDirectories,
-            diskBytes: diskBytes,
-            diskFrames: cachedSlots.count,
-            ramOnlyFrames: coverage.count - cachedSlots.count,
-            storageError: lastStorageError,
-            autoCapturedSlots: autoCapturedSlots.count,
-            seekCapturedSlots: seekCapturedSlots.count,
-            aheadCapturedSlots: aheadCapturedSlots.count,
-            aheadAttempts: aheadAttempts,
-            aheadFailures: aheadFailures,
-            aheadLastSeconds: aheadLastSeconds,
-            aheadDisabled: aheadDisabled,
-            futureDiskFrames: cachedSlots.filter { $0 > indexPlayback + 6 }.count,
-            furthestAheadSeconds: max(0, (cachedSlots.max() ?? indexPlayback) - indexPlayback),
-            previewTiming: previewTiming)
-        lock.unlock()
-        return result
+        defer { lock.unlock() }
+        let slots = hot.keys.union(compressed.keys)
+        return CacheStats(slots: Array(slots), writeMBPerSecond: 0,
+            frameCount: slots.count, deliveredFrames: delivered,
+            jpegEncodedFrames: encoded, failedEncodes: failed,
+            failedWrites: 0, missingDirectories: 0, diskBytes: 0,
+            diskFrames: 0, ramOnlyFrames: slots.count, storageError: "",
+            autoCapturedSlots: autoSlots.intersection(slots).count,
+            seekCapturedSlots: seekSlots.intersection(slots).count,
+            aheadCapturedSlots: 0, aheadAttempts: 0, aheadFailures: 0,
+            aheadLastSeconds: 0, aheadDisabled: true, futureDiskFrames: 0,
+            furthestAheadSeconds: 0, previewTiming: timing)
     }
 
-    /// In-memory lookup is instantaneous for SDR, HDR and DV.
     func cachedImage(second: Int) -> UIImage? {
-        if let image = hotImages.object(forKey: key(second)) {
+        let slot = bucket(second)
+        lock.lock()
+        if let image = hot.get(slot) {
+            lock.unlock()
             return image
         }
-        lock.lock()
-        let compressed = compressedFrames[bucket(second)]
+        let data = compressed.get(slot)
+        let epoch = session
         lock.unlock()
-        return compressed.flatMap(UIImage.init(data:))
+        guard let data, let image = UIImage(data: data) else { return nil }
+        lock.lock()
+        let valid = session == epoch && source != nil
+        if valid { hot.put(image, key: slot, cost: cost(image)) }
+        lock.unlock()
+        return valid ? image : nil
     }
 
-    /// True only if the requested exact 12-second slot has already
-    /// been generated or saved on disk. A neighbouring slot does not count.
     func hasCachedFrame(second: Int) -> Bool {
         let slot = bucket(second)
-        if hotImages.object(forKey: key(slot)) != nil { return true }
         lock.lock()
         defer { lock.unlock() }
-        return cachedSlots.contains(slot) || compressedFrames[slot] != nil
+        return hot.contains(slot) || compressed.contains(slot)
     }
 
-    /// Nearby cached stills are usable for fast scrub previews without
-    /// performing a costly native seek or starting another decoder.
-    /// Disk reads are left to lookupCached on its dedicated diskReader queue.
     func hasCachedFrameNear(second: Int) -> Bool {
         let slot = bucket(second)
         lock.lock()
         defer { lock.unlock() }
-        for delta in [0, -12, 12] {
-            let candidate = slot + delta
-            if candidate >= 0 &&
-               (cachedSlots.contains(candidate) ||
-                compressedFrames[candidate] != nil) {
-                return true
-            }
+        return [slot, slot - 12, slot + 12].contains {
+            $0 >= 0 && (hot.contains($0) || compressed.contains($0))
         }
-        return false
     }
 
-    /// Cache-only lookups never wait for the media decoder or a pause.
-    /// Search the exact 12s bucket first, then nearby frames (at most 12s on the coarse pass).
-    /// Cancel superseded scrubs before disk access to avoid I/O backlogs.
-    func lookupCached(second: Int,
-                      callback: @escaping (UIImage?, Int?, Bool) -> Void) {
+    /// Only RAM is searched. An adjacent image is never labeled as an exact
+    /// position; the existing UI keeps its previous good still while waiting.
+    func lookupCached(second: Int, callback: @escaping (UIImage?, Int?, Bool) -> Void) {
         let slot = bucket(second)
         lock.lock()
-        latestCacheLookup &+= 1
-        let lookup = latestCacheLookup
-        let version = generation
-        let directory = scopedDirectory
-        let legacy = legacyScopedDirectory
+        lookupVersion &+= 1
+        let lookup = lookupVersion
+        let epoch = session
         lock.unlock()
-        diskReader.async { [weak self] in
+        let image = cachedImage(second: slot)
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            var found: UIImage?
-            var foundSlot: Int?
-            let candidates = [slot, slot - 12, slot + 12]
-            for candidate in candidates where candidate >= 0 {
-                self.lock.lock()
-                let stillCurrent = self.generation == version
-                    && self.latestCacheLookup == lookup
-                self.lock.unlock()
-                if !stillCurrent { return }
-                if let image = self.cachedImage(second: candidate)
-                    ?? self.readDisk(slot: candidate, directory: directory)
-                    ?? self.readDisk(slot: candidate, directory: legacy) {
-                    found = image
-                    foundSlot = candidate
-                    self.hotImages.setObject(image, forKey: self.key(candidate),
-                        cost: max(1, Int(image.size.width * image.size.height * 4)))
-                    break
-                }
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.lock.lock()
-                let valid = self.generation == version
-                    && self.latestCacheLookup == lookup
-                self.lock.unlock()
-                if valid { callback(found, foundSlot, foundSlot == slot) }
-            }
+            self.lock.lock()
+            let valid = self.session == epoch && self.lookupVersion == lookup
+            self.lock.unlock()
+            if valid { callback(image, image == nil ? nil : slot, image != nil) }
         }
     }
 
-    /// Receive an already-decoded frame through the native video tap.
-    /// The seek worker can be blocked by remote AVFoundation requests, so
-    /// NEVER enqueue playback captures onto that same queue.
-    /// Normal playback needs only a small retained UIImage; JPEG encoding
-    /// and all filesystem operations run on the serial disk writer.
+    /// Normal playback captures are opportunistic, not a separate download.
+    /// Keep a bounded encoder queue to avoid bursts of full decoded images.
     func cachePlaybackFrame(_ image: UIImage, second: Int,
                             automatic: Bool = true, ahead: Bool = false) {
         let slot = bucket(second)
         lock.lock()
-        if cachedSlots.contains(slot) || compressedFrames[slot] != nil {
-            lock.unlock()
-            return
-        }
-        let primary = scopedDirectory
-        let fallback = legacyScopedDirectory
-        let epoch = cacheEpoch
-        deliveredFrames += 1
-        if ahead {
-            aheadCapturedSlots.insert(slot)
-        } else if automatic {
-            autoCapturedSlots.insert(slot)
-        } else {
-            seekCapturedSlots.insert(slot)
-        }
-        lock.unlock()
+        defer { lock.unlock() }
+        guard source != nil, !ahead else { return }
+        storeLocked(image, slot: slot, automatic: automatic)
+    }
 
-        // Make the decoded image usable immediately, even if disk is full.
-        hotImages.setObject(image, forKey: key(slot),
-            cost: max(1, Int(image.size.width * image.size.height * 4)))
+    private func storeLocked(_ image: UIImage, slot: Int, automatic: Bool) {
+        let existed = hot.contains(slot) || compressed.contains(slot)
+        if automatic && existed { return }
+        hot.put(image, key: slot, cost: cost(image))
+        delivered += 1
+        if automatic { autoSlots.insert(slot) } else { seekSlots.insert(slot) }
+        guard !compressed.contains(slot), !encodingSlots.contains(slot),
+              encodingSlots.count < 8 else { return }
 
-        diskWriter.async { [weak self] in
+        let epoch = session
+        encodingSlots.insert(slot)
+        encoder.async { [weak self] in
             guard let self else { return }
+            let bytes = image.jpegData(compressionQuality: 0.78)
             self.lock.lock()
-            let valid = self.cacheEpoch == epoch &&
-                self.scopedDirectory == primary
-            self.lock.unlock()
-            guard valid else { return }
-
-            // One 720px frame every ~12sec. Keeping a 24MiB compressed RAM
-            // ring permits real cached thumbnails even if disk IO fails.
-            guard let bytes = image.jpegData(compressionQuality: 0.78) else {
-                self.lock.lock()
-                self.failedEncodes += 1
-                self.lock.unlock()
-                NSLog("[NuvioCache] JPEG encoder rejected slot %d", slot)
-                return
+            defer { self.lock.unlock() }
+            guard self.session == epoch, self.source != nil else { return }
+            self.encodingSlots.remove(slot)
+            if let bytes {
+                self.compressed.put(bytes, key: slot, cost: bytes.count)
+                self.encoded += 1
+            } else {
+                self.failed += 1
             }
-            self.lock.lock()
-            self.jpegEncodedFrames += 1
-            if self.compressedFrames[slot] == nil {
-                self.compressedFrames[slot] = bytes
-                self.compressedOrder.append(slot)
-                self.compressedBytes += bytes.count
-                while self.compressedBytes > self.compressedLimit,
-                      !self.compressedOrder.isEmpty {
-                    let oldest = self.compressedOrder.removeFirst()
-                    if let old = self.compressedFrames.removeValue(forKey: oldest) {
-                        self.compressedBytes -= old.count
-                    }
-                }
-            }
-            self.lock.unlock()
-
-            let fm = FileManager.default
-            let locations = [primary, fallback].compactMap { $0 }
-            var storageError: NSError?
-            var stored = false
-
-            // Application Support is preferred for persistence. tvOS can
-            // refuse that path on a particular build; retry in Library/Caches
-            // which remains discoverable by our seeking and resume logic.
-            for directory in locations {
-                let file = directory.appendingPathComponent("frame-\(slot).jpg")
-                if fm.fileExists(atPath: file.path) {
-                    stored = true
-                    break
-                }
-                do {
-                    try fm.createDirectory(at: directory,
-                                           withIntermediateDirectories: true)
-                    do {
-                        try bytes.write(to: file, options: .atomic)
-                    } catch {
-                        // Some tvOS file providers reject temp-file rename
-                        // used by .atomic. Direct JPEG writes are tiny and
-                        // still preferable to discarding good preview data.
-                        try bytes.write(to: file, options: [])
-                    }
-                    stored = true
-                    break
-                } catch {
-                    storageError = error as NSError
-                    NSLog("[NuvioCache] JPEG write failed at %@: %@ (%d) %@",
-                          directory.lastPathComponent,
-                          storageError?.domain ?? "unknown",
-                          storageError?.code ?? -1,
-                          storageError?.localizedDescription ?? "unknown")
-                }
-            }
-            self.lock.lock()
-            if self.cacheEpoch == epoch {
-                if stored {
-                    let wasNew = self.cachedSlots.insert(slot).inserted
-                    if wasNew {
-                        self.diskBytes += Int64(bytes.count)
-                        let now = Date()
-                        self.recentDiskWrites.append((date: now, bytes: bytes.count))
-                        self.recentDiskWrites.removeAll {
-                            $0.date < now.addingTimeInterval(-8)
-                        }
-                    }
-                    self.lastStorageError = ""
-                } else {
-                    self.failedWrites += 1
-                    self.lastStorageError = storageError.map {
-                        "\($0.domain):\($0.code) \($0.localizedDescription)"
-                    } ?? "No writable preview cache directory"
-                }
-            }
-            self.lock.unlock()
         }
     }
 
-    func cancel() {
-        lock.lock()
-        generation &+= 1
-        latestCacheLookup &+= 1
-        activeToken?.cancelled = true
+    private func selectLocked(_ slot: Int?) {
+        guard desiredSlot != slot else { return }
+        desiredSlot = slot
+        version &+= 1
+        lookupVersion &+= 1
+        token?.cancelled = true
         pending = nil
-        pendingBackground = nil
-        indexURL = nil
-        lock.unlock()
     }
 
-    /// Wait until the serial system frame generator is no longer active
-    /// before allowing the main playback engine to seek.
-    func cancelAndDrain(_ completion: @escaping () -> Void) {
+    /// Latest-position-wins, including moving to an already cached position.
+    /// Do not let stale HTTP seeks block the new request or replace its image.
+    func cancelObsolete(second: Int) {
         lock.lock()
-        indexingSuspended = true
+        selectLocked(bucket(second))
         lock.unlock()
-        cancel()
-        worker.async { [weak self] in
-            self?.aheadDecoder?.reset()
-            DispatchQueue.main.async {
-                completion()
-                if let self {
-                    self.lock.lock()
-                    self.indexingSuspended = false
-                    self.lock.unlock()
-                }
-            }
-        }
-    }
-
-    func clear() {
-        cancel()
-        lock.lock()
-        // Keep the artwork/history store, but capture the old playback
-        // directories before clearing their references.
-        let previousDirectory = scopedDirectory
-        let previousLegacyDirectory = legacyScopedDirectory
-        cacheEpoch &+= 1
-        sourceKey = nil
-        scopedDirectory = nil
-        legacyScopedDirectory = nil
-        backgroundPrefetchUnavailable = false
-        aheadAttempts = 0
-        aheadFailures = 0
-        aheadLastSeconds = 0
-        previewTiming = ""
-        aheadDisabled = false
-        nativeDolbyVisionOnly = false
-        indexURL = nil
-        indexPlan = NuvioAheadPlan()
-        indexSourceURL = nil
-        indexPlayback = 0
-        lastIndexedPlayback = nil
-        recoveryWindowStart = 0
-        aheadRecovery.reset()
-        aheadRetrySlots.removeAll()
-        cachedSlots.removeAll()
-        recentDiskWrites.removeAll()
-        deliveredFrames = 0
-        jpegEncodedFrames = 0
-        failedEncodes = 0
-        failedWrites = 0
-        missingDirectories = 0
-        diskBytes = 0
-        compressedFrames.removeAll()
-        compressedOrder.removeAll()
-        compressedBytes = 0
-        lastStorageError = ""
-        autoCapturedSlots.removeAll()
-        seekCapturedSlots.removeAll()
-        aheadCapturedSlots.removeAll()
-        hotImages.removeAllObjects()
-        lock.unlock()
-        worker.async { [weak self] in
-            self?.aheadDecoder?.reset()
-            self?.aheadDecoder = nil
-        }
-        // Perform deletion after all previously queued JPEG writes. The
-        // generation/epoch guards prevent any cancelled decode from
-        // repopulating these directories once playback has ended.
-        diskWriter.async {
-            if let directory = previousDirectory {
-                try? FileManager.default.removeItem(at: directory)
-            }
-            if let directory = previousLegacyDirectory {
-                try? FileManager.default.removeItem(at: directory)
-            }
-        }
     }
 
     func request(url: URL, second: Int, allowSystemDecode: Bool = true,
                  callback: @escaping (UIImage?) -> Void) {
         let slot = bucket(second)
-        if let cached = cachedImage(second: slot) {
-            DispatchQueue.main.async { callback(cached) }
+        lock.lock()
+        guard source == url, !suspended else { lock.unlock(); return }
+        selectLocked(slot)
+        let epoch = session
+        let requestVersion = version
+        if let image = hot.get(slot) {
+            lock.unlock()
+            deliver(image, session: epoch, version: requestVersion, callback: callback)
             return
         }
-        lock.lock()
-        let request = Request(url: url, second: slot,
-                              prefetch: false, allowSystemDecode: allowSystemDecode,
-                              keyframeOnly: true, callback: callback)
-        pending = request
-        // A foreground preview always supersedes any background decode.
-        if activeWasBackground { activeToken?.cancelled = true }
-        scheduleWorkerLocked()
+        if let bytes = compressed.get(slot) {
+            lock.unlock()
+            let image = UIImage(data: bytes)
+            deliver(image, session: epoch, version: requestVersion, callback: callback)
+            return
+        }
+        guard !nativeDolbyVisionOnly else {
+            lock.unlock()
+            deliver(nil, session: epoch, version: requestVersion, callback: callback)
+            return
+        }
+
+        pending = Request(url: url, slot: slot, session: epoch,
+                          version: requestVersion, allowSystemDecode: allowSystemDecode,
+                          callback: callback)
+        scheduleLocked()
         lock.unlock()
     }
 
-    // P5 Dolby Vision IPTPQc2 cannot be decoded as a normal HDR10 base.
-    // Native rendered frames can still populate the disk thumbnail cache.
     func setNativeDolbyVisionOnly(_ enabled: Bool) {
         lock.lock()
         nativeDolbyVisionOnly = enabled
-        if enabled {
-            indexURL = nil
-            if activeWasBackground { activeToken?.cancelled = true }
+        if enabled { selectLocked(nil) }
+        lock.unlock()
+    }
+
+    /// Compatibility hooks: the old ahead scheduler is deliberately disabled.
+    func updateAheadIndex(url: URL, playback: Double, duration: Double) {}
+    func pauseAheadIndex() {}
+
+    func cancel() {
+        lock.lock()
+        version &+= 1
+        lookupVersion &+= 1
+        desiredSlot = nil
+        pending = nil
+        token?.cancelled = true
+        lock.unlock()
+    }
+
+    /// Avoid main-player/preview decoder contention when committing a seek.
+    /// The session's RAM thumbnails survive; only the decoder is drained.
+    func cancelAndDrain(_ completion: @escaping () -> Void) {
+        lock.lock()
+        suspended = true
+        let epoch = session
+        version &+= 1
+        lookupVersion &+= 1
+        desiredSlot = nil
+        pending = nil
+        token?.cancelled = true
+        worker.async { [weak self] in
+            guard let self else { return }
+            self.decoder?.reset()
+            DispatchQueue.main.async {
+                self.lock.lock()
+                if self.session == epoch {
+                    self.suspended = false
+                    self.scheduleLocked()
+                }
+                self.lock.unlock()
+                completion()
+            }
         }
         lock.unlock()
     }
 
-    /// Update the real playback anchor. The worker schedules its own next
-    /// sample immediately after saving the previous one, even with chrome hidden
-    /// or playback paused. The uncommitted scrub cursor is never used here.
-    func updateAheadIndex(url: URL, playback: Double, duration: Double) {
-        guard ["http", "https"].contains(url.scheme ?? ""),
-              playback.isFinite, playback >= 0,
-              duration.isFinite, duration > 2 else { return }
+    private func scheduleLocked() {
+        guard !running, !suspended, pending != nil else { return }
+        running = true
+        worker.async { [weak self] in self?.processOne() }
+    }
+
+    private func processOne() {
         lock.lock()
-        defer { lock.unlock() }
-        guard !indexingSuspended && !nativeDolbyVisionOnly else { return }
-        let position = Int(playback)
-        if indexSourceURL != url {
-            indexPlan = NuvioAheadPlan()
-            aheadRetrySlots.removeAll()
-            aheadRecovery.reset()
-            lastIndexedPlayback = nil
-            recoveryWindowStart = position
-            indexSourceURL = url
-        }
-        // Resumes and actual seeks should not cause 240 seconds of
-        // unrelated *pre-resume* frames to be decoded as missing playback.
-        // A normal Up/Down press does not seek or change this boundary.
-        if let previous = lastIndexedPlayback, abs(position - previous) > 25 {
-            recoveryWindowStart = position
-            aheadRecovery.reset()
-        } else if lastIndexedPlayback == nil {
-            recoveryWindowStart = position
-        }
-        lastIndexedPlayback = position
-        indexURL = url
-        indexPlayback = position
-        indexPlan.update(playback: position, duration: Int(duration))
-        scheduleWorkerLocked()
-    }
-
-    // This policy is deliberately independent of the player controls.
-    // Native playback can miss a 12-second frame if tvOS focus animations
-    // briefly interrupt its render tap. A missed past slot was never attempted
-    // by the 24s forward pass, so a retry queue alone cannot recover it.
-    // Repair completed playback buckets and failed ahead decodes without
-    // starving the fast coarse-first ahead plan.
-    private func nextIndexRequestLocked() -> Request? {
-        guard let url = indexURL, !indexingSuspended else { return nil }
-        let now = Date()
-
-        // Prune retries already written by the independent playback tap.
-        for slot in Array(aheadRetrySlots.keys) where
-            cachedSlots.contains(slot) || compressedFrames[slot] != nil {
-            aheadRetrySlots.removeValue(forKey: slot)
-        }
-
-        let makeRequest: (Int) -> Request = { slot in
-            Request(url: url, second: slot, prefetch: true,
-                    allowSystemDecode: true, keyframeOnly: true, callback: nil)
-        }
-        var repairSlot: Int?
-        // The native tap has had a full 12-second window to capture these.
-        // A hole here needs active backfill, even if no ahead decode ever
-        // attempted the slot. Only a bounded 240s window is scanned.
-        for slot in NuvioAheadRecovery.completedPastSlots(playback: indexPlayback)
-            where slot >= recoveryWindowStart {
-            guard !cachedSlots.contains(slot), compressedFrames[slot] == nil else {
-                continue
-            }
-            if let retry = aheadRetrySlots[slot], retry.eligibleAt > now {
-                continue
-            }
-            repairSlot = slot
-            break
-        }
-        // Recover missed future slots too. The previous policy only retried
-        // positions near the current playhead, deferring interruptions far
-        // ahead until both full-video index passes were complete.
-        if repairSlot == nil {
-            repairSlot = aheadRetrySlots.keys.sorted().first { slot in
-                guard !cachedSlots.contains(slot), compressedFrames[slot] == nil,
-                      let retry = aheadRetrySlots[slot], retry.eligibleAt <= now else {
-                    return false
-                }
-                return true
-            }
-        }
-
-        if let repairSlot, aheadRecovery.shouldRepairBeforeForward {
-            NSLog("[NuvioAhead] Repair slot=%d playback=%d", repairSlot, indexPlayback)
-            aheadRecovery.didScheduleRepair()
-            return makeRequest(repairSlot)
-        }
-
-        while let slot = indexPlan.next() {
-            guard !cachedSlots.contains(slot), compressedFrames[slot] == nil else {
-                aheadRetrySlots.removeValue(forKey: slot)
-                continue
-            }
-            // A slot still cooling down after an earlier failure must not
-            // jump its per-slot timeout just because another pass visits it.
-            if let retry = aheadRetrySlots[slot], retry.eligibleAt > now {
-                continue
-            }
-            aheadRecovery.didScheduleForward()
-            return makeRequest(slot)
-        }
-        if let repairSlot {
-            NSLog("[NuvioAhead] Repair slot=%d playback=%d", repairSlot, indexPlayback)
-            aheadRecovery.didScheduleRepair()
-            return makeRequest(repairSlot)
-        }
-        return nil
-    }
-
-    // Important: never spin the background queue merely because playback
-    // has past slots. Reschedule only when a slot is genuinely missing and
-    // its retry delay has elapsed. New holes are detected on the 0.25s
-    // playback clock without coupling generation to the controls UI.
-    private func hasDueRepairLocked(now: Date) -> Bool {
-        for slot in NuvioAheadRecovery.completedPastSlots(playback: indexPlayback)
-            where slot >= recoveryWindowStart {
-            if cachedSlots.contains(slot) || compressedFrames[slot] != nil { continue }
-            if let retry = aheadRetrySlots[slot], retry.eligibleAt > now { continue }
-            return true
-        }
-        return aheadRetrySlots.contains { slot, retry in
-            retry.eligibleAt <= now &&
-            !cachedSlots.contains(slot) && compressedFrames[slot] == nil
-        }
-    }
-
-    func pauseAheadIndex() {
-        lock.lock()
-        indexURL = nil
-        if activeWasBackground { activeToken?.cancelled = true }
-        lock.unlock()
-    }
-
-    private func scheduleWorkerLocked() {
-        if !isWorkerRunning {
-            isWorkerRunning = true
-            worker.async { [weak self] in self?.processRequests() }
-        }
-    }
-
-    private func diskURL(for slot: Int, directory: URL?) -> URL? {
-        directory?.appendingPathComponent("frame-\(slot).jpg")
-    }
-
-    private func readDisk(slot: Int, directory: URL?) -> UIImage? {
-        guard let file = diskURL(for: slot, directory: directory),
-              let data = try? Data(contentsOf: file),
-              let image = UIImage(data: data) else { return nil }
-        return image
-    }
-
-    private func remember(_ image: UIImage, slot: Int,
-                          directory: URL?, writeToDisk: Bool) {
-        // Foreground-generated thumbnails use the exact same RAM/disk
-        // persistence path as native decoded-frame captures. The old direct
-        // disk writer would silently lose them when tvOS refused its folder.
-        if writeToDisk {
-            cachePlaybackFrame(image, second: slot, automatic: false)
-        } else {
-            hotImages.setObject(image, forKey: key(slot),
-                cost: max(1, Int(image.size.width * image.size.height * 4)))
-        }
-    }
-
-    private func processRequests() {
-        while true {
-            lock.lock()
-            guard let job = pending ?? pendingBackground ?? nextIndexRequestLocked() else {
-                isWorkerRunning = false
-                activeToken = nil
-                activeWasBackground = false
-                lock.unlock()
-                return
-            }
-            if pending != nil { pending = nil } else { pendingBackground = nil }
-            let version = generation
-            let directory = scopedDirectory
-            let legacyDirectory = legacyScopedDirectory
-            let token = NuvioThumbnailAbortToken()
-            activeToken = token
-            activeWasBackground = job.prefetch
-            lock.unlock()
-
-            // Hot RAM hits must not block behind synchronous JPEG disk reads.
-            let hot = cachedImage(second: job.second)
-            let currentDiskImage = hot == nil
-                ? readDisk(slot: job.second, directory: directory) : nil
-            let cached = hot ?? currentDiskImage
-                ?? readDisk(slot: job.second, directory: legacyDirectory)
-            let startedAt = Date()
-            let decoded: UIImage?
-            if let cached {
-                decoded = cached
-            } else if token.cancelled || !job.allowSystemDecode {
-                decoded = nil
-            } else if job.keyframeOnly {
-                // Keyframes first, two slice threads at most; fetched ranges
-                // live on disk. No second hardware renderer is created.
-                if aheadDecoder == nil { aheadDecoder = NuvioThumbnailDecoder() }
-                if job.prefetch {
-                    decoded = aheadDecoder?.keyframeThumbnail(
-                        for: job.url, second: Int64(job.second),
-                        timeoutSeconds: 12.0, token: token)
-                } else {
-                    // Foreground-only progressive sparse reads return the
-                    // first bytes immediately; background indexing keeps
-                    // its original completed-block cache semantics.
-                    decoded = aheadDecoder?.foregroundKeyframeThumbnail(
-                        for: job.url, second: Int64(job.second),
-                        timeoutSeconds: 12.0, token: token)
-                }
-            } else {
-                decoded = appleFallback(url: job.url, second: job.second)
-            }
-
-            lock.lock()
-            let samePlayback = generation == version
-            let valid = samePlayback && !token.cancelled
-            let foregroundWaiting = pending != nil
-            if samePlayback && job.keyframeOnly && job.prefetch {
-                if valid && decoded != nil {
-                    aheadRetrySlots.removeValue(forKey: job.second)
-                } else {
-                    let oldFailures = aheadRetrySlots[job.second]?.failures ?? 0
-                    let failures = token.cancelled ? oldFailures : oldFailures + 1
-                    // Only this failed slot backs off. A temporary timeout
-                    // while controls animate must not pause *all* ahead work.
-                    let delay = token.cancelled ? 0.5
-                        : min(60.0, Double(3 * (1 << min(5, failures))))
-                    aheadRetrySlots[job.second] = AheadRetry(
-                        failures: failures,
-                        eligibleAt: Date().addingTimeInterval(delay)
-                    )
-                }
-            }
-            if valid && cached == nil && job.keyframeOnly {
-                previewTiming = aheadDecoder?.lastTimingSummary ?? ""
-            }
-            if valid && job.keyframeOnly && job.prefetch {
-                aheadAttempts += 1
-                aheadLastSeconds = Date().timeIntervalSince(startedAt)
-                if decoded == nil {
-                    aheadFailures += 1
-                    // Do not impose a global 1-5 second hold on the entire
-                    // ahead worker; per-slot backoff above handles failures.
-                } else {
-                    aheadFailures = 0
-                }
-                // Retain the demuxer/HTTP connection. AVFrame and AVPacket
-                // references are released by the bridge after every sample.
-            } else if valid && job.prefetch && decoded == nil {
-                backgroundPrefetchUnavailable = true
-            }
-            if activeToken === token { activeToken = nil }
-            activeWasBackground = false
-            lock.unlock()
-
-            if valid, let image = decoded {
-                if job.keyframeOnly {
-                    cachePlaybackFrame(image, second: job.second,
-                                       automatic: false, ahead: job.prefetch)
-                    // Foreground can display the retained RAM image NOW.
-                    // The JPEG writer runs independently; only automatic
-                    // indexing needs to wait for durable disk bookkeeping.
-                    if job.prefetch { diskWriter.sync {} }
-                } else {
-                    remember(image, slot: job.second, directory: directory,
-                             writeToDisk: currentDiskImage == nil)
-                }
-            }
-            if valid, !job.prefetch, !foregroundWaiting,
-               let callback = job.callback {
-                deliver(decoded, version: version, callback: callback)
-            }
-            lock.lock()
-            isWorkerRunning = false
-            if pending != nil || pendingBackground != nil ||
-               (indexURL != nil && !indexingSuspended &&
-                (indexPlan.hasPending || hasDueRepairLocked(now: Date()))) {
-                scheduleWorkerLocked()
-            }
+        guard !suspended, let job = pending else {
+            running = false
             lock.unlock()
             return
         }
+        pending = nil
+        let abort = NuvioThumbnailAbortToken()
+        token = abort
+        lock.unlock()
+
+        let image: UIImage? = autoreleasepool {
+            guard !abort.cancelled, job.allowSystemDecode else { return nil }
+            if decoder == nil { decoder = NuvioThumbnailDecoder() }
+            // Existing native persistent demuxer, keyframe-first extraction,
+            // progressive HTTP ranges and HDR-correct SDR thumbnails.
+            // No second AVFoundation player, no background video download.
+            return decoder?.foregroundKeyframeThumbnail(for: job.url,
+                second: Int64(job.slot), timeoutSeconds: 8, token: abort)
+        }
+
+        lock.lock()
+        let valid = session == job.session && version == job.version
+            && !abort.cancelled && source == job.url && !nativeDolbyVisionOnly
+        if valid {
+            timing = decoder?.lastTimingSummary ?? ""
+            if let image { storeLocked(image, slot: job.slot, automatic: false) }
+        }
+        if token === abort { token = nil }
+        running = false
+        scheduleLocked()
+        lock.unlock()
+        if valid { deliver(image, session: job.session, version: job.version, callback: job.callback) }
     }
 
-    private func deliver(_ image: UIImage?, version: UInt64,
+    private func deliver(_ image: UIImage?, session epoch: UInt64, version requestVersion: UInt64,
                          callback: @escaping (UIImage?) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.lock.lock()
-            let valid = self.generation == version
+            let valid = self.session == epoch && self.version == requestVersion
             self.lock.unlock()
             if valid { callback(image) }
         }
-    }
-
-    private func appleFallback(url: URL, second: Int) -> UIImage? {
-        let suffix = url.pathExtension.lowercased()
-        // AVAssetImageGenerator supports native containers, not arbitrary
-        // signed URL streams, MKV, WebM or unknown formats. Trying all of
-        // them could block this serial queue for seconds before falling back.
-        // Unknown types go directly to the already-open mpv decoder.
-        guard ["mp4", "mov", "m4v", "m3u8"].contains(suffix) else { return nil }
-        let asset = AVURLAsset(url: url)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 512, height: 288)
-        generator.requestedTimeToleranceBefore = CMTime(seconds: 3, preferredTimescale: 600)
-        generator.requestedTimeToleranceAfter = CMTime(seconds: 3, preferredTimescale: 600)
-        guard let frame = try? generator.copyCGImage(
-            at: CMTime(seconds: Double(second), preferredTimescale: 600),
-            actualTime: nil
-        ) else { return nil }
-        return UIImage(cgImage: frame)
     }
 }

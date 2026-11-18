@@ -828,8 +828,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let generation = playbackGeneration
         PlayerStartupDiagnostics.mark("handoff-received")
 
-        // New stream gets its own persistent disk-cache namespace.
-        // The previous file's thumbnails remain available on disk.
+        // New media gets a clean, bounded in-memory thumbnail session.
         thumbs.prepare(url: media.url)
         previewHideTimer?.invalidate()
         previewIsVisible = false
@@ -3285,6 +3284,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             seekPreviewSpinner.startAnimating()
         }
         if lastCacheLookupBucket != slot {
+            // Supersede obsolete work even if the next position is cached.
+            thumbs.cancelObsolete(second: slot)
+            lastPreviewRequestedBucket = nil
             lastCacheLookupBucket = slot
             if let hot = thumbs.cachedImage(second: slot) {
                 frameViews.first?.image = hot
@@ -3318,13 +3320,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         let interval: TimeInterval
         if touchpadPreviewMode && isTouchScrubbing {
             let sincePrevious = Date().timeIntervalSince(lastLiveTouchpadRequest)
-            // Cached frames are equally quick for SDR, HDR and DV.
-            // Native uncached HDR/DV seeks remain conservative.
-            let selected = max(0, Int((targetSeconds ?? currentSeconds).rounded()))
-            let isCached = thumbs.cachedImage(second: selected) != nil
-            let cadence: TimeInterval = isCached ? 0.20 :
-                (sourceColorMetadataReady && !sourceIsHDR
-                 && !requiresNativeDolbyVision ? 0.48 : 0.95)
+            // Latest-target coalescing handles ordinary SDR/HDR seeks.
+            // Keep native profile-5 seeking conservative because it uses
+            // the movie's own hardware decoder rather than the preview worker.
+            let cadence: TimeInterval = (core?.doviProfile ?? 0) == 5 ? 0.95 : 0.20
             interval = max(0.12, cadence - max(0, sincePrevious))
         } else {
             interval = touchpadPreviewMode ? 0.20 : 0.12
@@ -3348,7 +3347,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             seekPreviewSpinner.stopAnimating()
             return
         }
-        // An exact disk hit is loaded asynchronously by scheduleFrames.
+        // An exact RAM hit is loaded by scheduleFrames.
         // Neighbouring 12s slots don't satisfy this requested timestamp.
         if thumbs.hasCachedFrame(second: slot) { return }
         guard lastPreviewRequestedBucket != slot else { return }
@@ -3842,17 +3841,8 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         NuvioFrameTapSetPlaybackSecond(captureAllowed
             ? Int64(playbackSecond) : -1)
         refreshLabels()
-        // A service-owned loop generates future previews without depending
-        // on control visibility, pause flags or progress of the scrub cursor.
-        // Only the actual playback timestamp anchors the forward index.
-        if let media = link, let playbackCore = core,
-           !isPreparingPlayback && !waitingForFirstFrame &&
-           !displayNegotiationPending && committedSeekTarget == nil {
-            thumbs.updateAheadIndex(url: media.url,
-                playback: playbackCore.timePos, duration: totalSeconds)
-        } else {
-            thumbs.pauseAheadIndex()
-        }
+        // No whole-movie indexing: only user-requested previews and cheap
+        // existing playback captures enter the session-local RAM cache.
         // Sample the separate media-cache, sparse range-cache and JPEG disk
         // writers once a second. Only actual writes count toward DISK MB/s.
         if Date().timeIntervalSince(lastCacheUIUpdate) >= 1.0 {

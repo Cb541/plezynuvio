@@ -33,6 +33,9 @@ jobs:
           swiftc standalone_tvos/Sources/NuvioAheadPlan.swift \
             standalone_tvos/Tests/main.swift -o /tmp/nuvio-ahead-test
           /tmp/nuvio-ahead-test
+          swiftc standalone_tvos/Sources/NuvioPreviewLRU.swift \
+            standalone_tvos/Tests/PreviewMemory/main.swift -o /tmp/nuvio-preview-memory-test
+          /tmp/nuvio-preview-memory-test
           swiftc standalone_tvos/Sources/NuvioAheadRecovery.swift \
             standalone_tvos/Tests/AheadRecovery/main.swift -o /tmp/nuvio-recovery-test
           /tmp/nuvio-recovery-test

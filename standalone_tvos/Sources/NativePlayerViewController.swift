@@ -1675,9 +1675,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             picturePanel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 60),
             picturePanel.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -45),
             picturePanel.widthAnchor.constraint(equalToConstant: 535),
-            zoomLabel.topAnchor.constraint(equalTo: picturePanel.topAnchor, constant: 23),
-            zoomLabel.leadingAnchor.constraint(equalTo: picturePanel.leadingAnchor, constant: 22),
-            zoomLabel.trailingAnchor.constraint(equalTo: picturePanel.trailingAnchor, constant: -22),
+            // The top row is now the Dolby Vision output toggle.
+            dolbyVisionLabel.topAnchor.constraint(equalTo: picturePanel.topAnchor, constant: 23),
+            dolbyVisionLabel.leadingAnchor.constraint(equalTo: picturePanel.leadingAnchor, constant: 22),
+            dolbyVisionLabel.trailingAnchor.constraint(equalTo: picturePanel.trailingAnchor, constant: -22),
+            zoomLabel.topAnchor.constraint(equalTo: dolbyVisionLabel.bottomAnchor, constant: 15),
+            zoomLabel.leadingAnchor.constraint(equalTo: dolbyVisionLabel.leadingAnchor),
+            zoomLabel.trailingAnchor.constraint(equalTo: dolbyVisionLabel.trailingAnchor),
             stretchLabel.topAnchor.constraint(equalTo: zoomLabel.bottomAnchor, constant: 15),
             stretchLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             stretchLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
@@ -1696,10 +1700,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             vividLabel.topAnchor.constraint(equalTo: hdrBoostLabel.bottomAnchor, constant: 15),
             vividLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             vividLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            dolbyVisionLabel.topAnchor.constraint(equalTo: vividLabel.bottomAnchor, constant: 15),
-            dolbyVisionLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
-            dolbyVisionLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
-            colorStatusLabel.topAnchor.constraint(equalTo: dolbyVisionLabel.bottomAnchor, constant: 15),
+            colorStatusLabel.topAnchor.constraint(equalTo: vividLabel.bottomAnchor, constant: 15),
             colorStatusLabel.leadingAnchor.constraint(equalTo: zoomLabel.leadingAnchor),
             colorStatusLabel.trailingAnchor.constraint(equalTo: zoomLabel.trailingAnchor),
             colorStatusLabel.bottomAnchor.constraint(equalTo: picturePanel.bottomAnchor, constant: -20),
@@ -1757,38 +1758,38 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     }
 
     private func updatePictureLabels() {
-        zoomLabel.text = "\(selectedPictureControl == 0 ? "▶ " : "   ")Zoom: \(Int(zoom * 100))%"
-        stretchLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Vertical stretch: \(Int((verticalStretch * 100).rounded()))%"
-        saturationLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
-        contrastLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
-        brightnessLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
+        zoomLabel.text = "\(selectedPictureControl == 1 ? "▶ " : "   ")Zoom: \(Int(zoom * 100))%"
+        stretchLabel.text = "\(selectedPictureControl == 2 ? "▶ " : "   ")Vertical stretch: \(Int((verticalStretch * 100).rounded()))%"
+        saturationLabel.text = "\(selectedPictureControl == 3 ? "▶ " : "   ")Saturation: \(Int((colorSaturation * 100).rounded()))%"
+        contrastLabel.text = "\(selectedPictureControl == 4 ? "▶ " : "   ")Contrast: \(Int((colorContrast * 100).rounded()))%"
+        brightnessLabel.text = "\(selectedPictureControl == 5 ? "▶ " : "   ")Brightness: \(Int((colorBrightness * 100).rounded()))%"
         hdrBoostLabel.text = pictureFiltersBlockedByDolbyVision
             ? "   HDR boost: unavailable (DV protected)"
-            : "\(selectedPictureControl == 5 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
-        vividLabel.text = "\(selectedPictureControl == 6 ? "▶ " : "   ")Vivid: \(vividEnabled ? "ON" : "OFF")"
-        dolbyVisionLabel.text = "\(selectedPictureControl == 7 ? "▶ " : "   ")Dolby Vision: \(requiresNativeDolbyVision ? (dolbyVisionOutputEnabled ? "ON" : "OFF") : "N/A")"
-        zoomLabel.textColor = selectedPictureControl == 0 ? .white : .lightGray
-        stretchLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
+            : "\(selectedPictureControl == 6 ? "▶ " : "   ")HDR boost (test): \(experimentalHDRColorBoost ? "ON" : "OFF")"
+        vividLabel.text = "\(selectedPictureControl == 7 ? "▶ " : "   ")Vivid: \(vividEnabled ? "ON" : "OFF")"
+        dolbyVisionLabel.text = "\(selectedPictureControl == 0 ? "▶ " : "   ")Dolby Vision: \(requiresNativeDolbyVision ? (dolbyVisionOutputEnabled ? "ON" : "OFF") : "N/A")"
+        zoomLabel.textColor = selectedPictureControl == 1 ? .white : .lightGray
+        stretchLabel.textColor = selectedPictureControl == 2 ? .white : .lightGray
         let available = sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost)
             && !colorFilterFailed
         saturationLabel.textColor = available
-            ? (selectedPictureControl == 2 ? .white : .lightGray)
-            : .gray
-        contrastLabel.textColor = available
             ? (selectedPictureControl == 3 ? .white : .lightGray)
             : .gray
-        brightnessLabel.textColor = available
+        contrastLabel.textColor = available
             ? (selectedPictureControl == 4 ? .white : .lightGray)
+            : .gray
+        brightnessLabel.textColor = available
+            ? (selectedPictureControl == 5 ? .white : .lightGray)
             : .gray
         hdrBoostLabel.textColor = sourceColorMetadataReady && sourceIsHDR
             && !pictureFiltersBlockedByDolbyVision
-            ? (selectedPictureControl == 5 ? .white : .lightGray) : .gray
+            ? (selectedPictureControl == 6 ? .white : .lightGray) : .gray
         vividLabel.textColor = available
-            ? (selectedPictureControl == 6 ? .white : .lightGray)
+            ? (selectedPictureControl == 7 ? .white : .lightGray)
             : .gray
         dolbyVisionLabel.textColor = requiresNativeDolbyVision
-            ? (selectedPictureControl == 7 ? .white : .lightGray) : .gray
+            ? (selectedPictureControl == 0 ? .white : .lightGray) : .gray
         if pendingDolbyVisionOutputRestore {
             colorStatusLabel.text = "Restoring native Dolby Vision…\nRemoving color filters before switching output."
         } else if requiresNativeDolbyVision && dolbyVisionOutputEnabled {
@@ -1827,31 +1828,31 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
 
     private func changePictureValue(_ direction: Int, stretchStepPercent: Int = 5) {
         switch selectedPictureControl {
-        case 0:
+        case 1:
             zoom = max(1, min(2.5, zoom + CGFloat(direction) * 0.05))
             applyPictureTransform()
-        case 1:
+        case 2:
             // Clicks keep 5% steps; touchpad swipes adjust by exactly 1%.
             let currentPercent = Int((verticalStretch * 100).rounded())
             let nextPercent = max(75, min(170, currentPercent + direction * stretchStepPercent))
             verticalStretch = CGFloat(nextPercent) / 100
             UserDefaults.standard.set(nextPercent, forKey: savedVerticalStretchKey)
             applyPictureTransform()
-        case 2 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
+        case 3 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorSaturation = min(1.50, max(0.60,
                 (colorSaturation * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorSaturation, forKey: "Nuvio.ColorSaturation")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 3 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
+        case 4 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             colorContrast = min(1.40, max(0.70,
                 (colorContrast * 100 + Double(direction) * 5).rounded() / 100))
             UserDefaults.standard.set(colorContrast, forKey: "Nuvio.ColorContrast")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 4 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
+        case 5 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             // Fade the luma boost above the encoded-black threshold so the
             // movie brightens without lifting OLED-black letterbox bars.
@@ -1860,7 +1861,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             UserDefaults.standard.set(colorBrightness, forKey: "Nuvio.ColorBrightness")
             colorEffectRequestedForVideo = true
             scheduleColorFilterUpdate()
-        case 5 where sourceColorMetadataReady && sourceIsHDR && !pictureFiltersBlockedByDolbyVision:
+        case 6 where sourceColorMetadataReady && sourceIsHDR && !pictureFiltersBlockedByDolbyVision:
             // Remains an explicit opt-in for HDR sources. DV output stays
             // protected; HDR fallback on compatible profile 7/8 is experimental
             // because software copy/filter may still affect performance.
@@ -1882,13 +1883,13 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                 colorFilterFailed = false
             }
             scheduleColorFilterUpdate()
-        case 6 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
+        case 7 where sourceColorMetadataReady && !pictureFiltersBlockedByDolbyVision
             && (!sourceIsHDR || experimentalHDRColorBoost) && !colorFilterFailed:
             // Right enables, left disables. Save across future playback.
             vividEnabled = direction > 0
             NuvioVividPreferences.setEnabled(vividEnabled)
             scheduleColorFilterUpdate()
-        case 7 where requiresNativeDolbyVision:
+        case 0 where requiresNativeDolbyVision:
             setDolbyVisionOutputEnabled(direction > 0)
         default: break
         }
@@ -2295,9 +2296,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         case .select:
             if toolPanel == .picture {
-                if selectedPictureControl == 6 {
+                if selectedPictureControl == 7 {
                     toggleVivid()
-                } else if selectedPictureControl == 7 {
+                } else if selectedPictureControl == 0 {
                     toggleDolbyVisionOutput()
                 } else {
                     resetPicture()
@@ -2545,7 +2546,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         // In Picture settings, only Vertical Stretch responds to swipes.
         if toolPanel == .picture {
-            return selectedPictureControl == 1 && gestureRecognizer is UISwipeGestureRecognizer
+            return selectedPictureControl == 2 && gestureRecognizer is UISwipeGestureRecognizer
         }
         guard core != nil, toolPanel == .none, !toolbarFocused,
               !waitingForFirstFrame, !displayNegotiationPending,
@@ -2563,7 +2564,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         guard recognizer.state == .ended else { return }
         let direction = recognizer.direction == .right ? 1 : -1
         if toolPanel == .picture {
-            guard selectedPictureControl == 1 else { return }
+            guard selectedPictureControl == 2 else { return }
             changePictureValue(direction, stretchStepPercent: 1)
             return
         }

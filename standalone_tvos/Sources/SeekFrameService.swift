@@ -301,11 +301,12 @@ final class SeekFrameService {
     /// Do not let stale HTTP seeks block the new request or replace its image.
     func cancelObsolete(second: Int) {
         lock.lock()
-        let changed = desiredSlot != bucket(second)
         selectLocked(bucket(second))
         lock.unlock()
-        // A cached selection must still cancel obsolete native work.
-        if changed, Thread.isMainThread { nativePreview?.dismiss() }
+        // Keep Rust's in-flight indexed reads alive as the seek target moves.
+        // Version checks discard obsolete results; the next request changes
+        // Rust's desired keyframe without clearing its fetched packets/cache.
+        // Full dismiss/clear is reserved for exiting or committing a seek.
     }
 
     func request(url: URL, second: Int, allowSystemDecode: Bool = true,

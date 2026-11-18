@@ -3273,9 +3273,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // Preserve the last successfully generated image across distant seeks.
         // The new image replaces it as soon as the cached lookup or decode finishes.
 
-        // The preview grid stays at twelve seconds inside the fast-forward
-        // menu too. Moving the cursor within a cell must not decode more frames.
-        let slot = max(0, (Int(seconds.rounded()) / 12) * 12)
+        // Match mpvRx: request the indexed keyframe at or before the actual
+        // selected position. The visible window and remote step size stay unchanged.
+        let slot = max(0, Int(seconds.rounded()))
         // Only uncached positions need an animated loading indicator.
         // Keep displaying the last good thumbnail underneath meanwhile.
         if thumbs.hasCachedFrame(second: slot) {
@@ -3298,7 +3298,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                     guard let self, self.previewIsVisible,
                           self.currentPreviewSerial == serial,
                           let target = self.targetSeconds,
-                          max(0, (Int(target.rounded()) / 12) * 12) == slot,
+                          max(0, Int(target.rounded())) == slot,
                           self.link != nil else { return }
                     // A nearby image is NOT the requested timestamp.
                     // Keep the last displayed image rather than presenting
@@ -3339,7 +3339,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func loadFrames(serial: Int) {
         guard previewIsVisible, let link, let targetSeconds,
               serial == currentPreviewSerial else { return }
-        let slot = max(0, (Int(targetSeconds.rounded()) / 12) * 12)
+        let slot = max(0, Int(targetSeconds.rounded()))
         if let cached = thumbs.cachedImage(second: slot) {
             frameViews.first?.image = cached
             lastPreviewImageSecond = slot
@@ -3348,7 +3348,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             return
         }
         // An exact RAM hit is loaded by scheduleFrames.
-        // Neighbouring 12s slots don't satisfy this requested timestamp.
+        // Neighbouring timestamps do not satisfy this requested position.
         if thumbs.hasCachedFrame(second: slot) { return }
         guard lastPreviewRequestedBucket != slot else { return }
         lastPreviewRequestedBucket = slot
@@ -3365,7 +3365,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                   self.currentPreviewSerial == serial,
                   self.link?.url == link.url,
                   let current = self.targetSeconds,
-                  max(0, (Int(current.rounded()) / 12) * 12) == slot else { return }
+                  max(0, Int(current.rounded())) == slot else { return }
             self.seekPreviewSpinner.stopAnimating()
             if let image {
                 self.frameViews.first?.image = image
@@ -3573,7 +3573,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             if let image {
                 self.thumbs.cachePlaybackFrame(
                     image, second: desired, automatic: false)
-                let selected = max(0, (Int((self.targetSeconds ?? -1).rounded()) / 12) * 12)
+                let selected = max(0, Int((self.targetSeconds ?? -1).rounded()))
                 if selected == desired {
                     self.frameViews.first?.image = image
                     self.lastPreviewImageSecond = desired

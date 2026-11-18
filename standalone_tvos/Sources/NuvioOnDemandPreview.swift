@@ -6,12 +6,10 @@ import UIKit
 /// UI geometry, overlays, and last-good-image behavior remain in the controller.
 final class NuvioOnDemandPreview {
     private var handle: OpaquePointer?
-    private var pending: DispatchWorkItem?
     private var polling: DispatchWorkItem?
     private var generation: UInt64 = 0
     private var target: UInt64?
     private var permanentlyUnavailable = false
-    private var lastSend: TimeInterval = -1
 
     private let imageReady: (UIImage, UInt64) -> Void
     private let fallback: (UInt64) -> Void
@@ -42,19 +40,14 @@ final class NuvioOnDemandPreview {
         target = milliseconds
         generation &+= 1
         let requestID = generation
-        pending?.cancel()
         polling?.cancel()
         if permanentlyUnavailable { fallback(milliseconds); return }
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, let h = self.handle,
-                  self.generation == requestID else { return }
-            self.lastSend = ProcessInfo.processInfo.systemUptime
-            nvthumb_want(h, milliseconds)
-            self.pollForImage(requestID, deadline: ProcessInfo.processInfo.systemUptime + 6)
-        }
-        pending = work
-        let elapsed = ProcessInfo.processInfo.systemUptime - lastSend
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, 0.080 - elapsed), execute: work)
+        // The seek controller already coalesces touchpad input to ~80 ms.
+        // A SECOND 80 ms debounce here stalls every uncached picture, and
+        // repeated scrubs can cancel the native request before it is sent.
+        // Rust's Session::want itself is latest-target-wins and nonblocking.
+        nvthumb_want(handle, milliseconds)
+        pollForImage(requestID, deadline: ProcessInfo.processInfo.systemUptime + 6)
     }
 
     private func pollForImage(_ id: UInt64, deadline: TimeInterval) {
@@ -86,7 +79,7 @@ final class NuvioOnDemandPreview {
             self?.pollForImage(id, deadline: deadline)
         }
         polling = next
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20), execute: next)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16), execute: next)
     }
 
     /// Stops pending display work but retains Rust's cached JPEGs and index.
@@ -94,7 +87,6 @@ final class NuvioOnDemandPreview {
         dispatchPrecondition(condition: .onQueue(.main))
         generation &+= 1
         target = nil
-        pending?.cancel()
         polling?.cancel()
         if let handle { nvthumb_clear(handle) }
     }
@@ -107,7 +99,6 @@ final class NuvioOnDemandPreview {
     }
 
     deinit {
-        pending?.cancel()
         polling?.cancel()
         if let handle { nvthumb_close(handle) }
     }

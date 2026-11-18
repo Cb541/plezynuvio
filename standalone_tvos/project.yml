@@ -46,6 +46,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.cb541.nuvionativeplayer
         SWIFT_VERSION: "5.9"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/FFmpegThumbnailBridge.h
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/RustThumbnails/native/target/aarch64-apple-tvos/release"
+        OTHER_LDFLAGS: "$(inherited) -lnuvio_tvos_thumbnails -framework Security -framework SystemConfiguration -framework CoreFoundation -framework CFNetwork -lc++"
         CLANG_ENABLE_MODULES: NO
         TARGETED_DEVICE_FAMILY: "3"
         ENABLE_BITCODE: NO

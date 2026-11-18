@@ -68,6 +68,12 @@ final class SeekFrameService {
     private var seekSlots = Set<Int>()
     private var timing = ""
 
+    // Only touched on the main queue. Rust performs network and decode work
+    // on its own threads, independently of the MPV playback cache.
+    private var nativePreview: NuvioOnDemandPreview?
+    // Guarded by `lock`, and invalidated on every new seek target/session.
+    private var nativeWaiting: Request?
+
     private func bucket(_ second: Int) -> Int { max(0, (second / 12) * 12) }
 
     private func cost(_ image: UIImage) -> Int {
@@ -83,10 +89,12 @@ final class SeekFrameService {
     private func resetSession(to url: URL?) {
         lock.lock()
         session &+= 1
+        let nativeEpoch = session
         version &+= 1
         lookupVersion &+= 1
         token?.cancelled = true
         pending = nil
+        nativeWaiting = nil
         desiredSlot = nil
         source = url
         suspended = false
@@ -105,6 +113,69 @@ final class SeekFrameService {
         worker.async { [weak self] in
             self?.decoder?.reset()
             self?.decoder = nil
+        }
+        lock.unlock()
+        configureNative(url: url, epoch: nativeEpoch)
+    }
+
+    /// Recreates the Rust session only when the movie changes. Initial index
+    /// preparation is asynchronous and does not generate advance thumbnails.
+    private func configureNative(url: URL?, epoch: UInt64) {
+        let update = { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let valid = self.session == epoch && self.source == url
+            self.lock.unlock()
+            guard valid else { return }
+            self.nativePreview?.close()
+            self.nativePreview = nil
+            guard let url else { return }
+            self.nativePreview = NuvioOnDemandPreview(
+                url: url, headers: [:], thumbnailPixelWidth: 640,
+                imageReady: { [weak self] image, _ in
+                    self?.nativeCompleted(image)
+                },
+                fallback: { [weak self] _ in
+                    self?.nativeFallback()
+                })
+        }
+        if Thread.isMainThread {
+            update()
+        } else {
+            DispatchQueue.main.async(execute: update)
+        }
+    }
+
+    /// Rust's keyframe result and the legacy extractor share the existing RAM
+    /// store, so none of the UI's timestamp/last-good-frame logic is changed.
+    private func nativeCompleted(_ image: UIImage) {
+        lock.lock()
+        guard let job = nativeWaiting else { lock.unlock(); return }
+        nativeWaiting = nil
+        let valid = session == job.session && version == job.version &&
+            source == job.url && !suspended && !nativeDolbyVisionOnly
+        if valid {
+            storeLocked(image, slot: job.slot, automatic: false)
+            timing = "rust-indexed-keyframe"
+        }
+        lock.unlock()
+        if valid {
+            deliver(image, session: job.session, version: job.version,
+                    callback: job.callback)
+        }
+    }
+
+    /// Unsupported formats, servers without Range support, and native request
+    /// timeouts fall back to the original independent FFmpeg seek worker.
+    private func nativeFallback() {
+        lock.lock()
+        guard let job = nativeWaiting else { lock.unlock(); return }
+        nativeWaiting = nil
+        let valid = session == job.session && version == job.version &&
+            source == job.url && !suspended && !nativeDolbyVisionOnly
+        if valid {
+            pending = job
+            scheduleLocked()
         }
         lock.unlock()
     }
@@ -223,14 +294,18 @@ final class SeekFrameService {
         lookupVersion &+= 1
         token?.cancelled = true
         pending = nil
+        nativeWaiting = nil
     }
 
     /// Latest-position-wins, including moving to an already cached position.
     /// Do not let stale HTTP seeks block the new request or replace its image.
     func cancelObsolete(second: Int) {
         lock.lock()
+        let changed = desiredSlot != bucket(second)
         selectLocked(bucket(second))
         lock.unlock()
+        // A cached selection must still cancel obsolete native work.
+        if changed, Thread.isMainThread { nativePreview?.dismiss() }
     }
 
     func request(url: URL, second: Int, allowSystemDecode: Bool = true,
@@ -258,11 +333,20 @@ final class SeekFrameService {
             return
         }
 
-        pending = Request(url: url, slot: slot, session: epoch,
+        let job = Request(url: url, slot: slot, session: epoch,
                           version: requestVersion, allowSystemDecode: allowSystemDecode,
                           callback: callback)
-        scheduleLocked()
-        lock.unlock()
+        // Native's network/index/decode pipeline is fully independent of MPV.
+        // Retain the existing FFmpeg worker as a general fallback.
+        if allowSystemDecode, Thread.isMainThread, let nativePreview {
+            nativeWaiting = job
+            lock.unlock()
+            nativePreview.request(milliseconds: UInt64(slot) * 1_000)
+        } else {
+            pending = job
+            scheduleLocked()
+            lock.unlock()
+        }
     }
 
     func setNativeDolbyVisionOnly(_ enabled: Bool) {
@@ -270,6 +354,7 @@ final class SeekFrameService {
         nativeDolbyVisionOnly = enabled
         if enabled { selectLocked(nil) }
         lock.unlock()
+        if enabled, Thread.isMainThread { nativePreview?.dismiss() }
     }
 
     /// Compatibility hooks: the old ahead scheduler is deliberately disabled.
@@ -282,8 +367,10 @@ final class SeekFrameService {
         lookupVersion &+= 1
         desiredSlot = nil
         pending = nil
+        nativeWaiting = nil
         token?.cancelled = true
         lock.unlock()
+        if Thread.isMainThread { nativePreview?.dismiss() }
     }
 
     /// Avoid main-player/preview decoder contention when committing a seek.
@@ -296,7 +383,9 @@ final class SeekFrameService {
         lookupVersion &+= 1
         desiredSlot = nil
         pending = nil
+        nativeWaiting = nil
         token?.cancelled = true
+        if Thread.isMainThread { nativePreview?.dismiss() }
         worker.async { [weak self] in
             guard let self else { return }
             self.decoder?.reset()

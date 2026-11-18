@@ -3320,13 +3320,23 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         // Profile 5 still uses the main hardware decoder: retain the old
         // conservative path and its cadence rather than flooding playback.
         let profile5 = (core?.doviProfile ?? 0) == 5
+        // Android dispatches the first request immediately, then coalesces
+        // subsequent moves into an 80ms latest-target cadence. Do not insert
+        // an initial 80ms penalty on tvOS.
+        let elapsed = Date().timeIntervalSince(lastLiveTouchpadRequest)
         let interval: TimeInterval = profile5
             ? (touchpadPreviewMode && !isTouchScrubbing ? 0.20 : 0.12)
-            : 0.08
+            : max(0, 0.08 - elapsed)
+        if !profile5 && interval <= 0 {
+            lastLiveTouchpadRequest = Date()
+            loadFrames(serial: serial)
+            return
+        }
         let timer = Timer(timeInterval: interval, repeats: false) {
             [weak self] _ in
             guard let self else { return }
             self.thumbTimer = nil
+            self.lastLiveTouchpadRequest = Date()
             self.loadFrames(serial: serial)
         }
         thumbTimer = timer

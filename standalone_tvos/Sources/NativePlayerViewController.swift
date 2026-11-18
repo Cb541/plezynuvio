@@ -455,6 +455,15 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         super.viewDidLoad()
         view.backgroundColor = .clear
         buildUI()
+        // Match mpvRx: an older in-flight keyframe may be displayed as the
+        // last good picture while Rust fetches the newest selected position.
+        // Do not stop the spinner or label this interim frame as an exact hit.
+        thumbs.onInterimFrame = { [weak self] image, actualSecond in
+            guard let self, self.previewIsVisible, self.link != nil else { return }
+            self.frameViews.first?.image = image
+            self.lastPreviewImageSecond = actualSecond
+            self.filmStrip.alpha = 1
+        }
         configureHistoryInterface()
         // If a previous launch died in the decoder, tell the user WHICH stage
         // was reached. Never persist, display or log the signed media URL.

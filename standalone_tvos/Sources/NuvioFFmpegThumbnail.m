@@ -19,6 +19,18 @@
 #import <math.h>
 #import <float.h>
 
+// ePorner-owned video hosts may expect a browser-style Referer/UA when a
+// separate thumbnail decoder opens or seeks the source. This applies only
+// to eporner.com hosts, never to unrelated signed/CDN URLs.
+static void nuvioAddPreviewHTTPContext(NSURL *url, AVDictionary **options) {
+    NSString *host = url.host.lowercaseString ?: @"";
+    if (![host isEqualToString:@"eporner.com"] &&
+        ![host hasSuffix:@".eporner.com"]) return;
+    av_dict_set(options, "referer", "https://www.eporner.com/", 0);
+    av_dict_set(options, "user_agent",
+        "Mozilla/5.0 (AppleTV; CPU OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15", 0);
+}
+
 @implementation NuvioThumbnailAbortToken
 @end
 
@@ -397,6 +409,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
     AVDictionary *options = NULL;
     av_dict_set(&options, "rw_timeout", "5500000", 0);
     av_dict_set(&options, "multiple_requests", "1", 0);
+    nuvioAddPreviewHTTPContext(url, &options);
     double networkStarted = CFAbsoluteTimeGetCurrent();
     int rc = avio_open2(&_cachedInput->remote, url.absoluteString.UTF8String,
                        AVIO_FLAG_READ, &interrupt, &options);
@@ -535,6 +548,7 @@ static bool nuvioConsiderFrame(AVFrame *frame, int64_t target, AVRational timeBa
             }
             AVDictionary *options = NULL;
             av_dict_set(&options, "rw_timeout", "5500000", 0);
+            nuvioAddPreviewHTTPContext(url, &options);
             int rc = avformat_open_input(&_format, url.absoluteString.UTF8String,
                                          NULL, &options);
             av_dict_free(&options);

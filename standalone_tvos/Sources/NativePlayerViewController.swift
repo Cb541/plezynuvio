@@ -3088,20 +3088,48 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             let width = values["Width"] ?? "?"
             let height = values["Height"] ?? "?"
             let fps = Double(values["Frame rate"] ?? "").map { String(format: "%.3f fps", $0) } ?? "Unknown"
-            // DV is reported separately; the HDR line identifies the transfer
-            // standard for non-DV HDR10/PQ and HLG files as well.
-            let dvProfile = Int(values["Dolby Vision"] ?? "") ?? Int(core.doviProfile)
-            let dv = dvProfile == 7 ? "Profile 7 → 8.1"
-                : (dvProfile > 0 ? "Profile \(dvProfile)" : "No")
+            // mpv's DV profile and gamma describe the SOURCE video, so
+            // those values cannot tell whether the user has disabled DV HDMI
+            // output on this same file. Report the selected output separately
+            // while retaining the original profile for truthful provenance.
+            let reportedProfile = Int(values["Dolby Vision"] ?? "") ?? Int(core.doviProfile)
+            let dvProfile = reportedProfile > 0
+                ? reportedProfile : Int(self.originalDolbyVisionProfile)
+            let isDVSource = dvProfile > 0 || self.originalIsDolbyVision
+            let profileName = dvProfile == 7 ? "Profile 7 → 8.1"
+                : (dvProfile > 0 ? "Profile \(dvProfile)" : "DV source")
+            let dvOutputSelected = isDVSource && self.dolbyVisionOutputEnabled
+                && core.hdrEnabled
+            let dv: String
+            if !isDVSource {
+                dv = "No"
+            } else if self.pendingDolbyVisionOutputRestore && core.hdrEnabled {
+                dv = "Restoring · " + profileName
+            } else {
+                dv = dvOutputSelected
+                    ? "ON · " + profileName
+                    : "OFF · source " + profileName
+            }
             let gamma = (values["HDR transfer"] ?? "").lowercased()
             let primaries = (values["HDR primaries"] ?? "").lowercased()
             let hdr: String
-            if gamma.contains("arib") || gamma.contains("hlg") {
+            if !core.hdrEnabled {
+                hdr = "SDR (requested)"
+            } else if isDVSource && self.pendingDolbyVisionOutputRestore {
+                hdr = "Dolby Vision (restoring)"
+            } else if dvOutputSelected {
+                hdr = "PQ (Dolby Vision)"
+            } else if gamma.contains("arib") || gamma.contains("hlg") {
                 hdr = "HLG" + (primaries.contains("2020") ? " · BT.2020" : "")
+            } else if isDVSource {
+                // tvOS requests the compatible HDR base layer through
+                // AVDisplayManager. Profile 5 lacks a normal HDR10 base;
+                // distinguish the request from a confirmed TV output mode.
+                hdr = dvProfile == 5
+                    ? "HDR fallback requested (P5)"
+                    : "HDR10 / PQ (requested)"
             } else if gamma.contains("smpte2084") || gamma.contains("pq") {
-                hdr = dvProfile > 0 ? "PQ (Dolby Vision)" : "HDR10 / PQ"
-            } else if dvProfile > 0 {
-                hdr = "Dolby Vision (HDR)"
+                hdr = "HDR10 / PQ"
             } else if self.sourceColorMetadataReady && self.sourceIsHDR {
                 hdr = "HDR (transfer unknown)"
             } else {

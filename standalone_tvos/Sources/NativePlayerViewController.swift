@@ -3762,7 +3762,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         controlsVisible = hasPlayerControls
         panel.isHidden = !hasPlayerControls
         progress.isHidden = !showTimeline
-        cachedTimeline.isHidden = !showTimeline
+        // Thumbnail-cache markers are intentionally not displayed.
+        // Preserve the underlying slot data for seeking logic only.
+        cachedTimeline.isHidden = true
         playbackPositionMarker.isHidden = !showTimeline
         // Video/disk telemetry is a PAUSED-player control only.
         // Never show it during unpaused playback, including when Down,
@@ -3947,7 +3949,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                abs(cachedTimeline.durationSeconds - totalSeconds) > 0.5 {
                 cachedTimeline.durationSeconds = totalSeconds
                 cachedTimeline.frameSlots = newSlots
-                cachedTimeline.setNeedsDisplay()
+                // The cache overlay is hidden; no white tick redraw is needed.
             }
         }
     }

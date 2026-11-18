@@ -3169,13 +3169,11 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private func stepSeek(_ direction: Int, commitAfterIdle: Bool) {
         guard core != nil else { return }
         let base = targetSeconds ?? max(0, currentSeconds)
-        // A white indent means this precise saved frame exists. Skip gaps;
-        // if no further white indent exists, leave the preview where it is.
-        guard let mark = adjacentCachedWhiteMark(from: base,
-                                                  direction: direction) else {
-            return
-        }
-        targetSeconds = mark
+        // Native on-demand previews must work before any cached marker
+        // exists. Keep the established Apple TV 15-second remote step and
+        // let Rust decode the requested uncached keyframe, as on mpvRx.
+        let proposed = max(0, base + Double(direction) * 15.0)
+        targetSeconds = totalSeconds > 0 ? min(proposed, totalSeconds) : proposed
         scheduleFrames()
         refreshLabels()
         showPanel()

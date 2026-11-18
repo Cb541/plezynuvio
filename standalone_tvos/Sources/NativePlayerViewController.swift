@@ -3312,28 +3312,28 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
             }
         }
 
-        // One concurrent decoding worker, with a capped live-request rate.
-        // Don't reset this timer on each touch update (that would prevent
-        // it from firing). It always requests the latest target position.
+        // One UI coalescing timer; Rust's worker independently fetches and
+        // decodes the newest position. Avoid the old 120-200ms UI throttle
+        // plus another native 80ms debounce. No background frame generation.
         guard thumbTimer == nil else { return }
         let serial = currentPreviewSerial
-        let interval: TimeInterval
-        if touchpadPreviewMode && isTouchScrubbing {
-            let sincePrevious = Date().timeIntervalSince(lastLiveTouchpadRequest)
-            // Latest-target coalescing handles ordinary SDR/HDR seeks.
-            // Keep native profile-5 seeking conservative because it uses
-            // the movie's own hardware decoder rather than the preview worker.
-            let cadence: TimeInterval = (core?.doviProfile ?? 0) == 5 ? 0.95 : 0.20
-            interval = max(0.12, cadence - max(0, sincePrevious))
-        } else {
-            interval = touchpadPreviewMode ? 0.20 : 0.12
-        }
-        thumbTimer = Timer.scheduledTimer(withTimeInterval: interval,
-            repeats: false) { [weak self] _ in
+        // Profile 5 still uses the main hardware decoder: retain the old
+        // conservative path and its cadence rather than flooding playback.
+        let profile5 = (core?.doviProfile ?? 0) == 5
+        let interval: TimeInterval = profile5
+            ? (touchpadPreviewMode && !isTouchScrubbing ? 0.20 : 0.12)
+            : 0.08
+        let timer = Timer(timeInterval: interval, repeats: false) {
+            [weak self] _ in
             guard let self else { return }
             self.thumbTimer = nil
             self.loadFrames(serial: serial)
         }
+        thumbTimer = timer
+        // scheduledTimer uses the default runloop mode; during a touchpad
+        // tracking gesture it may stop firing. Common modes keep previews
+        // requesting while the finger is moving.
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func loadFrames(serial: Int) {

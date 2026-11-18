@@ -1414,8 +1414,9 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         panel.addSubview(currentLabel)
         panel.addSubview(endLabel)
         // Blue = played portion, white = actual saved thumbnail frames.
-        progress.progressTintColor = UIColor(red: 0.36, green: 0.72,
-                                             blue: 1.0, alpha: 1)
+        // Steel Blue (#4682B4) for the played portion of the timeline.
+        progress.progressTintColor = UIColor(red: 70.0 / 255.0, green: 130.0 / 255.0,
+                                             blue: 180.0 / 255.0, alpha: 1)
         progress.trackTintColor = UIColor.white.withAlphaComponent(0.25)
         progress.layer.cornerRadius = 2
         progress.clipsToBounds = true

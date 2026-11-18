@@ -316,8 +316,7 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 
 impl Decoder {
-    pub #[cfg(not(target_os = "tvos"))]
-fn open(name: &str, o: &Options) -> Result<Decoder, String> {
+    pub fn open(name: &str, o: &Options) -> Result<Decoder, String> {
         let api = api()?;
         let c_name = CString::new(name).map_err(|e| e.to_string())?;
         let codec = unsafe { (api.find_decoder_by_name)(c_name.as_ptr()) };

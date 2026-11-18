@@ -378,6 +378,10 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
     private var mainFramePreviewPending: Int?
     private var mainFramePreviewGeneration = 0
     private var mainFramePreviewUnsupported = false
+    // Browser/CDN URLs may play through mpv but reject separate byte-range
+    // thumbnail readers. After one unsuccessful independent extraction, use
+    // the already-active video decoder for subsequent previews instead.
+    private var preferNativePreviewForUnindexedSource = false
     private var mainFramePreviewRestoreTarget: Double?
     private var mainFramePreviewResumeAfterRestore = false
     private let toolbar = UIStackView()
@@ -816,6 +820,7 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         mainFramePreviewPending = nil
         mainFramePreviewGeneration += 1
         mainFramePreviewUnsupported = false
+        preferNativePreviewForUnindexedSource = false
         mainFramePreviewRestoreTarget = nil
         frozenVideo.isHidden = true
         frozenVideo.image = nil
@@ -3399,13 +3404,25 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
         if thumbs.hasCachedFrame(second: slot) { return }
         guard lastPreviewRequestedBucket != slot else { return }
         lastPreviewRequestedBucket = slot
-        if core?.doviProfile == 5 {
-            // P5 has no HDR10-compatible base layer. The FFmpeg seek worker
-            // can't reproduce Dolby's IPTPQc2 + RPU color mapping. Ask the
-            // existing hardware decoder for a still, while paused, rather
-            // than cache a dark/magenta corrupted FFmpeg JPEG.
-            requestNativePreviewTarget(slot, serial: serial)
-            return
+        // A playlist cannot have the MP4/MKV byte-range keyframe index that
+        // the Rust on-demand engine expects. Browser handoffs may also carry
+        // signed MP4 URLs for CDNs that reject independent HTTP Range reads.
+        // Keep Rust for supported files; otherwise use mpv's existing decoded
+        // video frame while paused, with the established freeze/restore flow.
+        let playlist = ["m3u8", "mpd"].contains(link.url.pathExtension.lowercased())
+        let profile5 = core?.doviProfile == 5
+        if profile5 || playlist || preferNativePreviewForUnindexedSource {
+            // Never seek the main movie for thumbnail generation while it
+            // is playing. If native capture is unsupported, allow the usual
+            // independent decoder as a fallback for non-P5 video.
+            if core?.isPaused == true && !mainFramePreviewUnsupported {
+                requestNativePreviewTarget(slot, serial: serial)
+                return
+            }
+            if profile5 {
+                seekPreviewSpinner.stopAnimating()
+                return
+            }
         }
         thumbs.request(url: link.url, second: slot) { [weak self] image in
             guard let self, self.previewIsVisible,
@@ -3413,15 +3430,24 @@ final class NativePlayerViewController: UIViewController, MpvPlayerDelegate, UIG
                   self.link?.url == link.url,
                   let current = self.targetSeconds,
                   max(0, Int(current.rounded())) == slot else { return }
-            self.seekPreviewSpinner.stopAnimating()
             if let image {
                 self.frameViews.first?.image = image
                 self.lastPreviewImageSecond = slot
                 self.filmStrip.alpha = 1
+                self.seekPreviewSpinner.stopAnimating()
             } else {
-                // A failed transient network request can be retried on the
-                // next interaction rather than sticking to this bucket.
+                // Both the Rust indexer and independent FFmpeg decoder failed.
+                // The URL can still be playable in mpv (e.g. a CDN denying
+                // Range/HEAD access). Reuse its active decoder while paused.
                 self.lastPreviewRequestedBucket = nil
+                if self.core?.isPaused == true &&
+                   !self.mainFramePreviewUnsupported {
+                    self.preferNativePreviewForUnindexedSource = true
+                    self.seekPreviewSpinner.startAnimating()
+                    self.requestNativePreviewTarget(slot, serial: serial)
+                } else {
+                    self.seekPreviewSpinner.stopAnimating()
+                }
             }
             self.previewLoadingLabel.isHidden = true
         }
